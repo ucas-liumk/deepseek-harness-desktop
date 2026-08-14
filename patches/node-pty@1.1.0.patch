@@ -60,3 +60,32 @@ index 98733dc0cd752b554bd94e45904ca341ad141bba..fa234291206617ae5a6d8605abf97712
 
  const DEFAULT_FILE = 'sh';
  const DEFAULT_NAME = 'xterm';
+diff --git a/binding.gyp b/binding.gyp
+--- a/binding.gyp
++++ b/binding.gyp
+@@ -93,17 +93,21 @@
+         }
+       ]
+     }],
+-    ['OS=="mac"', {
++    ['OS=="mac" or OS=="linux"', {
+       'targets': [
+         {
+           'target_name': 'spawn-helper',
+           'type': 'executable',
+           'sources': [
+             'src/unix/spawn-helper.cc',
+           ],
+-          "xcode_settings": {
+-            "MACOSX_DEPLOYMENT_TARGET":"10.7"
+-          }
++          'conditions': [
++            ['OS=="mac"', {
++              "xcode_settings": {
++                "MACOSX_DEPLOYMENT_TARGET":"10.7"
++              }
++            }]
++          ]
+         },
+       ]
+     }]

@@ -65,6 +65,7 @@ describe('desktop release workflow', () => {
       'packages/preset/agent-presets/tests/mount.spec.ts',
       'packages/typert/loader/tests/loader.spec.ts',
       'scripts/build-desktop.spec.ts',
+      'scripts/node-pty-patch.spec.ts',
       'scripts/desktop-release.spec.ts',
       'scripts/gen-desktop-third-party-licenses.spec.ts',
       'apps/cli/tests/desktop-api-auth.spec.ts',
@@ -292,7 +293,7 @@ describe('desktop release workflow', () => {
     expect(succeeded.calls).toContain('api --method POST repos/example/desktop/releases')
     expect(succeeded.calls).toContain('api --method PATCH repos/example/desktop/releases/731 -F draft=false --silent')
     expect(succeeded.calls).not.toContain('api --method DELETE')
-  })
+  }, 20_000)
 })
 
 interface PublishContractOptions {

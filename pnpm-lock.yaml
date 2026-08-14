@@ -12,7 +12,7 @@ overrides:
   js-yaml: 4.3.1
 
 patchedDependencies:
-  node-pty@1.1.0: 7a0c04f1f49d798a9ffe2f7f414c01064a44ca2489772d0c3e1235ab336755e6
+  node-pty@1.1.0: 4447eda1d35baffcd6568d74612b3ae0635245f22ba1e6aaf6d8cefe632c3dac
 
 importers:
 
@@ -7503,7 +7503,7 @@ importers:
     dependencies:
       node-pty:
         specifier: ^1.1.0
-        version: 1.1.0(patch_hash=7a0c04f1f49d798a9ffe2f7f414c01064a44ca2489772d0c3e1235ab336755e6)
+        version: 1.1.0(patch_hash=4447eda1d35baffcd6568d74612b3ae0635245f22ba1e6aaf6d8cefe632c3dac)
     devDependencies:
       '@deepseek-ai/cordis':
         specifier: workspace:^
@@ -19144,7 +19144,7 @@ snapshots:
 
   node-int64@0.4.0: {}
 
-  node-pty@1.1.0(patch_hash=7a0c04f1f49d798a9ffe2f7f414c01064a44ca2489772d0c3e1235ab336755e6):
+  node-pty@1.1.0(patch_hash=4447eda1d35baffcd6568d74612b3ae0635245f22ba1e6aaf6d8cefe632c3dac):
     dependencies:
       node-addon-api: 7.1.1
 

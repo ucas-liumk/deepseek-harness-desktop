@@ -178,6 +178,7 @@ jobs:
           packages/preset/agent-presets/tests/mount.spec.ts
           packages/typert/loader/tests/loader.spec.ts
           scripts/build-desktop.spec.ts
+          scripts/node-pty-patch.spec.ts
           scripts/desktop-release.spec.ts
           scripts/gen-desktop-third-party-licenses.spec.ts
           apps/cli/tests/desktop-api-auth.spec.ts

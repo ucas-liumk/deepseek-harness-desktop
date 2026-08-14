@@ -9,7 +9,7 @@ import { createReadStream, existsSync, statSync } from 'node:fs'
 import { chmod, copyFile, cp, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from 'node:fs/promises'
 import { createServer, type Server } from 'node:http'
 import { homedir, tmpdir } from 'node:os'
-import { basename, delimiter, dirname, join, resolve, sep, win32 } from 'node:path'
+import { basename, dirname, join, resolve, sep, win32 } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import { pathToFileURL } from 'node:url'
 import { parseArgs } from 'node:util'
@@ -141,6 +141,10 @@ export interface ArtifactMarker {
 export interface PeCertificateTable {
   readonly fileOffset: number
   readonly size: number
+}
+
+interface PeCertificateTableLocation extends PeCertificateTable {
+  readonly directoryOffset?: number
 }
 
 function usage(): string {
@@ -311,13 +315,7 @@ function requireByteRange(bytes: Uint8Array, offset: number, length: number, lab
   }
 }
 
-/**
- * Read the Authenticode certificate-table entry from a PE image.
- * The certificate table is data-directory entry 4 and uses file offsets rather than RVAs.
- * @param bytes Complete PE file contents.
- * @returns The certificate table location; both values are zero when the image is unsigned.
- */
-export function readPeCertificateTable(bytes: Uint8Array): PeCertificateTable {
+function locatePeCertificateTable(bytes: Uint8Array): PeCertificateTableLocation {
   requireByteRange(bytes, 0, 0x40, 'DOS header')
   if (bytes[0] !== 0x4d || bytes[1] !== 0x5a) throw new Error('file is not a PE image')
   const view = byteView(bytes)
@@ -358,27 +356,35 @@ export function readPeCertificateTable(bytes: Uint8Array): PeCertificateTable {
     throw new Error('PE image has a malformed certificate-table entry')
   }
   if (size !== 0) requireByteRange(bytes, fileOffset, size, 'certificate table')
+  return { fileOffset, size, directoryOffset: certificateEntry }
+}
+
+/**
+ * Read the Authenticode certificate-table entry from a PE image.
+ * The certificate table is data-directory entry 4 and uses file offsets rather than RVAs.
+ * @param bytes Complete PE file contents.
+ * @returns The certificate table location; both values are zero when the image is unsigned.
+ */
+export function readPeCertificateTable(bytes: Uint8Array): PeCertificateTable {
+  const { fileOffset, size } = locatePeCertificateTable(bytes)
   return { fileOffset, size }
 }
 
-function parseWindowsSdkVersion(version: string): number[] | undefined {
-  if (!/^\d+(?:\.\d+)+$/.test(version)) return undefined
-  return version.split('.').map(component => Number.parseInt(component, 10))
-}
-
-/** Sort Windows SDK directory names with the newest numeric version first. */
-export function compareWindowsSdkVersionsDescending(left: string, right: string): number {
-  const leftParts = parseWindowsSdkVersion(left)
-  const rightParts = parseWindowsSdkVersion(right)
-  if (leftParts === undefined && rightParts === undefined) return right.localeCompare(left)
-  if (leftParts === undefined) return 1
-  if (rightParts === undefined) return -1
-  const length = Math.max(leftParts.length, rightParts.length)
-  for (let index = 0; index < length; index += 1) {
-    const difference = (rightParts[index] ?? 0) - (leftParts[index] ?? 0)
-    if (difference !== 0) return difference
+/**
+ * Clear the PE Security Directory without removing certificate bytes or a later SEA overlay.
+ * @param bytes Complete PE file contents.
+ * @returns A same-length copy whose certificate-table entry is empty.
+ */
+export function clearPeSecurityDirectory(bytes: Uint8Array): Uint8Array {
+  const { directoryOffset } = locatePeCertificateTable(bytes)
+  const unsigned = Uint8Array.from(bytes)
+  if (directoryOffset !== undefined) unsigned.fill(0, directoryOffset, directoryOffset + 8)
+  const certificateTable = readPeCertificateTable(unsigned)
+  if (unsigned.byteLength !== bytes.byteLength
+    || certificateTable.fileOffset !== 0 || certificateTable.size !== 0) {
+    throw new Error('failed to clear the PE Security Directory without changing the image length')
   }
-  return 0
+  return unsigned
 }
 
 function formatCommand(command: string, args: string[]): string {
@@ -399,6 +405,31 @@ function pathMarkerVariants(path: string): string[] {
   return [...variants].filter(value => value !== '')
 }
 
+const HOSTED_RUNNER_WORKSPACE_MARKERS = [
+  '/home/runner/work/',
+  '/Users/runner/work/',
+  '/github/workspace/',
+  'C:\\Users\\runneradmin\\',
+  'C:\\a\\',
+  'D:\\a\\',
+] as const
+
+function normalizedHostPath(path: string): string {
+  return path.replaceAll('\\', '/').replace(/\/+$/, '').toLowerCase()
+}
+
+function isKnownHostedRunnerHome(path: string, githubWorkspace: string | undefined): boolean {
+  if (githubWorkspace === undefined) return false
+  const normalized = normalizedHostPath(path)
+  const knownHome = normalized === '/home/runner'
+    || normalized === '/users/runner'
+    || normalized === 'c:/users/runneradmin'
+  const normalizedWorkspace = `${normalizedHostPath(githubWorkspace)}/`
+  return knownHome && HOSTED_RUNNER_WORKSPACE_MARKERS.some((prefix) => {
+    return normalizedWorkspace.startsWith(normalizedHostPath(prefix) + '/')
+  })
+}
+
 /** Build the path and package markers that may never occur in a distributable SEA image. */
 export function sidecarArtifactForbiddenMarkers(context: ArtifactIsolationContext): ArtifactMarker[] {
   const markers: ArtifactMarker[] = []
@@ -407,17 +438,13 @@ export function sidecarArtifactForbiddenMarkers(context: ArtifactIsolationContex
     for (const value of pathMarkerVariants(path)) markers.push({ label, value })
   }
   addPath('repository root', context.repositoryRoot)
-  addPath('user home', context.userHome)
+  addPath(
+    isKnownHostedRunnerHome(context.userHome, context.githubWorkspace) ? 'hosted-runner home' : 'user home',
+    context.userHome,
+  )
   for (const isolationRoot of context.isolationRoots) addPath('isolated build root', isolationRoot)
   addPath('GITHUB_WORKSPACE', context.githubWorkspace)
-  for (const value of [
-    '/home/runner/work/',
-    '/Users/runner/work/',
-    '/github/workspace/',
-    'C:\\Users\\runneradmin\\',
-    'C:\\a\\',
-    'D:\\a\\',
-  ]) {
+  for (const value of HOSTED_RUNNER_WORKSPACE_MARKERS) {
     markers.push({ label: 'hosted-runner workspace', value })
   }
   for (const value of ['/var/folders/', '/private/var/folders/']) {
@@ -442,6 +469,19 @@ export function sidecarArtifactForbiddenMarkers(context: ArtifactIsolationContex
     seen.add(key)
     return true
   })
+}
+
+const VFS_ONLY_ARTIFACT_MARKER_LABELS = new Set([
+  'hosted-runner home',
+  'hosted-runner workspace',
+  'undeclared build-tool asset',
+])
+
+/** Keep compiler/debug-path false positives out of whole-binary scans while retaining VFS rejection. */
+export function wholeArtifactSidecarForbiddenMarkers(
+  markers: readonly ArtifactMarker[],
+): ArtifactMarker[] {
+  return markers.filter(marker => !VFS_ONLY_ARTIFACT_MARKER_LABELS.has(marker.label))
 }
 
 interface EncodedArtifactMarker extends ArtifactMarker {
@@ -825,39 +865,6 @@ function regularFile(path: string): boolean {
   }
 }
 
-/**
- * Find the Windows SDK signing tool without invoking a shell.
- * PATH takes precedence over the newest installed Windows 10 SDK x64 tool.
- */
-export async function locateWindowsSignTool(environment: NodeJS.ProcessEnv = process.env): Promise<string> {
-  const searchPath = environmentValue(environment, 'PATH') ?? ''
-  for (const rawDirectory of searchPath.split(delimiter)) {
-    const directory = rawDirectory.trim().replace(/^"(.*)"$/, '$1')
-    if (directory === '') continue
-    const candidate = join(directory, 'signtool.exe')
-    if (regularFile(candidate)) return candidate
-  }
-
-  const programFilesX86 = environmentValue(environment, 'ProgramFiles(x86)')
-  if (programFilesX86 !== undefined && programFilesX86 !== '') {
-    const sdkBin = join(programFilesX86, 'Windows Kits', '10', 'bin')
-    if (existsSync(sdkBin)) {
-      const versions = (await readdir(sdkBin, { withFileTypes: true }))
-        .filter(entry => entry.isDirectory() && parseWindowsSdkVersion(entry.name) !== undefined)
-        .map(entry => entry.name)
-        .sort(compareWindowsSdkVersionsDescending)
-      for (const version of versions) {
-        const candidate = join(sdkBin, version, 'x64', 'signtool.exe')
-        if (regularFile(candidate)) return candidate
-      }
-    }
-  }
-  throw new Error(
-    'Windows SDK signtool.exe was not found on PATH or below '
-    + '%ProgramFiles(x86)%\\Windows Kits\\10\\bin\\*\\x64.',
-  )
-}
-
 async function prepareLinuxNodePty(cli: Cli, target: HostTarget): Promise<void> {
   if (process.platform !== 'linux') return
   const expectedArchitecture = target.nodePtyPlatform === 'linux-x64'
@@ -1232,21 +1239,29 @@ async function prepareHostNativePayloads(cli: Cli, target: HostTarget): Promise<
 async function removeWindowsSignature(cli: Cli, executable: string): Promise<void> {
   if (process.platform !== 'win32') return
   if (cli.dryRun) {
-    console.log('build-desktop-sidecar: [dry-run] locate Windows SDK signtool.exe without a shell')
-    console.log(`build-desktop-sidecar: [dry-run] signtool.exe remove /s ${executable}`)
+    console.log(`build-desktop-sidecar: [dry-run] clear the 8-byte PE Security Directory in ${executable}`)
     console.log(`build-desktop-sidecar: [dry-run] verify ${executable} has an empty PE certificate table`)
     return
   }
-  const signTool = await locateWindowsSignTool()
-  await run('remove inherited Windows signature', signTool, ['remove', '/s', executable], false)
-  const certificateTable = readPeCertificateTable(await readFile(executable))
+  const signed = await readFile(executable)
+  const unsigned = clearPeSecurityDirectory(signed)
+  await writeFile(executable, unsigned)
+  const persisted = await readFile(executable)
+  if (persisted.byteLength !== signed.byteLength || !persisted.equals(unsigned)) {
+    throw new Error(
+      `clearing the PE Security Directory did not preserve ${executable} byte-for-byte `
+      + `outside its 8-byte directory entry (${String(signed.byteLength)} input bytes, `
+      + `${String(persisted.byteLength)} output bytes).`,
+    )
+  }
+  const certificateTable = readPeCertificateTable(persisted)
   if (certificateTable.fileOffset !== 0 || certificateTable.size !== 0) {
     throw new Error(
-      `signtool left a PE certificate table in ${executable} `
+      `clearing the PE Security Directory left a certificate table in ${executable} `
       + `(offset ${String(certificateTable.fileOffset)}, size ${String(certificateTable.size)}).`,
     )
   }
-  console.log(`build-desktop-sidecar: verified unsigned PE certificate table: ${executable}`)
+  console.log(`build-desktop-sidecar: cleared the PE Security Directory without changing image length: ${executable}`)
 }
 
 async function removeBinDirectories(directory: string): Promise<void> {
@@ -1701,9 +1716,7 @@ async function verifyArtifactIsolation(
       ? {}
       : { githubWorkspace: process.env.GITHUB_WORKSPACE },
   })
-  const wholeArtifactMarkers = markers.filter(marker => (
-    marker.label !== 'hosted-runner workspace' && marker.label !== 'undeclared build-tool asset'
-  ))
+  const wholeArtifactMarkers = wholeArtifactSidecarForbiddenMarkers(markers)
   const wholeArtifactViolations = await findForbiddenSidecarArtifactMarkers(executable, wholeArtifactMarkers)
   const vfsManifest = extractPkgVfsManifest(await readFile(executable))
   verifyHostNativeVfsManifest(vfsManifest, target)

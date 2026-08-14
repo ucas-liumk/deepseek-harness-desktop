@@ -21,7 +21,7 @@ Windows x64 发布包不支持持久 Bash 会话或持久 Shell 会话。请使�
 ## 前置条件
 
 - 在所有平台上安装 Node.js 24.19.0、pnpm 11.7.0 和仓库锁定的依赖。
-- 安装 Rust 1.94.0。在 macOS 15.0 或更高版本上还需安装 Xcode Command Line Tools。在 Windows 上安装 Microsoft C++ Build Tools、包含 `signtool.exe` 的 Windows SDK 和 WebView2 构建前置组件。
+- 安装 Rust 1.94.0。在 macOS 15.0 或更高版本上还需安装 Xcode Command Line Tools。在 Windows 上安装 Microsoft C++ Build Tools、Windows SDK 和 WebView2 构建前置组件。
 - 在 Debian 或 Ubuntu Linux 上安装 Tauri 所需的 WebKit、AppIndicator、SVG、OpenSSL、XDO 和打包依赖：
 
 ```sh

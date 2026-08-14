@@ -21,7 +21,7 @@ The Windows x64 release does not support persistent Bash sessions or persistent 
 ## Prerequisites
 
 - Install Node.js 24.19.0, pnpm 11.7.0, and the repository's frozen dependencies on every platform.
-- Install Rust 1.94.0. On macOS 15.0 or later, also install Xcode Command Line Tools. On Windows, install Microsoft C++ Build Tools, the Windows SDK (including `signtool.exe`), and WebView2 build prerequisites.
+- Install Rust 1.94.0. On macOS 15.0 or later, also install Xcode Command Line Tools. On Windows, install Microsoft C++ Build Tools, the Windows SDK, and WebView2 build prerequisites.
 - On Debian or Ubuntu Linux, install the Tauri WebKit, AppIndicator, SVG, OpenSSL, XDO, and packaging dependencies:
 
 ```sh

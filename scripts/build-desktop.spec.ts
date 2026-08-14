@@ -4,14 +4,13 @@ import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import {
   auditStagedNpmPackageVersions,
+  clearPeSecurityDirectory,
   collectStagedNpmPackageVersions,
-  compareWindowsSdkVersionsDescending,
   extractPkgVfsManifest,
   findAncestorNodeModules,
   findForbiddenSidecarArtifactMarkers,
   findRestrictedClaudePayloads,
   hostNativeLayout,
-  locateWindowsSignTool,
   nativeAssetGlobsForTarget,
   neutralPkgTempDirectory,
   normalizeStagedRootManifest,
@@ -29,6 +28,7 @@ import {
   startSmokeLlmServer,
   verifyHostNativeStaging,
   verifyHostNativeVfsManifest,
+  wholeArtifactSidecarForbiddenMarkers,
 } from './build-desktop-sidecar.ts'
 import { parseBuildCli } from './build-desktop.ts'
 import { pnpmInvocation } from './pnpm-invocation.ts'
@@ -254,6 +254,44 @@ describe('isolated SEA build inputs', () => {
     } finally {
       await rm(fixture, { recursive: true, force: true })
     }
+  })
+
+  it('limits known hosted-runner homes to VFS scans without weakening exact build-root checks', () => {
+    const hostedRunnerMarkers = sidecarArtifactForbiddenMarkers({
+      repositoryRoot: '/Users/runner/work/project/project',
+      userHome: '/Users/runner',
+      isolationRoots: ['/tmp/dsh-desktop-sea-build-fixture'],
+      githubWorkspace: '/Users/runner/work/project/project',
+    })
+    const wholeArtifactMarkers = wholeArtifactSidecarForbiddenMarkers(hostedRunnerMarkers)
+
+    expect(hostedRunnerMarkers).toContainEqual({ label: 'hosted-runner home', value: '/Users/runner' })
+    expect(wholeArtifactMarkers.some(marker => marker.label === 'hosted-runner home')).toBe(false)
+    expect(wholeArtifactMarkers).toEqual(expect.arrayContaining([
+      { label: 'repository root', value: '/Users/runner/work/project/project' },
+      { label: 'GITHUB_WORKSPACE', value: '/Users/runner/work/project/project' },
+      { label: 'isolated build root', value: '/tmp/dsh-desktop-sea-build-fixture' },
+    ]))
+
+    const localMarkers = sidecarArtifactForbiddenMarkers({
+      repositoryRoot: '/Users/builder/project',
+      userHome: '/Users/builder',
+      isolationRoots: ['/tmp/dsh-desktop-sea-build-fixture'],
+    })
+    expect(wholeArtifactSidecarForbiddenMarkers(localMarkers)).toContainEqual({
+      label: 'user home',
+      value: '/Users/builder',
+    })
+
+    const localRunnerMarkers = sidecarArtifactForbiddenMarkers({
+      repositoryRoot: '/Users/runner/project',
+      userHome: '/Users/runner',
+      isolationRoots: ['/tmp/dsh-desktop-sea-build-fixture'],
+    })
+    expect(wholeArtifactSidecarForbiddenMarkers(localRunnerMarkers)).toContainEqual({
+      label: 'user home',
+      value: '/Users/runner',
+    })
   })
 
   it('extracts exactly one structurally valid pkg VFS manifest and fails closed', () => {
@@ -706,44 +744,32 @@ describe('desktop native-binary validation', () => {
     expect(() => readPeCertificateTable(new Uint8Array(64))).toThrow('not a PE image')
   })
 
-  it('finds PATH signtool first and otherwise selects the newest Windows SDK', async () => {
-    const fixture = await mkdtemp(join(tmpdir(), 'dsh-desktop-signtool-'))
-    try {
-      const pathDirectory = join(fixture, 'path-bin')
-      const sdkBin = join(fixture, 'Windows Kits', '10', 'bin')
-      const older = join(sdkBin, '10.0.22621.0', 'x64')
-      const newer = join(sdkBin, '10.0.26100.0', 'x64')
-      await mkdir(pathDirectory, { recursive: true })
-      await mkdir(older, { recursive: true })
-      await mkdir(newer, { recursive: true })
-      const pathTool = join(pathDirectory, 'signtool.exe')
-      const olderTool = join(older, 'signtool.exe')
-      const newerTool = join(newer, 'signtool.exe')
-      await writeFile(pathTool, '')
-      await writeFile(olderTool, '')
-      await writeFile(newerTool, '')
+  it('clears only the PE Security Directory and preserves later SEA payload bytes', () => {
+    const bytes = new Uint8Array(640)
+    const view = new DataView(bytes.buffer)
+    bytes.set([0x4d, 0x5a])
+    view.setUint32(0x3c, 0x80, true)
+    view.setUint32(0x80, 0x0000_4550, true)
+    view.setUint16(0x80 + 20, 240, true)
+    const optionalHeader = 0x80 + 24
+    view.setUint16(optionalHeader, 0x20b, true)
+    view.setUint32(optionalHeader + 108, 16, true)
+    const certificateEntry = optionalHeader + 112 + 4 * 8
+    view.setUint32(certificateEntry, 400, true)
+    view.setUint32(certificateEntry + 4, 32, true)
+    bytes.fill(0xa5, 400, 432)
+    const seaPayload = Buffer.from('SEA payload after inherited certificate')
+    bytes.set(seaPayload, 512)
 
-      expect(await locateWindowsSignTool({
-        PATH: pathDirectory,
-        'ProgramFiles(x86)': fixture,
-      })).toBe(pathTool)
-      await rm(pathTool)
-      expect(await locateWindowsSignTool({
-        PATH: '',
-        'ProgramFiles(x86)': fixture,
-      })).toBe(newerTool)
-      expect([
-        '10.0.22621.0',
-        'preview',
-        '10.0.26100.0',
-      ].sort(compareWindowsSdkVersionsDescending)).toEqual([
-        '10.0.26100.0',
-        '10.0.22621.0',
-        'preview',
-      ])
-    } finally {
-      await rm(fixture, { recursive: true, force: true })
-    }
+    const unsigned = clearPeSecurityDirectory(bytes)
+
+    expect(unsigned).toHaveLength(bytes.byteLength)
+    expect(unsigned.slice(0, certificateEntry)).toEqual(bytes.slice(0, certificateEntry))
+    expect(unsigned.slice(certificateEntry, certificateEntry + 8)).toEqual(new Uint8Array(8))
+    expect(unsigned.slice(certificateEntry + 8)).toEqual(bytes.slice(certificateEntry + 8))
+    expect(unsigned.slice(400, 432)).toEqual(bytes.slice(400, 432))
+    expect(unsigned.slice(512, 512 + seaPayload.byteLength)).toEqual(Uint8Array.from(seaPayload))
+    expect(readPeCertificateTable(unsigned)).toEqual({ fileOffset: 0, size: 0 })
   })
 })
 
