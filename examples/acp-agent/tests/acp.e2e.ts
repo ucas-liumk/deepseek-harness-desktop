@@ -66,8 +66,8 @@ describe('acp-agent over real stdio (no key required)', () => {
   }, 30_000)
 
   it('session/new succeeds over real stdio (no model call)', async () => {
-    // REGRESSION GUARD (this exact RPC crashed a real Zed session with
-    // "cannot get property \"agents\" without inject"): `session/new` drives the
+    // REGRESSION GUARD (this exact RPC exposed the missing-inject Loader bug):
+    // `session/new` drives the
     // full bridge → `ctx.agents.create({sessionId, meta:{cwd}})` → AgentLoop →
     // registry/persistence path, ALL of which run from the JSON-RPC read loop
     // OUTSIDE the bridge plugin's injection scope. A lazy `ctx.<service>` read
@@ -104,7 +104,7 @@ describe.skipIf(!process.env.DEEPSEEK_API_KEY)('acp-agent e2e: real prompt over 
     const { client, updates } = spawned
 
     await client.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} })
-    // Any absolute cwd is honored now; use the temp `workdir` as this session's
+    // Any absolute cwd is honored; use the temp `workdir` as this session's
     // workspace (the bash tool will run there) — it need not equal the launch dir.
     const { sessionId } = await client.newSession({ cwd: workdir, mcpServers: [] })
 
@@ -114,64 +114,13 @@ describe.skipIf(!process.env.DEEPSEEK_API_KEY)('acp-agent e2e: real prompt over 
     })
     expect(['end_turn', 'max_tokens']).toContain(res.stopReason)
 
-    // Verify the WORLD, not the agent's self-report: read the file from disk.
+    // Assert the filesystem effect independently of the model response.
     const proof = await readFile(join(workdir, 'proof.txt'), 'utf8')
     expect(proof).toContain('ACP_OK')
 
-    // And the client saw tool-call activity stream through.
-    const toolCalls = updates.filter(u => u.sessionUpdate === 'tool_call')
-    expect(toolCalls.length).toBeGreaterThan(0)
-
-    // Tool-call UI quality (the tool owns its presentation): the bash tool's
-    // `presentCall` sets the title to the exact command (an execute card hides
-    // rawInput, so the command IS the title) — NOT the bare tool name "bash".
-    // A `bash` call must therefore carry an execute kind, a non-"bash" title,
-    // and a string rawInput (the command). `toolCalls` is already narrowed to
-    // the `tool_call` shape by the filter above, so these fields are reachable.
-    const bashCall = toolCalls.find(u => u.kind === 'execute')
-    expect(bashCall).toBeDefined()
-    if (bashCall === undefined) throw new Error('expected an execute tool_call')
-    expect(typeof bashCall.title).toBe('string')
-    expect(bashCall.title.length).toBeGreaterThan(0)
-    expect(bashCall.title).not.toBe('bash') // the old, unhelpful title
-    expect(typeof bashCall.rawInput).toBe('string') // the exact command
-    // Capability OFF: no terminal _meta — the ```console text path renders.
-    expect((bashCall as { _meta?: unknown })._meta).toBeUndefined()
-  }, 180_000)
-
-  it('with the terminal_output capability, a real bash call renders as a terminal card (content + _meta + exit)', async () => {
-    workdir = await mkdtemp(join(tmpdir(), 'acp-e2e-'))
-    spawned = launchAcpTestAgent({ agent: AGENT, cwd: workdir, env: DANGER_FULL_ACCESS_ENV })
-    const { client, updates } = spawned
-
-    // Advertise the Zed `_meta.terminal_output` capability so the bridge emits
-    // the terminal card for the real bash tool.
-    await client.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: { _meta: { terminal_output: true } } })
-    const { sessionId } = await client.newSession({ cwd: workdir, mcpServers: [] })
-    const res = await client.prompt({
-      sessionId,
-      prompt: [{ type: 'text', text: 'Use the bash tool to run: echo ACP_TERMINAL_OK. Then stop.' }],
-    })
-    expect(['end_turn', 'max_tokens']).toContain(res.stopReason)
-
-    // A bash tool_call now carries a terminal content block + _meta.terminal_info
-    // with the session cwd as the header; the matching update streams the output
-    // on _meta.terminal_output.
-    const bashCall = updates.find(u => u.sessionUpdate === 'tool_call' && u.kind === 'execute')
-    if (bashCall?.sessionUpdate !== 'tool_call') throw new Error('expected an execute tool_call')
-    // The content carries the description text block AND a terminal block (the
-    // description renders above the card) — find the terminal block by type, not
-    // by position.
-    const blocks = (bashCall.content ?? []) as { type: string; terminalId?: string }[]
-    const terminalBlock = blocks.find(b => b.type === 'terminal')
-    expect(terminalBlock).toBeDefined()
-    expect(typeof terminalBlock?.terminalId).toBe('string')
-    const info = (bashCall._meta as { terminal_info?: { terminal_id: string; cwd?: string } }).terminal_info
-    expect(info?.cwd).toBe(workdir)
-    const updatesForTerminal = updates.filter(u => u.sessionUpdate === 'tool_call_update' && (u._meta as { terminal_output?: unknown } | undefined)?.terminal_output !== undefined)
-    expect(updatesForTerminal.length).toBeGreaterThan(0)
-    // The completed update also carries the parsed exit on _meta.terminal_exit.
-    const exitUpdate = updates.find(u => u.sessionUpdate === 'tool_call_update' && (u._meta as { terminal_exit?: unknown } | undefined)?.terminal_exit !== undefined)
-    expect(exitUpdate).toBeDefined()
+    // The transport exposes only committed assistant text; tool execution is
+    // proved by the world effect above and remains session-log data.
+    expect(updates.length).toBeGreaterThan(0)
+    expect(updates.every(update => update.sessionUpdate === 'agent_message_chunk')).toBe(true)
   }, 180_000)
 })

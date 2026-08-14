@@ -10,7 +10,7 @@ import uuid
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Literal, TypeAlias, TypeVar
+from typing import Callable, TypeAlias, TypeVar
 
 from pydantic import BaseModel
 
@@ -47,6 +47,7 @@ class HarnessClient:
         self._notification_subscribers: dict[
             str, tuple[queue.Queue[Notification | BaseException], NotificationFilter | None]
         ] = {}
+        self._session_parents: dict[str, str] = {}
         self._requests: queue.Queue[IncomingRequest | BaseException] = queue.Queue()
         self._stderr_lines: deque[str] = deque(maxlen=400)
         self._reader_thread: threading.Thread | None = None
@@ -62,6 +63,8 @@ class HarnessClient:
     def start(self) -> None:
         if self._proc is not None:
             return
+        with self._lock:
+            self._session_parents.clear()
         args = list(self.config.launch_args_override or self._default_launch_args())
         env = os.environ.copy()
         if self.config.env:
@@ -117,12 +120,15 @@ class HarnessClient:
         cwd: str,
         provider: str,
         model: str,
+        max_tokens: int | None = None,
     ) -> InitializeResponse:
         payload: JsonObject = {
             "cwd": str(Path(cwd).resolve()),
             "provider": provider,
             "model": model,
         }
+        if max_tokens is not None:
+            payload["maxTokens"] = max_tokens
         try:
             return self.request("initialize", payload, response_model=InitializeResponse)
         except BaseException:
@@ -136,16 +142,17 @@ class HarnessClient:
         *,
         on_notification: Callable[[Notification], None] | None = None,
         notification_subscription: "NotificationSubscription | None" = None,
-    ) -> None:
+    ) -> str:
         payload: JsonObject = {"sessionId": session_id, "contentBlocks": content_blocks}
-        self.request(
+        response = self.request(
             "session/prompt",
             payload,
             response_model=_SessionPromptResponse,
             on_notification=on_notification,
-            notification_filter=_notification_belongs_to_session(session_id),
+            notification_filter=self._notification_belongs_to_session_tree(session_id),
             notification_subscription=notification_subscription,
         )
+        return response.messageId
 
     def request(
         self,
@@ -193,7 +200,8 @@ class HarnessClient:
         return NotificationSubscription(self, subscription_id, notifications)
 
     def subscribe_session_notifications(self, session_id: str) -> "NotificationSubscription":
-        return self.subscribe_notifications(_notification_belongs_to_session(session_id))
+        """Subscribe to a session and descendants discovered from subagent lifecycle edges."""
+        return self.subscribe_notifications(self._notification_belongs_to_session_tree(session_id))
 
     def next_request(self) -> IncomingRequest:
         item = self._requests.get()
@@ -261,7 +269,11 @@ class HarnessClient:
                     if remaining <= 0:
                         with self._lock:
                             self._responses.pop(request_id, None)
-                        raise TimeoutError(f"{method} timed out waiting for DeepSeek Harness runtime")
+                        diagnostics = self._runtime_diagnostics()
+                        suffix = f"\n{diagnostics}" if diagnostics else ""
+                        raise TimeoutError(
+                            f"{method} timed out waiting for DeepSeek Harness runtime{suffix}"
+                        )
                     wait_timeout = remaining if wait_timeout is None else min(wait_timeout, remaining)
                 try:
                     item = waiter.get(timeout=wait_timeout)
@@ -352,6 +364,7 @@ class HarnessClient:
             params = message.get("params")
             notification = Notification(method=method, payload=params if isinstance(params, dict) else {})
             with self._lock:
+                self._record_session_relationship_locked(notification)
                 subscribers = list(self._notification_subscribers.items())
             delivered = False
             for subscription_id, (subscriber, predicate) in subscribers:
@@ -384,6 +397,11 @@ class HarnessClient:
         self._requests.put(exc)
 
     def _runtime_closed_error(self, reason: str) -> TransportClosedError:
+        diagnostics = self._runtime_diagnostics()
+        return TransportClosedError(f"{reason}\n{diagnostics}" if diagnostics else reason)
+
+    def _runtime_diagnostics(self) -> str:
+        """Return available subprocess state for transport failures and timeouts."""
         proc = self._proc
         if (
             proc is not None
@@ -394,14 +412,14 @@ class HarnessClient:
         ):
             self._stderr_thread.join(timeout=0.1)
 
-        parts = [reason]
+        parts: list[str] = []
         if proc is not None:
             exit_code = proc.poll()
             if exit_code is not None:
                 parts.append(f"exit code: {exit_code}")
         if self._stderr_lines:
             parts.append("stderr tail:\n" + "\n".join(self._stderr_lines))
-        return TransportClosedError("\n".join(parts))
+        return "\n".join(parts)
 
     def _default_launch_args(self) -> tuple[str, ...]:
         if self.config.runtime_bin is not None:
@@ -438,6 +456,52 @@ class HarnessClient:
     def _unsubscribe_notifications(self, subscription_id: str) -> None:
         with self._lock:
             self._notification_subscribers.pop(subscription_id, None)
+
+    def _record_session_relationship_locked(self, notification: Notification) -> None:
+        if notification.method != "subagent.started":
+            return
+        parent_id = notification.payload.get("parentSessionId")
+        child_id = notification.payload.get("childSessionId")
+        if (
+            isinstance(parent_id, str)
+            and parent_id
+            and isinstance(child_id, str)
+            and child_id
+            and parent_id != child_id
+        ):
+            self._session_parents[child_id] = parent_id
+
+    def _notification_belongs_to_session_tree(self, session_id: str) -> NotificationFilter:
+        def belongs(notification: Notification) -> bool:
+            payload = notification.payload
+            if notification.method in {"subagent.started", "subagent.finished"}:
+                parent_id = payload.get("parentSessionId")
+                if (
+                    isinstance(parent_id, str)
+                    and self._session_is_descendant_of(parent_id, session_id)
+                ):
+                    return True
+                return payload.get("childSessionId") == session_id
+            related_id = payload.get("sessionId")
+            return (
+                isinstance(related_id, str)
+                and self._session_is_descendant_of(related_id, session_id)
+            )
+
+        return belongs
+
+    def _session_is_descendant_of(self, session_id: str, root_session_id: str) -> bool:
+        current = session_id
+        visited: set[str] = set()
+        while current not in visited:
+            if current == root_session_id:
+                return True
+            visited.add(current)
+            parent = self._session_parents.get(current)
+            if parent is None:
+                return False
+            current = parent
+        return False
 
 
 class NotificationSubscription:
@@ -482,7 +546,7 @@ class NotificationSubscription:
 
 
 class _SessionPromptResponse(BaseModel):
-    accepted: Literal[True]
+    messageId: str
 
 
 class _ShutdownResponse(BaseModel):
@@ -491,15 +555,3 @@ class _ShutdownResponse(BaseModel):
 
 def _int_or_none(value: object) -> int | None:
     return value if isinstance(value, int) else None
-
-
-def _notification_belongs_to_session(session_id: str) -> NotificationFilter:
-    def belongs(notification: Notification) -> bool:
-        payload = notification.payload
-        return (
-            payload.get("sessionId") == session_id
-            or payload.get("parentSessionId") == session_id
-            or payload.get("childSessionId") == session_id
-        )
-
-    return belongs

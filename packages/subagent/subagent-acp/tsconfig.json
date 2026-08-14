@@ -27,10 +27,16 @@
       "path": "../subagent"
     },
     {
-      "path": "../subagent-subprocess"
+      "path": "../../subprocess/subprocess"
     },
     {
-      "path": "../../support/loader-smoke"
+      "path": "../../util/timeout"
+    },
+    {
+      "path": "../../test-support/loader-smoke"
+    },
+    {
+      "path": "../../runtime-diagnostics/invariants"
     }
   ]
 }

@@ -1,0 +1,11 @@
+{
+  "bundle": {
+    "externalBin": [
+      "binaries/dsh-backend",
+      "binaries/dsh-backend-spawn-helper"
+    ],
+    "targets": [
+      "deb"
+    ]
+  }
+}

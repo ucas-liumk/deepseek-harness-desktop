@@ -1,46 +1,57 @@
-import { execFile } from 'node:child_process'
-import { existsSync, readdirSync } from 'node:fs'
+/** Run publint over the exact manifest-declared publication view of every package. */
+
+import {
+  globSync,
+  readdirSync,
+  readFileSync,
+  statSync,
+} from 'node:fs'
 import { availableParallelism } from 'node:os'
-import { resolve } from 'node:path'
-import { promisify } from 'node:util'
+import { dirname, relative, resolve, sep } from 'node:path'
+import { parseArgs } from 'node:util'
+import { publint, type Message, type PackFile } from 'publint'
+import { formatMessage } from 'publint/utils'
 
-const execFileAsync = promisify(execFile)
 const CONCURRENCY_ENV = 'DSH_PUBLINT_CONCURRENCY'
+const repositoryRoot = resolve(import.meta.dirname, '..')
+const { values: options } = parseArgs({
+  args: process.argv.slice(2),
+  options: { 'packages-root': { type: 'string' } },
+})
+const packagesRoot = resolve(options['packages-root'] ?? repositoryRoot)
 
-// Discover harness packages at packages/<group>/<pkg>; group containers,
-// examples, and private vendored sources are not package targets.
-const root = resolve(import.meta.dirname, '..')
-const packagesRoot = resolve(root, 'packages')
+interface PackageTarget {
+  path: string
+  directory: string
+  manifest: PackageManifest
+}
 
-// Run publint's JS CLI through the current node, not the .bin shim: the
-// extensionless shim isn't spawnable on Windows (CVE-2024-27980) and the .cmd
-// variant needs shell:true, which space-joins args UNESCAPED (DEP0190) and
-// breaks when the repo path contains spaces. The JS entry is identical on every
-// platform (`bin` is `./src/cli.js` per publint's package.json).
-const publintCli = resolve(root, 'node_modules/publint/src/cli.js')
+interface PackageManifest {
+  name?: string
+  files?: unknown
+}
 
 type PublintResult =
-  | { path: string; status: 'passed'; stdout: string; stderr: string }
-  | { path: string; status: 'failed'; stdout: string; stderr: string; message: string }
+  | { path: string; status: 'passed'; messages: Message[]; manifest: Record<string, unknown> }
+  | { path: string; status: 'failed'; messages: Message[]; manifest: Record<string, unknown>; failure?: string }
 
-function workspacePackages(): string[] {
-  return readdirSync(packagesRoot, { withFileTypes: true })
-    .filter(group => group.isDirectory())
-    .flatMap(group =>
-      readdirSync(resolve(packagesRoot, group.name), { withFileTypes: true })
-        .filter(pkg => pkg.isDirectory())
-        .filter(pkg => existsSync(resolve(packagesRoot, group.name, pkg.name, 'package.json')))
-        .map(pkg => `packages/${group.name}/${pkg.name}`),
-    )
+function workspacePackages(): PackageTarget[] {
+  return globSync('packages/*/*/package.json', { cwd: packagesRoot })
+    .sort()
+    .map((manifestPath) => {
+      const absoluteManifestPath = resolve(packagesRoot, manifestPath)
+      const manifest = JSON.parse(readFileSync(absoluteManifestPath, 'utf8')) as PackageManifest
+      return { path: dirname(manifestPath), directory: dirname(absoluteManifestPath), manifest }
+    })
 }
 
 function publintConcurrency(total: number): number {
   if (total === 0) return 0
 
   const raw = process.env[CONCURRENCY_ENV]
-  if (raw !== undefined) {
+  if (raw !== undefined && raw !== '') {
     const parsed = Number.parseInt(raw, 10)
-    if (!Number.isSafeInteger(parsed) || parsed < 1) {
+    if (!Number.isSafeInteger(parsed) || parsed < 1 || String(parsed) !== raw) {
       throw new Error(`publint-all: ${CONCURRENCY_ENV} must be a positive integer, got ${JSON.stringify(raw)}.`)
     }
     return Math.min(total, parsed)
@@ -49,57 +60,97 @@ function publintConcurrency(total: number): number {
   return Math.min(total, availableParallelism())
 }
 
-function outputText(value: unknown): string {
-  if (typeof value === 'string') return value
-  if (Buffer.isBuffer(value)) return value.toString()
-  return ''
+function publicationFiles(target: PackageTarget): PackFile[] {
+  const paths = new Set<string>()
+  addPath(resolve(target.directory, 'package.json'), paths)
+  const declared = Array.isArray(target.manifest.files)
+    ? target.manifest.files.filter((value): value is string => typeof value === 'string')
+    : []
+  for (const pattern of [
+    ...declared,
+    'README*',
+    'LICENSE*',
+    'LICENCE*',
+    'CHANGELOG*',
+    'CHANGES*',
+    'HISTORY*',
+    'NOTICE*',
+  ]) {
+    for (const match of globSync(pattern, { cwd: target.directory })) {
+      addPath(resolve(target.directory, match), paths)
+    }
+  }
+
+  return [...paths]
+    .sort()
+    .map(path => ({
+      name: `package/${relative(target.directory, path).split(sep).join('/')}`,
+      data: readFileSync(path),
+    }))
 }
 
-async function runPublint(path: string): Promise<PublintResult> {
+function addPath(path: string, paths: Set<string>): void {
+  const stat = statSync(path)
+  if (stat.isDirectory()) {
+    // readdirSync, not globSync: `**/*` skips dot-prefixed segments, but npm
+    // pack publishes dotfiles inside included directories, and this view must
+    // match what npm publishes.
+    for (const entry of readdirSync(path, { recursive: true, withFileTypes: true })) {
+      if (entry.isFile()) paths.add(resolve(entry.parentPath, entry.name))
+    }
+  } else if (stat.isFile()) {
+    paths.add(path)
+  }
+}
+
+async function runPublint(target: PackageTarget): Promise<PublintResult> {
   try {
-    const { stdout, stderr } = await execFileAsync(process.execPath, [publintCli, path], {
-      cwd: root,
-      encoding: 'utf8',
-      maxBuffer: 10 * 1024 * 1024,
+    const result = await publint({
+      pkgDir: 'package',
+      pack: { files: publicationFiles(target) },
     })
-    return { path, status: 'passed', stdout, stderr }
+    const manifest = result.pkg as Record<string, unknown>
+    return result.messages.some(message => message.type === 'error')
+      ? { path: target.path, status: 'failed', messages: result.messages, manifest }
+      : { path: target.path, status: 'passed', messages: result.messages, manifest }
   } catch (error: unknown) {
-    const failed = error as { stdout?: unknown; stderr?: unknown; message?: string }
     return {
-      path,
+      path: target.path,
       status: 'failed',
-      stdout: outputText(failed.stdout),
-      stderr: outputText(failed.stderr),
-      message: failed.message ?? 'publint failed',
+      messages: [],
+      manifest: target.manifest as Record<string, unknown>,
+      failure: error instanceof Error ? error.message : String(error),
     }
   }
 }
 
-async function runAll(paths: string[], concurrency: number): Promise<PublintResult[]> {
+async function runAll(targets: PackageTarget[], concurrency: number): Promise<PublintResult[]> {
   let next = 0
   const results: Array<PublintResult | undefined> = []
   await Promise.all(Array.from({ length: concurrency }, async () => {
     for (;;) {
       const index = next
       next += 1
-      const path = paths[index]
-      if (path === undefined) return
-      results[index] = await runPublint(path)
+      const target = targets[index]
+      if (target === undefined) return
+      results[index] = await runPublint(target)
     }
   }))
 
-  return paths.map((path, index) => {
+  return targets.map((target, index) => {
     const result = results[index]
-    if (result === undefined) throw new Error(`publint-all: missing result for ${path}.`)
+    if (result === undefined) throw new Error(`publint-all: missing result for ${target.path}.`)
     return result
   })
 }
 
 function printResult(result: PublintResult): void {
   console.log(`Running publint for ${result.path}...`)
-  process.stdout.write(result.stdout)
-  process.stderr.write(result.stderr)
-  if (result.status === 'failed') console.error(result.message)
+  if ('failure' in result) console.error(result.failure)
+  for (const message of result.messages) {
+    console.log(formatMessage(message, result.manifest, { color: false }) ?? message.code)
+  }
+  if (result.status === 'passed' && result.messages.length === 0) console.log('All good!')
 }
 
 const packages = workspacePackages()

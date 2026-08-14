@@ -1,12 +1,13 @@
 /**
- * Same-world process-confinement seam: wrap exact subprocess argv under a
+ * Service Definition for the same-world process-confinement capability seam: wrap exact subprocess argv under a
  * host-path file policy. Containers, microVMs, and remote execution replace the
  * surrounding capability seam instead; this service shares the host kernel and filesystem.
  * @module @deepseek-ai/dsh-sandbox
  */
 
-import { Context, Service } from 'cordis'
+import { Context, Service } from '@deepseek-ai/cordis'
 import { HarnessError } from '@deepseek-ai/dsh-llm'
+import type { SessionId } from '@deepseek-ai/dsh-session'
 
 export {
   ESCALATION_TARGETS,
@@ -31,6 +32,26 @@ export type SandboxMode = 'read-only' | 'workspace-write' | 'danger-full-access'
 export type ConfinedSandboxMode = Exclude<SandboxMode, 'danger-full-access'>
 
 /**
+ * The complete file-effect policy resolved for one capability call. The root
+ * is carried even under modes that do not consume it so callers can resolve
+ * policy once before choosing the enforcement path.
+ */
+export interface SandboxExecutionPolicy {
+  /** The file-effect mode this execution runs under. */
+  mode: SandboxMode
+  /** Absolute root directory `workspace-write` may write under. */
+  workspaceRoot: string
+  /**
+   * Opaque identity of the calling session (the branded `dsh-session`
+   * SessionId). Backends key per-session state off it (e.g. windows-acl gives
+   * each live session/workspace pair a random private temp directory and SID,
+   * while the workspace SID and standing grant remain per-workspace); absent
+   * for agentless calls, which fall back to per-call backend state.
+   */
+  sessionId?: SessionId
+}
+
+/**
  * Enforcement completeness for this host. `partial` means an active backend or
  * older kernel ABI cannot govern every promised file effect; callers requiring
  * an absolute boundary must not treat it as `full`.
@@ -42,15 +63,28 @@ export type SandboxEnforcement = 'full' | 'partial'
  * fixed on the provider: two consumers may confine under different policies
  * at the same instant (bash under `read-only` while a confined child agent
  * needs its state directory writable), and an approved escalated retry is a
- * new call with a wider policy. Defaulting/resolution is the consumer's
- * explicit step (its config owns the fallback chain); the provider treats
- * the policy as fully specified.
+ * new call with a wider policy. Defaulting/resolution is an explicit step at
+ * the consumer boundary; the provider treats the policy as fully specified.
  */
-export interface SandboxPolicy {
+export interface SandboxPolicy extends SandboxExecutionPolicy {
   /** The file-effect mode this execution runs under. */
   mode: ConfinedSandboxMode
-  /** Absolute root directory `workspace-write` may write under. */
-  workspaceRoot: string
+}
+
+/**
+ * Evidence that identifies a sandbox runner failing before it executes the
+ * wrapped command. A consumer first applies {@link allowedExitCodes} when
+ * present, removes {@link informationalLines} by case-insensitive exact line
+ * equality, then matches {@link fatalSignatures} case-insensitively within
+ * each remaining stderr line. Exit status alone never proves runner failure.
+ */
+export interface RunnerFailureRule {
+  /** Nonzero process exit codes on which this rule may match; omitted permits any nonzero exit. */
+  allowedExitCodes?: readonly number[]
+  /** Non-empty substrings identifying a fatal runner diagnostic on one stderr line. */
+  fatalSignatures: readonly string[]
+  /** Benign stderr lines excluded by exact full-line equality before fatal matching. */
+  informationalLines?: readonly string[]
 }
 
 /**
@@ -73,11 +107,12 @@ export interface ConfinedArgv {
    */
   denialSignatures: readonly string[]
   /**
-   * Case-insensitive signatures for runner failure before command execution.
-   * Consumers check these before denial signatures: runner failure means the
+   * Structured runner-failure evidence rules. Consumers require a matching
+   * fatal stderr line (after informational exclusions) and any rule-specific
+   * exit-code gate before checking denial signatures: runner failure means the
    * command never ran, while denial means confinement worked and blocked it.
    */
-  runnerFailureSignatures: readonly string[]
+  runnerFailureRules: readonly RunnerFailureRule[]
 }
 
 /**
@@ -98,8 +133,9 @@ export class SandboxUnavailableError extends HarnessError {
     super(
       `sandbox mode "${mode}" is requested but no sandbox backend is usable on this host; `
       + 'refusing to run the command unconfined. Install bubblewrap or run a Landlock-enforcing '
-      + 'kernel (Linux), ensure sandbox-exec is usable (macOS) — Windows has no confinement '
-      + 'backend yet — or switch the consumer to danger-full-access.'
+      + 'kernel (Linux), ensure sandbox-exec is usable (macOS), or ensure the ACL '
+      + 'restricted-token runner can start (Windows) — otherwise switch the consumer to '
+      + 'danger-full-access.'
       + (detail === undefined ? '' : ` Runner failure: ${detail}`),
       SANDBOX_UNAVAILABLE,
     )
@@ -107,7 +143,7 @@ export class SandboxUnavailableError extends HarnessError {
   }
 }
 
-declare module 'cordis' {
+declare module '@deepseek-ai/cordis' {
   interface Context {
     sandbox: SandboxProvider
   }
@@ -120,6 +156,7 @@ declare module 'cordis' {
  * skipped for a sole candidate, whose own refusal remains the fail-closed end.
  */
 export abstract class SandboxProvider extends Service {
+  /* v8 ignore next -- abstract service construction is covered through concrete provider packages. */
   constructor(ctx: Context) {
     super(ctx, 'sandbox')
   }

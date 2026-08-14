@@ -1,5 +1,5 @@
 /**
- * Tests for the sandbox-enforcing filesystem backend: the per-call mode fence
+ * Tests for the sandbox-enforcing filesystem backend: the per-call policy fence
  * on write/edit (read-only denies, workspace-write contains, danger-full-access
  * passes through), reads always passing through, the capability fact, and the
  * containment matrix — `..` traversal, absolute paths outside, and symlink
@@ -12,8 +12,8 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises'
 import { existsSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
-import { join } from 'node:path'
-import { Context } from 'cordis'
+import { join, parse } from 'node:path'
+import { Context } from '@deepseek-ai/cordis'
 import { FsError, FsTargetKey } from '@deepseek-ai/dsh-fs'
 import type { FsTarget } from '@deepseek-ai/dsh-fs'
 import SandboxPolicyService from '@deepseek-ai/dsh-sandbox-policy'
@@ -167,16 +167,15 @@ describe('workspace-write containment', () => {
 })
 
 describe('workspace-write with the filesystem root as the workspace (a root ending in the path separator)', () => {
-  it('grants writes anywhere: containment against `/` allows any absolute path', async () => {
-    // A degenerate but valid config — workspaceRoot '/'. It exercises isUnder's
-    // separator-suffixed-root branch: `/` already ends in the separator, so the
-    // prefix stays `/` and every absolute path is contained.
+  it('grants writes anywhere on that volume', async () => {
+    // A degenerate but valid config: the filesystem root containing the target.
+    // It exercises the separator-suffixed-root branch on POSIX and Windows.
     const rootCtx = new Context()
-    await rootCtx.plugin(SandboxPolicyService, { mode: 'workspace-write', workspaceRoot: '/' })
+    await rootCtx.plugin(SandboxPolicyService, { mode: 'workspace-write', workspaceRoot: parse(base).root })
     const rootFiber = await rootCtx.plugin(SandboxedFileSystem, { cwd: workspace })
     const rootFs = rootCtx.fs as SandboxedFileSystem
     try {
-      const path = join(base, 'anywhere.txt') // under HOME, outside /tmp — allowed only via the `/` root
+      const path = join(base, 'anywhere.txt') // under HOME, outside temp — allowed only via the filesystem root
       await rootFs.writeText(await rootFs.resolve(path), 'anywhere')
       expect(await readFile(path, 'utf8')).toBe('anywhere')
     } finally {
@@ -195,12 +194,12 @@ describe('danger-full-access', () => {
   })
 })
 
-describe('the per-call mode override (escalation)', () => {
+describe('the per-call policy override (escalation)', () => {
   it('a workspace-write stamp on a read-only default lets a contained write land for that call only', async () => {
     await boot('read-only')
     const path = join(workspace, 'escalated.txt')
-    // Default read-only would deny; the per-call workspace-write stamp allows it (contained).
-    await fs.writeText(await target(path), 'granted', undefined, undefined, 'workspace-write')
+    // Default read-only would deny; the per-call workspace-write policy allows it (contained).
+    await fs.writeText(await target(path), 'granted', undefined, undefined, { mode: 'workspace-write', workspaceRoot: workspace })
     expect(await readFile(path, 'utf8')).toBe('granted')
     // A neighboring plain call still runs under the read-only default.
     await expect(fs.writeText(await target(join(workspace, 'plain.txt')), 'x'))
@@ -210,7 +209,7 @@ describe('the per-call mode override (escalation)', () => {
   it('a danger-full-access stamp bypasses the fence for that call', async () => {
     await boot('read-only')
     const path = join(outside, 'granted-full.txt')
-    await fs.writeText(await target(path), 'full', undefined, undefined, 'danger-full-access')
+    await fs.writeText(await target(path), 'full', undefined, undefined, { mode: 'danger-full-access', workspaceRoot: workspace })
     expect(await readFile(path, 'utf8')).toBe('full')
   })
 })

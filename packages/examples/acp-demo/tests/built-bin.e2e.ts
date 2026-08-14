@@ -17,13 +17,13 @@ import {
 import { Readable, Writable } from 'node:stream'
 import { promisify } from 'node:util'
 import { zstdDecompress } from 'node:zlib'
+import { execa } from 'execa'
 import { afterEach, describe, expect, it } from 'vitest'
 
 /**
  * Published-entry smoke: run `lib/bin.js` under plain Node in a symlinked external consumer and
  * complete a mock-backed turn. This catches built-only settle races, stdout protocol leaks, and
- * published persistence behavior that the tsx source-path smoke cannot. It skips before build;
- * `--expose-internals` enables Cordis bare-plugin loading.
+ * published persistence behavior that the tsx source-path smoke cannot. It skips before build.
  */
 
 const repoRoot = fileURLToPath(new URL('../../../../', import.meta.url))
@@ -32,10 +32,11 @@ const decompress = promisify(zstdDecompress)
 
 const dshPackages = [
   'examples/agent-spine-demo', 'core/agent', 'core/session', 'core/system-prompt',
-  'core/tools', 'core/agent-loop', 'llm/llm', 'bash/bash',
-  'bash/bash-local', 'bash/tool-bash', 'context/workspace-context', 'support/invariants', 'ui/app-boot',
-  'session-persistence/session-persistence',
-  'session-persistence/session-persistence-jsonl', 'ui/acp', 'examples/acp-demo', 'util/paths',
+  'core/tools', 'core/agent-loop', 'llm/llm', 'shell/shell',
+  'shell/bash-local', 'shell/tool-bash', 'subprocess/subprocess', 'subprocess/subprocess-local', 'context/agent-instructions', 'runtime-diagnostics/invariants', 'boot/app-boot',
+  'session/session-persistence',
+  'session/session-checkpoint-policy', 'session/session-persistence-jsonl',
+  'acp/acp', 'examples/acp-demo', 'util/home-paths',
 ]
 const vendorPackages = [
   'cordis', 'loader', 'include', 'timer', 'hmr', 'logger-console',
@@ -43,8 +44,8 @@ const vendorPackages = [
 ]
 // Resolve ACP's declared third-party dependencies from that package, not this test: pnpm's strict
 // layout need not hoist them. Symlink those exact paths into the plain-Node consumer.
-const npmDeps = ['@agentclientprotocol/sdk', 'zod']
-const acpPkgDir = join(repoRoot, 'packages/ui/acp')
+const npmDeps = ['@agentclientprotocol/sdk']
+const acpPkgDir = join(repoRoot, 'packages/acp/acp')
 
 async function pkgName(absDir: string): Promise<string> {
   const json = JSON.parse(await readFile(join(absDir, 'package.json'), 'utf8')) as { name: string }
@@ -70,7 +71,7 @@ async function makeConsumer(): Promise<string> {
     await link(abs, await pkgName(abs), nm)
   }
   for (const dep of npmDeps) {
-    // Resolve from `ui/acp`'s package.json URL (the package that declares the
+    // Resolve from ACP's package.json URL (the package that declares the
     // dep), not this test file's location — `acp-agent` does not depend on these.
     const fromAcp = pathToFileURL(join(acpPkgDir, 'package.json')).href
     const resolved = fileURLToPath(import.meta.resolve(`${dep}/package.json`, fromAcp))
@@ -94,6 +95,8 @@ async function makeConsumer(): Promise<string> {
   await writeFile(join(dir, 'cordis.yml'), [
     '- id: mock-llm',
     '  name: \'./mock-llm.mjs\'',
+    '- id: subprocess',
+    '  name: \'@deepseek-ai/dsh-subprocess-local\'',
     '- id: bash',
     '  name: \'@deepseek-ai/dsh-bash-local\'',
     '- id: acp-agent',
@@ -131,7 +134,7 @@ afterEach(async () => {
 describe.skipIf(!existsSync(acpBin))('dsh-acp-demo BUILT bin (node lib/bin.js, no tsx)', () => {
   it('boots the published bin, completes a turn, and writes default Zstandard persistence', async () => {
     consumer = await makeConsumer()
-    child = spawn(process.execPath, ['--expose-internals', acpBin, '--config', './cordis.yml'], {
+    child = spawn(process.execPath, [acpBin, '--config', './cordis.yml'], {
       cwd: consumer,
       env: {
         ...process.env,
@@ -152,8 +155,12 @@ describe.skipIf(!existsSync(acpBin))('dsh-acp-demo BUILT bin (node lib/bin.js, n
       Writable.toWeb(child.stdin!) as WritableStream<Uint8Array>,
       Readable.toWeb(passthrough) as ReadableStream<Uint8Array>,
     )
+    const updates: SessionNotification['update'][] = []
     const makeClient = (_a: AcpAgent): Client => ({
-      sessionUpdate(_p: SessionNotification): Promise<void> { return Promise.resolve() },
+      sessionUpdate(params: SessionNotification): Promise<void> {
+        updates.push(params.update)
+        return Promise.resolve()
+      },
       requestPermission(_p: RequestPermissionRequest): Promise<RequestPermissionResponse> {
         return Promise.resolve({ outcome: { outcome: 'cancelled' } })
       },
@@ -161,14 +168,18 @@ describe.skipIf(!existsSync(acpBin))('dsh-acp-demo BUILT bin (node lib/bin.js, n
     const client = new ClientSideConnection(makeClient, stream)
 
     const init = await client.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} })
-    // A response at all proves the built bin booted the bridge (the settle-race
-    // regression would exit before answering); loadSession proves the real app
-    // mounted, not a collapsed export shape.
-    expect(init.agentCapabilities?.loadSession).toBe(true)
-    const { sessionId } = await client.newSession({ cwd: consumer, mcpServers: [] })
+    expect(init.agentCapabilities).toEqual({
+      promptCapabilities: { image: false, audio: false, embeddedContext: false },
+    })
+    const sessionCwd = consumer
+    const { sessionId } = await client.newSession({ cwd: sessionCwd, mcpServers: [] })
     const result = await client.prompt({ sessionId, prompt: [{ type: 'text', text: 'reply' }] })
     expect(result.stopReason).toBe('end_turn')
-    const sessionsRoot = join(consumer, '.sessions')
+    await expect.poll(() => updates).toEqual([{
+      sessionUpdate: 'agent_message_chunk',
+      content: { type: 'text', text: 'ACP BUILT OK' },
+    }])
+    const sessionsRoot = join(sessionCwd, '.sessions')
     let log: string | undefined
     await expect.poll(async () => {
       log = (await readdir(sessionsRoot, { recursive: true })).find(file => file.endsWith('.jsonl.zstd'))
@@ -199,27 +210,22 @@ describe.skipIf(!existsSync(acpBin))('dsh-acp-demo BUILT bin (node lib/bin.js, n
     expect(code).not.toBe(0)
     expect(stderr).toContain('config file not found')
   }, 30_000)
+
 })
 
-/** Spawn the built acp bin against `configArg` and resolve with its exit code + stderr. */
-function runBinExpectingExit(configArg: string, cwd: string = tmpdir()): Promise<{ code: number; stderr: string }> {
-  return new Promise((resolve, reject) => {
-    const proc = spawn(process.execPath, ['--expose-internals', acpBin, '--config', configArg], {
-      cwd,
-      env: {
-        ...process.env,
-        DSH_HOME: join(cwd, '.dsh'),
-        DSH_AGENTS_HOME: join(cwd, '.agents'),
-      },
-      stdio: ['pipe', 'pipe', 'pipe'],
-    })
-    child = proc
-    let stderr = ''
-    proc.stderr.setEncoding('utf8')
-    proc.stderr.on('data', (c: string) => { stderr += c })
-    const timer = setTimeout(() => { proc.kill('SIGKILL'); reject(new Error(`bin did not exit within 25s. stderr:\n${stderr}`)) }, 25_000)
-    proc.on('exit', (code) => { clearTimeout(timer); resolve({ code: code ?? -1, stderr }) })
-    proc.on('error', (err) => { clearTimeout(timer); reject(err) })
-    proc.stdin.end()
+/** Spawn the built acp bin against `configArg` (stdin closed at EOF) and resolve with its exit code + stderr. */
+async function runBinExpectingExit(configArg: string, cwd: string = tmpdir()): Promise<{ code: number; stderr: string }> {
+  const result = await execa(process.execPath, [acpBin, '--config', configArg], {
+    cwd,
+    env: {
+      DSH_HOME: join(cwd, '.dsh'),
+      DSH_AGENTS_HOME: join(cwd, '.agents'),
+    },
+    input: '',
+    timeout: 25_000,
+    killSignal: 'SIGKILL',
+    reject: false,
   })
+  if (result.timedOut) throw new Error(`bin did not exit within 25s. stderr:\n${result.stderr}`)
+  return { code: result.exitCode ?? -1, stderr: result.stderr }
 }

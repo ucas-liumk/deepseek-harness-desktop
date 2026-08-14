@@ -1,3 +1,4 @@
+import { createUserMessage } from '@deepseek-ai/dsh-llm'
 /**
  * Loop-level tool-order determinism: the request/header event — and therefore the frozen
  * request the adapter receives — carries the assembly's canonical tool order (system-prompt's
@@ -7,12 +8,12 @@
  */
 
 import { describe, expect, it } from 'vitest'
-import { Context } from 'cordis'
-import LlmService from '@deepseek-ai/dsh-llm'
+import { Context } from '@deepseek-ai/cordis'
+import LlmRuntime from '@deepseek-ai/dsh-llm'
 import SessionStore, { SessionId, foldRequestHeader } from '@deepseek-ai/dsh-session'
 import SystemPrompt, { TOOL_ORDER_REST } from '@deepseek-ai/dsh-system-prompt'
 import type { Config as SystemPromptConfig } from '@deepseek-ai/dsh-system-prompt'
-import ToolRegistry, { defineTool } from '@deepseek-ai/dsh-tools'
+import ToolRuntime, { defineContentToolFixture } from '@deepseek-ai/dsh-tools'
 import AgentRegistry, { type Agent } from '@deepseek-ai/dsh-agent'
 
 import AgentLoop from '@deepseek-ai/dsh-agent-loop'
@@ -20,10 +21,10 @@ import { MockAdapter, textResponse } from './mock-adapter.ts'
 
 async function harness(adapter: MockAdapter, toolOrder?: SystemPromptConfig['toolOrder']) {
   const ctx = new Context()
-  await ctx.plugin(LlmService)
+  await ctx.plugin(LlmRuntime)
   await ctx.plugin(SessionStore)
   await ctx.plugin(SystemPrompt, { persona: 'stable base', ...toolOrder !== undefined ? { toolOrder } : {} })
-  await ctx.plugin(ToolRegistry)
+  await ctx.plugin(ToolRuntime)
   await ctx.plugin(AgentRegistry)
   await ctx.plugin(AgentLoop, { agents: [] })
   ctx.llm.registerAdapter(['mock'], adapter)
@@ -32,7 +33,7 @@ async function harness(adapter: MockAdapter, toolOrder?: SystemPromptConfig['too
 
 function waitForIdle(ctx: Context, agent: Agent): Promise<void> {
   return new Promise((resolve) => {
-    const dispose = ctx.on('agent/status', (subject, status) => {
+    const dispose = ctx.on('agent/status', ({ agent: subject, status }) => {
       if (subject === agent && status === 'idle') {
         dispose()
         resolve()
@@ -42,7 +43,7 @@ function waitForIdle(ctx: Context, agent: Agent): Promise<void> {
 }
 
 function registerNamed(ctx: Context, name: string) {
-  ctx.tools.register(defineTool({
+  ctx.tools.register(defineContentToolFixture({
     name,
     description: `the ${name} tool`,
     parameters: {},
@@ -58,7 +59,7 @@ async function runTurn(registrationOrder: string[], toolOrder?: SystemPromptConf
   const ctx = await harness(adapter, toolOrder)
   for (const name of registrationOrder) registerNamed(ctx, name)
   const agent = ctx.agentLoop.create(SessionId('a1'), { provider: 'mock', model: 'mock' })
-  agent.send([{ type: 'text', text: 'go' }])
+  agent.followup(createUserMessage({ content: [{ type: 'text', text: 'go' }], source: { kind: 'user' } }))
   await waitForIdle(ctx, agent)
   return { ctx, agent, adapter }
 }
@@ -92,22 +93,18 @@ describe('loop-level canonical tool order', () => {
     expect(Object.isFrozen(adapter.requests[0])).toBe(true)
   })
 
-  it('fails the turn — no model request — when toolOrder names an unregistered tool', async () => {
-    // Unknown tool order fails before step or request creation and returns the agent to idle.
+  it('closes a no-step turn when toolOrder names an unregistered tool', async () => {
     const adapter = new MockAdapter([textResponse('never sent')])
     const ctx = await harness(adapter, ['ghost', TOOL_ORDER_REST])
     registerNamed(ctx, 'alpha')
-    const errors: Error[] = []
-    ctx.on('agent/error', (_agent, _turn, _step, error) => void errors.push(error))
     const agent = ctx.agentLoop.create(SessionId('a1'), { provider: 'mock', model: 'mock' })
-    agent.send([{ type: 'text', text: 'go' }])
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'go' }], source: { kind: 'user' } }))
     await waitForIdle(ctx, agent)
     expect(adapter.requests).toHaveLength(0)
-    expect(errors.map(e => e.message)).toEqual(['toolOrder lists unregistered tool "ghost"; known tools: alpha'])
     expect(foldRequestHeader(agent.session.events)).toBeUndefined()
-    const end = agent.session.events.find(e => e.type === 'turn/end')
-    expect(end?.type === 'turn/end' && end.data.reason).toMatchObject({ kind: 'error', step: 1 })
-    // The turn is balanced (turn/start → turn/end) with no step events inside.
+    expect(agent.session.events.some(e => e.type === 'turn/start')).toBe(true)
+    expect(agent.session.events.some(e => e.type === 'turn/end')).toBe(true)
     expect(agent.session.events.some(e => e.type === 'step/start')).toBe(false)
+    expect(agent.session.events.some(e => e.type === 'step/end')).toBe(false)
   })
 })

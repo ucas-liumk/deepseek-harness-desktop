@@ -5,16 +5,16 @@
  * @module @deepseek-ai/dsh-tool-fs/src/write
  */
 
-import type { Context } from 'cordis'
+import type { Context } from '@deepseek-ai/cordis'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { DiffCallView, DiffResultView, ToolResult } from '@deepseek-ai/dsh-tools'
-import type { ContentBlock } from '@deepseek-ai/dsh-llm'
 import type { FsWriteOutcome } from '@deepseek-ai/dsh-fs'
 import type {} from '@deepseek-ai/dsh-fs'
 import type {} from '@deepseek-ai/dsh-system-prompt'
-import { computeHunkDiffs, diffsFromMeta, type FsDiffMeta } from './diff.ts'
+import { computeHunkDiffs, diffsFromMeta } from './diff.ts'
+import { remediateFsError } from './error.ts'
 import { sessionResolveOptions } from './session-cwd.ts'
-import type { FsSandboxSurface } from './sandbox.ts'
+import type { FsSandboxController } from './sandbox.ts'
 
 /**
  * Validate value constraints the schema DSL can't express: only a non-blank
@@ -33,7 +33,7 @@ export function parseWriteArgs(args: { file_path: string; content: string }): { 
  * @param outcome - the write outcome; its `operation` selects the Created/Updated wording.
  * @returns the model-facing confirmation envelope (no file content is echoed back).
  */
-export function formatWriteOutput(displayPath: string, outcome: FsWriteOutcome): string {
+export function formatWriteOutput(displayPath: string, outcome: Pick<FsWriteOutcome, 'operation'>): string {
   const verb = outcome.operation === 'create' ? 'Created' : 'Updated'
   return `<path>${displayPath}</path>
 <type>file</type>
@@ -43,7 +43,7 @@ ${verb} file
 }
 
 /**
- * The `write` tool's validated argument shape: the base parameters plus the
+ * The `write` tool's validated arguments: the base parameters plus the
  * two escalation fields, advertised only under a confining `ctx.fs` (absent
  * from the schema otherwise, so the validator rejects them before `execute`).
  */
@@ -57,13 +57,13 @@ interface WriteToolArgs {
 /**
  * Register the `write` tool and its system-prompt guidance.
  * @param ctx - the plugin context; registrations are effects scoped to it, and execution uses its `fs` service.
- * @param sandbox - the shared sandbox-escalation surface (advertisement, mode stamping, denial mapping).
+ * @param sandbox - the shared sandbox-escalation API (advertisement, mode stamping, denial mapping).
  */
-export function applyWriteTool(ctx: Context, sandbox: FsSandboxSurface): void {
+export function applyWriteTool(ctx: Context, sandbox: FsSandboxController): void {
   ctx.systemPrompt.section({
     name: 'tool:write',
     order: 101,
-    text: 'Use the write tool to create files or completely replace file contents. Existing files are overwritten, so read an existing file first (the default fs-policy requires it) and prefer edit for targeted changes.',
+    text: 'Use the write tool to create files or completely replace file contents. Existing files are overwritten, so read an existing file first (the default fs-observation-policy requires it) and prefer edit for targeted changes.',
   })
 
   ctx.tools.register(defineTool({
@@ -74,37 +74,61 @@ export function applyWriteTool(ctx: Context, sandbox: FsSandboxSurface): void {
       content: { type: 'string', required: true, description: 'Full UTF-8 text content to write.' },
       ...sandbox.escalationModes.length > 0 ? sandbox.schemaFields() : {},
     },
-    async execute(args: WriteToolArgs, exec): Promise<{ content: ContentBlock[]; meta?: FsDiffMeta }> {
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          path: { type: 'string', required: true },
+          operation: { type: 'string', required: true, enum: ['create', 'update'] },
+          before: {
+            required: true,
+            oneOf: [
+              { type: 'string' },
+              { type: 'null' },
+            ],
+          },
+          after: { type: 'string', required: true },
+        },
+      },
+      render: (_args, value) => [{ type: 'text', text: formatWriteOutput(value.path, value) }],
+      presentationMeta: (args, value) => ({
+        diffs: value.before === null
+          ? []
+          : computeHunkDiffs(args.file_path, value.before, value.after)
+            .map(({ path, oldText, newText }) => ({ path, oldText, newText })),
+      }),
+    },
+    async execute(args: WriteToolArgs, exec) {
       const input = parseWriteArgs(args)
-      // Resolve the per-call sandbox mode (escalation grant > session override
-      // > backend default) BEFORE anything executes; an escalating call
-      // resolves approval here and throws its distinct text on any non-grant.
-      const sandboxMode = await sandbox.stampMode('write', args, exec)
-      const target = await ctx.fs.resolve(input.filePath, sessionResolveOptions(exec))
+      // Resolve the per-call sandbox policy (approved mode > session override
+      // > backend default, plus the session cwd root) BEFORE anything executes;
+      // an escalating call throws its distinct text on any non-grant.
+      const sandboxPolicy = await sandbox.resolvePolicy('write', args, exec)
+      const target = await ctx.fs.resolve(input.filePath, sessionResolveOptions(exec, input.filePath, sandboxPolicy?.workspaceRoot))
       // Single-slot decision: the policy plugin produces createIfAbsent/
       // replaceIfVersion; the bare default is undefined (unconditional). No stat.
       const intent = await ctx.waterfall('fs/write-intent', target, exec, () => undefined)
       let outcome: FsWriteOutcome
       try {
-        outcome = await ctx.fs.writeText(target, input.content, intent, exec.signal, sandboxMode)
+        outcome = await ctx.fs.writeText(target, input.content, intent, exec.signal, sandboxPolicy)
       } catch (error: unknown) {
         // A sandbox denial becomes the shared [sandbox: …] marker (the model
-        // recognizes it from bash); any other error passes through.
-        throw sandbox.mapError(error, sandboxMode)
+        // recognizes it from bash); stale/not-observed failures gain their
+        // model-facing remedy; anything else passes through.
+        throw remediateFsError(sandbox.mapError(error, sandboxPolicy))
       }
-      // Record the observed version (a no-op when no policy plugin listens).
-      ctx.emit('fs/observed', target, outcome.version, exec)
-      // Overwrites carry applied hunks. Creates have no prior text, so result presentation uses
-      // the args-derived whole-file diff instead.
-      const diffs = outcome.before !== null ? computeHunkDiffs(input.filePath, outcome.before, outcome.after) : []
+      // Record the present observation (a no-op when no policy plugin listens).
+      ctx.emit('fs/observed', target, { kind: 'present', version: outcome.version }, exec)
       return {
-        content: [{ type: 'text', text: formatWriteOutput(target.displayPath, outcome) }],
-        ...diffs.length > 0 ? { meta: { diffs } } : {},
+        path: target.displayPath,
+        operation: outcome.operation,
+        before: outcome.before,
+        after: outcome.after,
       }
     },
-    // Pure display: a diff card (an editor renders write as a new-file / full- replace diff).
-    // `oldText: null` — a call-time presenter has no access to the file's prior content, so
-    // even an overwrite renders new-file style, matching claude-agent-acp.
+    // Pure display: a diff card. A call-time presenter has no access to prior
+    // file content, so `oldText: null` also represents an overwrite here.
     presentCall(args): DiffCallView {
       return {
         card: 'diff',
@@ -113,10 +137,9 @@ export function applyWriteTool(ctx: Context, sandbox: FsSandboxSurface): void {
         locations: [{ path: args.file_path }],
       }
     },
-    // Result-time display: a `diff` card so the completed `tool_call_update` re-installs the
-    // diff rather than the model-facing result text (an ACP `tool_call_update.content` REPLACES
-    // the call's content, so a text result would clobber the pending diff card). Overwrites use
-    // applied metadata; creates and identical overwrites use the replay-safe args fallback.
+    // Result-time display repeats the diff because completed views replace the
+    // pending view. Overwrites use applied metadata; creates and identical
+    // overwrites use the replay-safe args fallback.
     presentResult(args, result: ToolResult): DiffResultView | undefined {
       if (result.isError) return undefined
       const diffs = diffsFromMeta(result.meta)

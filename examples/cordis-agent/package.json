@@ -1,7 +1,0 @@
-{
-  "name": "cordis-agent-example",
-  "private": true,
-  "version": "0.0.1",
-  "type": "module",
-  "description": "Runnable demo: the self-referential harness — an agent that inspects and modifies its own cordis runtime"
-}

@@ -5,18 +5,18 @@
  * is a finding, not timing noise.
  *
  * Invariants: every sent message appears exactly once in the log (none lost);
- * turn numbers strictly increase; status transitions follow the legal machine
- * idle→running→idle (and →disposed at teardown).
+ * turn numbers strictly increase; status transitions follow
+ * idle→running→idle, while teardown is a registry lifecycle.
  */
 
 import { describe, expect, it } from 'vitest'
-import { Context } from 'cordis'
-import LlmService from '@deepseek-ai/dsh-llm'
+import { Context } from '@deepseek-ai/cordis'
+import LlmRuntime from '@deepseek-ai/dsh-llm'
+import { createUserMessage, LlmAdapter } from '@deepseek-ai/dsh-llm'
 import type { GenerateOptions, StreamChunk } from '@deepseek-ai/dsh-llm'
-import { LlmAdapter } from '@deepseek-ai/dsh-llm'
 import SessionStore, { SessionId } from '@deepseek-ai/dsh-session'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
-import ToolRegistry from '@deepseek-ai/dsh-tools'
+import ToolRuntime from '@deepseek-ai/dsh-tools'
 import AgentRegistry, { type Agent } from '@deepseek-ai/dsh-agent'
 
 import AgentLoop from '@deepseek-ai/dsh-agent-loop'
@@ -37,10 +37,10 @@ class EchoAdapter extends LlmAdapter {
 
 async function harness() {
   const ctx = new Context()
-  await ctx.plugin(LlmService)
+  await ctx.plugin(LlmRuntime)
   await ctx.plugin(SessionStore)
   await ctx.plugin(SystemPrompt)
-  await ctx.plugin(ToolRegistry)
+  await ctx.plugin(ToolRuntime)
   await ctx.plugin(AgentRegistry)
   await ctx.plugin(AgentLoop, { agents: [] })
   ctx.llm.registerAdapter(['mock'], new EchoAdapter())
@@ -50,7 +50,7 @@ async function harness() {
 /** Resolve on the agent's next transition to idle (event-based, not polled). */
 function nextIdle(ctx: Context, agent: Agent): Promise<void> {
   return new Promise((resolve) => {
-    const dispose = ctx.on('agent/status', (subject, status) => {
+    const dispose = ctx.on('agent/status', ({ agent: subject, status }) => {
       if (subject === agent && status === 'idle') {
         dispose()
         resolve()
@@ -63,7 +63,7 @@ function nextIdle(ctx: Context, agent: Agent): Promise<void> {
  * the seen list plus a disposer for the listener (per the registry convention). */
 function recordStatus(ctx: Context, agent: Agent): { seen: string[]; dispose: () => void } {
   const seen: string[] = []
-  const dispose = ctx.on('agent/status', (subject, status) => {
+  const dispose = ctx.on('agent/status', ({ agent: subject, status }) => {
     if (subject === agent) seen.push(status)
   })
   return { seen, dispose }
@@ -78,7 +78,7 @@ function userMessageTexts(agent: Agent): string[] {
 function turnNumbers(agent: Agent): number[] {
   return agent.session.events
     .filter(e => e.type === 'turn/start')
-    .map(e => (e.data as { turn: number }).turn)
+    .map(e => e.data.turn)
 }
 
 function turnEndNumbers(agent: Agent): number[] {
@@ -115,7 +115,7 @@ describe('agent loop scheduling properties', () => {
           const { seen: trace } = recordStatus(ctx, agent)
           const idle = nextIdle(ctx, agent)
           // Send all in one synchronous tick: they queue before the loop wakes.
-          for (const text of texts) agent.send([{ type: 'text', text }])
+          for (const text of texts) agent.followup(createUserMessage({ content: [{ type: 'text', text }], source: { kind: 'user' } }))
           await idle
 
           // No message lost: every send appears as a user/message, in order.
@@ -142,7 +142,7 @@ describe('agent loop scheduling properties', () => {
           const agent = ctx.agentLoop.create(SessionId('a'), { provider: 'mock', model: 'mock' })
           for (const text of texts) {
             const idle = nextIdle(ctx, agent)
-            agent.send([{ type: 'text', text }])
+            agent.followup(createUserMessage({ content: [{ type: 'text', text }], source: { kind: 'user' } }))
             await idle
           }
           // Each send was drained at a separate turn start: N turns, 1..N.
@@ -171,7 +171,7 @@ describe('agent loop scheduling properties', () => {
           for (const step of steps) {
             const idle = nextIdle(ctx, agent)
             lastIdle = idle
-            agent.send([{ type: 'text', text: step.text }])
+            agent.followup(createUserMessage({ content: [{ type: 'text', text: step.text }], source: { kind: 'user' } }))
             if (step.settle) await idle
           }
           await lastIdle

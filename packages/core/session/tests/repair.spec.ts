@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
-import { CallId } from '@deepseek-ai/dsh-llm'
-import { interruptedTurnClosers } from '../src/index.ts'
+import { CallId , createMessage, createToolResultMessage } from '@deepseek-ai/dsh-llm'
+import { interruptedTurnClosers, TOOL_NOT_STARTED, TOOL_OUTCOME_UNKNOWN } from '../src/index.ts'
 import type { SessionEvent, SurfaceEvent } from '../src/index.ts'
 
 /**
@@ -13,7 +13,7 @@ import type { SessionEvent, SurfaceEvent } from '../src/index.ts'
  */
 
 const userTurnStart = (turn: number, seq: number): SessionEvent =>
-  ({ type: 'turn/start', seq, time: seq, data: { turn, trigger: { kind: 'message', source: { kind: 'user' } } } })
+  ({ type: 'turn/start', seq, time: seq, data: { turn } })
 
 describe('interruptedTurnClosers', () => {
   it('returns nothing for a balanced log (ends on turn/end)', () => {
@@ -47,16 +47,24 @@ describe('interruptedTurnClosers', () => {
     expect(closers.map(e => e.seq)).toEqual([2, 3])
   })
 
-  it('synthesizes an error tool/result for a tool-call the crash left unanswered', () => {
-    // A step issued one tool call (in the assistant message) but crashed before
-    // the tool/result was logged — the classic mid-tool crash.
+  it('marks an assistant tool request with no recorded call as not started', () => {
     const events: SessionEvent[] = [
       userTurnStart(2, 0),
       { type: 'step/start', seq: 1, time: 1, data: { turn: 2, step: 1 } },
-      { type: 'assistant/message', seq: 2, time: 2, data: { turn: 2, step: 1, content: [
-        { type: 'text', text: 'calling a tool' },
-        { type: 'tool-call', id: CallId('call-1'), name: 'bash', arguments: '{}' },
-      ], provenance: { provider: 'mock', model: 'mock' } } },
+      { type: 'assistant/message', seq: 2, time: 2, data: {
+        turn: 2, step: 1,
+        message: createMessage({
+          role: 'assistant',
+          content: [
+            { type: 'text', text: 'calling a tool' },
+            { type: 'tool-call', id: CallId('call-1'), name: 'bash', arguments: '{}' },
+          ],
+          source: {
+            kind: 'model',
+            ...{ provider: 'mock', model: 'mock' },
+          },
+        }),
+      } },
     ]
     const closers = interruptedTurnClosers(events)
     // tool/result (for the orphaned call) → step/end → turn/end, contiguous seqs.
@@ -64,18 +72,44 @@ describe('interruptedTurnClosers', () => {
     expect(closers.map(e => e.seq)).toEqual([3, 4, 5])
     const result = closers[0]!
     expect(result.type === 'tool/result' && result.data).toMatchObject({
-      turn: 2, step: 1, callId: CallId('call-1'), isError: true, error: { code: 'interrupted' },
+      turn: 2,
+      step: 1,
+      message: {
+        source: { callId: CallId('call-1') },
+        content: [{ isError: true }],
+      },
+      error: { code: TOOL_NOT_STARTED },
     })
+    expect(result.type === 'tool/result' && result.data.message.content[0].content).toEqual([{
+      type: 'text', text: 'The tool call was interrupted before the Harness recorded it as started. Retry it if it is still needed.',
+    }])
   })
 
   it('does NOT synthesize a result for a tool-call that already has one', () => {
     const events: SessionEvent[] = [
       userTurnStart(2, 0),
       { type: 'step/start', seq: 1, time: 1, data: { turn: 2, step: 1 } },
-      { type: 'assistant/message', seq: 2, time: 2, data: { turn: 2, step: 1, content: [
-        { type: 'tool-call', id: CallId('call-1'), name: 'bash', arguments: '{}' },
-      ], provenance: { provider: 'mock', model: 'mock' } } },
-      { type: 'tool/result', seq: 3, time: 3, data: { turn: 2, step: 1, callId: CallId('call-1'), content: [{ type: 'text', text: 'ok' }], isError: false } },
+      { type: 'assistant/message', seq: 2, time: 2, data: {
+        turn: 2, step: 1,
+        message: createMessage({
+          role: 'assistant',
+          content: [
+            { type: 'tool-call', id: CallId('call-1'), name: 'bash', arguments: '{}' },
+          ],
+          source: {
+            kind: 'model',
+            ...{ provider: 'mock', model: 'mock' },
+          },
+        }),
+      } },
+      { type: 'tool/result', seq: 3, time: 3, data: {
+        turn: 2, step: 1,
+        message: createToolResultMessage({
+          callId: CallId('call-1'),
+          content: [{ type: 'text', text: 'ok' }],
+          isError: false,
+        }),
+      } },
     ]
     // The call is answered, so only the open step + turn need closing.
     const closers = interruptedTurnClosers(events)
@@ -86,9 +120,19 @@ describe('interruptedTurnClosers', () => {
     const events: SessionEvent[] = [
       userTurnStart(2, 0),
       { type: 'step/start', seq: 1, time: 1, data: { turn: 2, step: 1 } },
-      { type: 'assistant/message', seq: 2, time: 2, data: { turn: 2, step: 1, content: [
-        { type: 'tool-call', id: CallId('call-1'), name: 'bash', arguments: '{}' },
-      ], provenance: { provider: 'mock', model: 'mock' } } },
+      { type: 'assistant/message', seq: 2, time: 2, data: {
+        turn: 2, step: 1,
+        message: createMessage({
+          role: 'assistant',
+          content: [
+            { type: 'tool-call', id: CallId('call-1'), name: 'bash', arguments: '{}' },
+          ],
+          source: {
+            kind: 'model',
+            ...{ provider: 'mock', model: 'mock' },
+          },
+        }),
+      } },
       { type: 'step/end', seq: 3, time: 3, data: { turn: 2, step: 1 } },
     ]
 
@@ -103,48 +147,102 @@ describe('interruptedTurnClosers', () => {
     const events: SessionEvent[] = [
       userTurnStart(1, 0),
       { type: 'step/start', seq: 1, time: 1, data: { turn: 1, step: 1 } },
-      { type: 'assistant/message', seq: 2, time: 2, data: { turn: 1, step: 1, content: [
-        { type: 'tool-call', id: CallId('old-call'), name: 'bash', arguments: '{}' },
-      ], provenance: { provider: 'mock', model: 'mock' } } },
-      { type: 'tool/result', seq: 3, time: 3, data: { turn: 1, step: 1, callId: CallId('old-call'), content: [], isError: false } },
+      { type: 'assistant/message', seq: 2, time: 2, data: {
+        turn: 1, step: 1,
+        message: createMessage({
+          role: 'assistant',
+          content: [
+            { type: 'tool-call', id: CallId('old-call'), name: 'bash', arguments: '{}' },
+          ],
+          source: {
+            kind: 'model',
+            ...{ provider: 'mock', model: 'mock' },
+          },
+        }),
+      } },
+      { type: 'tool/result', seq: 3, time: 3, data: {
+        turn: 1, step: 1,
+        message: createToolResultMessage({
+          callId: CallId('old-call'),
+          content: [],
+          isError: false,
+        }),
+      } },
       { type: 'step/end', seq: 4, time: 4, data: { turn: 1, step: 1 } },
       { type: 'turn/end', seq: 5, time: 5, data: { turn: 1, reason: { kind: 'completed' } } },
       userTurnStart(2, 6),
       { type: 'step/start', seq: 7, time: 7, data: { turn: 2, step: 1 } },
-      { type: 'assistant/message', seq: 8, time: 8, data: { turn: 2, step: 1, content: [
-        { type: 'tool-call', id: CallId('new-call'), name: 'bash', arguments: '{}' },
-      ], provenance: { provider: 'mock', model: 'mock' } } },
+      { type: 'assistant/message', seq: 8, time: 8, data: {
+        turn: 2, step: 1,
+        message: createMessage({
+          role: 'assistant',
+          content: [
+            { type: 'tool-call', id: CallId('new-call'), name: 'bash', arguments: '{}' },
+          ],
+          source: {
+            kind: 'model',
+            ...{ provider: 'mock', model: 'mock' },
+          },
+        }),
+      } },
     ]
     const closers = interruptedTurnClosers(events)
     expect(closers.map(e => e.type)).toEqual(['tool/result', 'step/end', 'turn/end'])
     const result = closers[0]!
-    expect(result.type === 'tool/result' && result.data.callId).toBe('new-call')
+    expect(result.type === 'tool/result' && result.data.message.source.callId).toBe('new-call')
   })
 
   it('synthesizes a result for each of multiple unanswered calls, in log order', () => {
     const events: SessionEvent[] = [
       userTurnStart(1, 0),
       { type: 'step/start', seq: 1, time: 1, data: { turn: 1, step: 1 } },
-      { type: 'assistant/message', seq: 2, time: 2, data: { turn: 1, step: 1, content: [
-        { type: 'tool-call', id: CallId('call-a'), name: 'bash', arguments: '{}' },
-        { type: 'tool-call', id: CallId('call-b'), name: 'bash', arguments: '{}' },
-      ], provenance: { provider: 'mock', model: 'mock' } } },
+      { type: 'assistant/message', seq: 2, time: 2, data: {
+        turn: 1, step: 1,
+        message: createMessage({
+          role: 'assistant',
+          content: [
+            { type: 'tool-call', id: CallId('call-a'), name: 'bash', arguments: '{}' },
+            { type: 'tool-call', id: CallId('call-b'), name: 'bash', arguments: '{}' },
+          ],
+          source: {
+            kind: 'model',
+            ...{ provider: 'mock', model: 'mock' },
+          },
+        }),
+      } },
       // call-a got answered before the crash; call-b did not.
-      { type: 'tool/result', seq: 3, time: 3, data: { turn: 1, step: 1, callId: CallId('call-a'), content: [], isError: false } },
+      { type: 'tool/result', seq: 3, time: 3, data: {
+        turn: 1, step: 1,
+        message: createToolResultMessage({
+          callId: CallId('call-a'),
+          content: [],
+          isError: false,
+        }),
+      } },
     ]
     const closers = interruptedTurnClosers(events)
     expect(closers.map(e => e.type)).toEqual(['tool/result', 'step/end', 'turn/end'])
     const result = closers[0]!
-    expect(result.type === 'tool/result' && result.data.callId).toBe('call-b')
+    expect(result.type === 'tool/result' && result.data.message.source.callId).toBe('call-b')
   })
 
   it('synthesized tool/result carries surfaceOp and sourceEventSeqs when tool/call was logged', () => {
     const events: SessionEvent[] = [
       userTurnStart(1, 0),
       { type: 'step/start', seq: 1, time: 1, data: { turn: 1, step: 1 } },
-      { type: 'assistant/message', seq: 2, time: 2, data: { turn: 1, step: 1, content: [
-        { type: 'tool-call', id: CallId('call-1'), name: 'bash', arguments: '{}' },
-      ], provenance: { provider: 'mock', model: 'mock' } } },
+      { type: 'assistant/message', seq: 2, time: 2, data: {
+        turn: 1, step: 1,
+        message: createMessage({
+          role: 'assistant',
+          content: [
+            { type: 'tool-call', id: CallId('call-1'), name: 'bash', arguments: '{}' },
+          ],
+          source: {
+            kind: 'model',
+            ...{ provider: 'mock', model: 'mock' },
+          },
+        }),
+      } },
       { type: 'tool/call', seq: 3, time: 3, data: { turn: 1, step: 1, callId: CallId('call-1'), name: 'bash', arguments: '{}' } },
     ]
     const closers = interruptedTurnClosers(events)
@@ -152,6 +250,14 @@ describe('interruptedTurnClosers', () => {
     const result = closers[0]!
     expect((result as SurfaceEvent).surfaceOp).toBe('append')
     expect((result as SurfaceEvent).sourceEventSeqs).toEqual([3])
+    expect(result.type === 'tool/result' && result.data.error).toEqual({
+      name: 'ToolOutcomeUnknownError', code: TOOL_OUTCOME_UNKNOWN,
+    })
+    if (result.type !== 'tool/result' || result.data.message.content[0].content[0]?.type !== 'text') {
+      throw new Error('expected a text tool result')
+    }
+    expect(result.data.message.content[0].content[0].text).toContain('retry only if the operation is read-only or idempotent')
+    expect(result.data.message.content[0].content[0].text).toContain('first verify external state or ask the user')
   })
 
   it('handles tool/call without a matching assistant/message entry gracefully', () => {

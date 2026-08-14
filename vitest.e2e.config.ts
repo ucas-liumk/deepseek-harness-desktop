@@ -1,5 +1,6 @@
 import tsconfigPaths from 'vite-tsconfig-paths'
 import { defineConfig } from 'vitest/config'
+import { standardDecoratorPlugin, vitestExecArgv } from './vitest.shared.ts'
 
 // Real-API suite, separate because it spends tokens. Each test self-skips without
 // its provider credential for keyless CI; credentialed workflows preflight the
@@ -29,10 +30,19 @@ const e2eMaxWorkers = positiveIntFromEnv('DSH_E2E_MAX_WORKERS', DEFAULT_E2E_MAX_
 
 export default defineConfig({
   // Same resolution note as vitest.config.ts: bare workspace names resolve
-  // through the root tsconfig paths map; the native option cannot do this.
-  plugins: [tsconfigPaths({ projects: ['./tsconfig.json'] })],
+  // through the tsconfig.base.json paths facade (no include = match-all, so
+  // client-package sources get mapping too — dropping /client subpath imports
+  // onto package exports would load browser dist bundles into node).
+  // Built-artifact e2e suites are unaffected: their built-ness lives in
+  // subprocesses and createRequire lookups, which bypass vite resolution
+  // entirely.
+  plugins: [tsconfigPaths({ projects: ['./tsconfig.base.json'] }), standardDecoratorPlugin()],
   test: {
-    include: ['packages/*/*/tests/**/*.e2e.ts', 'examples/*/tests/**/*.e2e.ts'],
+    execArgv: vitestExecArgv,
+    setupFiles: ['./scripts/test-invariants.ts'],
+    // apps/cli only, not apps/*: apps/web/tests/*.e2e.ts needs the built
+    // frontend dist and runs under vitest.web.config.ts (the test:web job).
+    include: ['packages/*/*/tests/**/*.e2e.ts', 'apps/cli/tests/**/*.e2e.ts', 'examples/*/tests/**/*.e2e.ts'],
     // Real model calls: generous timeouts, and retries for transient flakes
     // (the shared internal key hits concurrency quotas). No coverage — the
     // unit suites own the coverage gate.

@@ -4,17 +4,39 @@ import {
   Session,
   SessionId,
   foldSurface,
+  isAppendSurfaceEvent,
+  isReplacementSurfaceEvent,
   isSurfaceEligibleType,
   isSurfaceEvent,
 } from '@deepseek-ai/dsh-session'
-import { CallId } from '@deepseek-ai/dsh-llm'
+import { SurfaceManager } from '@deepseek-ai/dsh-session/surface'
+import {
+  createMessage,
+  createToolResultMessage,
+  createUserMessage,
+  freezeMessage,
+  CallId,
+  MessageId,
+} from '@deepseek-ai/dsh-llm'
 
 /** Build a minimal session with turn boundaries and a single user message. */
 function surfaceSession(): Session {
-  const s = new Session(SessionId('ss'))
-  s.append('turn/start', { turn: 1, trigger: { kind: 'message', source: { kind: 'user' } } })
-  s.append('user/message', { content: [{ type: 'text', text: 'hello' }], source: { kind: 'user' } }, { surfaceOp: 'append' })
-  s.append('assistant/message', { provenance: { provider: 'mock', model: 'mock' }, turn: 1, step: 1, content: [{ type: 'text', text: 'hi' }] }, { surfaceOp: 'append' })
+  const s = Session.create(SessionId('ss'))
+  s.append('turn/start', { turn: 1 })
+  s.append('user/message', createUserMessage({
+    content: [{ type: 'text', text: 'hello' }], source: { kind: 'user' },
+  }), { surfaceOp: 'append' })
+  s.append('assistant/message', {
+    turn: 1, step: 1,
+    message: createMessage({
+      role: 'assistant',
+      content: [{ type: 'text', text: 'hi' }],
+      source: {
+        kind: 'model',
+        ...{ provider: 'mock', model: 'mock' },
+      },
+    }),
+  }, { surfaceOp: 'append' })
   s.append('turn/end', { turn: 1, reason: { kind: 'completed' } })
   return s
 }
@@ -24,14 +46,40 @@ function provenanceEvent(seq: number, sourceEventSeqs: unknown): SessionEvent {
     type: 'user/message',
     seq,
     time: seq,
-    data: { content: [], source: { kind: 'user' } },
+    data: createUserMessage({
+      content: [], source: { kind: 'user' },
+    }),
     surfaceOp: 'append',
     ...sourceEventSeqs === undefined ? {} : { sourceEventSeqs },
   } as unknown as SessionEvent
 }
 
-describe('foldSurface provenance', () => {
-  it('accepts absent or valid provenance and complete replacement coverage', () => {
+function toolResultEvent(
+  seq: number,
+  callId: string,
+  surfaceOp: SurfaceEvent['surfaceOp'] = 'append',
+  sourceEventSeqs?: number[],
+): SessionEvent {
+  return {
+    type: 'tool/result',
+    seq,
+    time: seq,
+    data: {
+      turn: 1,
+      step: 1,
+      message: createToolResultMessage({
+        callId: CallId(callId),
+        content: [{ type: 'text', text: `result ${seq}` }],
+        isError: false,
+      }),
+    },
+    surfaceOp,
+    ...sourceEventSeqs === undefined ? {} : { sourceEventSeqs },
+  }
+}
+
+describe('foldSurface source-event references', () => {
+  it('accepts absent or valid source-event references and complete replacement coverage', () => {
     const events = [
       provenanceEvent(0, undefined),
       provenanceEvent(1, undefined),
@@ -43,27 +91,33 @@ describe('foldSurface provenance', () => {
     expect(() => foldSurface(events)).not.toThrow()
   })
 
-  it('rejects provenance on a non-surface event', () => {
+  it('rejects source-event references on a non-surface event', () => {
     const event = {
       type: 'turn/start',
       seq: 0,
       time: 1,
-      data: { turn: 1, trigger: { kind: 'message', source: { kind: 'user' } } },
+      data: { turn: 1 },
       sourceEventSeqs: [0],
     } as unknown as SessionEvent
     expect(() => foldSurface([event])).toThrow(/cannot carry sourceEventSeqs/)
   })
 
-  it('accepts explicit empty provenance on an assistant message', () => {
+  it('accepts an explicit empty source-event list on an assistant message', () => {
     const event = {
       type: 'assistant/message',
       seq: 0,
       time: 0,
       data: {
-        provenance: { provider: 'mock', model: 'mock' },
         turn: 1,
         step: 1,
-        content: [],
+        message: createMessage({
+          role: 'assistant',
+          content: [],
+          source: {
+            kind: 'model',
+            ...{ provider: 'mock', model: 'mock' },
+          },
+        }),
       },
       surfaceOp: 'append',
       sourceEventSeqs: [],
@@ -94,13 +148,175 @@ describe('foldSurface provenance', () => {
   )
 })
 
+describe('foldSurface tool-result rewrites', () => {
+  it('rejects a replacement spanning multiple current nodes', () => {
+    const events = [
+      provenanceEvent(0, undefined),
+      provenanceEvent(1, undefined),
+      toolResultEvent(2, 'rewrite', { op: 'replace', start: 0, end: 1 }, [0, 1]),
+    ]
+    expect(() => foldSurface(events)).toThrow(/must rewrite exactly one current node/)
+  })
+
+  it('rejects a replacement targeting a non-result node', () => {
+    const events = [
+      provenanceEvent(0, undefined),
+      toolResultEvent(1, 'rewrite', { op: 'replace', start: 0, end: 0 }, [0]),
+    ]
+    expect(() => foldSurface(events)).toThrow(/must target a current tool\/result/)
+  })
+
+  it('rejects changes outside tool-result content', () => {
+    const events = [
+      toolResultEvent(0, 'original'),
+      toolResultEvent(1, 'changed', { op: 'replace', start: 0, end: 0 }, [0]),
+    ]
+    expect(() => foldSurface(events)).toThrow(/may change only content/)
+  })
+
+  it.each([
+    ['toolCallId', { toolCallId: CallId('changed') }],
+    ['isError', { isError: true }],
+  ] as const)('rejects a replacement that changes the result block %s', (_field, patch) => {
+    const original = toolResultEvent(0, 'original')
+    const data = original.data as Extract<SessionEvent, { type: 'tool/result' }>['data']
+    const result = data.message.content[0]
+    const replacement = {
+      ...original,
+      seq: 1,
+      time: 1,
+      data: {
+        ...data,
+        message: freezeMessage({
+          ...data.message,
+          content: [{ ...result, ...patch }] as [typeof result],
+        }),
+      },
+      surfaceOp: { op: 'replace', start: 0, end: 0 },
+      sourceEventSeqs: [0],
+    } as SessionEvent
+    expect(() => foldSurface([original, replacement])).toThrow(/may change only content/)
+  })
+
+  it('compares array-valued rest fields structurally (meta arrays: equal accepted, drifted rejected)', () => {
+    const withMeta = (seq: number, meta: unknown, surfaceOp: SurfaceEvent['surfaceOp'] = 'append', sourceEventSeqs?: number[]): SessionEvent => {
+      const event = toolResultEvent(seq, 'c-meta', surfaceOp, sourceEventSeqs)
+      const data = event.data as Extract<SessionEvent, { type: 'tool/result' }>['data']
+      return {
+        ...event,
+        data: {
+          ...data,
+          message: freezeMessage({ ...data.message, id: MessageId('meta-message') }),
+          meta,
+        },
+      } as SessionEvent
+    }
+    // Structurally equal arrays (fresh references) pass the rest-field equality.
+    expect(() => foldSurface([
+      withMeta(0, { tags: ['a', { n: 1 }] }),
+      withMeta(1, { tags: ['a', { n: 1 }] }, { op: 'replace', start: 0, end: 0 }, [0]),
+    ])).not.toThrow()
+    // Same length, drifted element: the array branch must reject.
+    expect(() => foldSurface([
+      withMeta(0, { tags: ['a'] }),
+      withMeta(1, { tags: ['b'] }, { op: 'replace', start: 0, end: 0 }, [0]),
+    ])).toThrow(/may change only content/)
+    // Array vs non-array on one side: the mixed-shape guard rejects.
+    expect(() => foldSurface([
+      withMeta(0, { tags: ['a'] }),
+      withMeta(1, { tags: 'a' }, { op: 'replace', start: 0, end: 0 }, [0]),
+    ])).toThrow(/may change only content/)
+    // Same key count, different key names: the hasOwn branch rejects.
+    expect(() => foldSurface([
+      withMeta(0, { left: 1 }),
+      withMeta(1, { right: 1 }, { op: 'replace', start: 0, end: 0 }, [0]),
+    ])).toThrow(/may change only content/)
+    // Different key counts: the key-length branch rejects.
+    expect(() => foldSurface([
+      withMeta(0, { one: 1 }),
+      withMeta(1, { one: 1, two: 2 }, { op: 'replace', start: 0, end: 0 }, [0]),
+    ])).toThrow(/may change only content/)
+  })
+})
+
 describe('SurfaceManager', () => {
+  it('folds a contiguous window without materializing earlier event sequences', () => {
+    const baseSeq = 400_000
+    const events = [
+      provenanceEvent(baseSeq, undefined),
+      provenanceEvent(baseSeq + 1, undefined),
+      {
+        ...provenanceEvent(baseSeq + 2, [baseSeq]),
+        surfaceOp: { op: 'replace', start: baseSeq, end: baseSeq },
+      },
+    ] as SessionEvent[]
+
+    const surface = new SurfaceManager(events, baseSeq)
+    expect(surface.nodes).toEqual([baseSeq + 2, baseSeq + 1])
+    expect(surface.replaceGeneration).toBe(1)
+  })
+
+  it('validates tool-result rewrites against a nonzero window offset', () => {
+    const baseSeq = 400_000
+    const original = toolResultEvent(baseSeq, 'call')
+    const events: SessionEvent[] = [
+      original,
+      {
+        ...original,
+        seq: baseSeq + 1,
+        time: baseSeq + 1,
+        surfaceOp: { op: 'replace' as const, start: baseSeq, end: baseSeq },
+        sourceEventSeqs: [baseSeq],
+      } as SessionEvent,
+    ]
+
+    expect(new SurfaceManager(events, baseSeq).nodes).toEqual([baseSeq + 1])
+  })
+
+  it('rejects a replacement that crosses a loaded window head', () => {
+    const baseSeq = 400_000
+    const events = [
+      provenanceEvent(baseSeq, undefined),
+      {
+        ...provenanceEvent(baseSeq + 1, [baseSeq - 1, baseSeq]),
+        surfaceOp: { op: 'replace', start: baseSeq - 1, end: baseSeq },
+      },
+    ] as SessionEvent[]
+
+    expect(() => new SurfaceManager(events, baseSeq).nodes)
+      .toThrow(`surface replace: start seq ${baseSeq - 1} not found in surface`)
+  })
+
   it('shares ordered entries and nested replacement ranges with foldSurface', () => {
-    const s = new Session(SessionId('shared-fold'))
-    s.append('user/message', { content: [{ type: 'text', text: 'a' }], source: { kind: 'user' } }, { surfaceOp: 'append' })
-    s.append('user/message', { content: [{ type: 'text', text: 'b' }], source: { kind: 'user' } }, { surfaceOp: 'append' })
-    s.append('assistant/message', { provenance: { provider: 'mock', model: 'mock' }, turn: 1, step: 1, content: [{ type: 'text', text: 'summary' }] }, { surfaceOp: { op: 'replace', start: 0, end: 0 }, sourceEventSeqs: [0] })
-    s.append('assistant/message', { provenance: { provider: 'mock', model: 'mock' }, turn: 1, step: 2, content: [{ type: 'text', text: 'summary 2' }] }, { surfaceOp: { op: 'replace', start: 2, end: 1 }, sourceEventSeqs: [2, 1] })
+    const s = Session.create(SessionId('shared-fold'))
+    s.append('user/message', createUserMessage({
+      content: [{ type: 'text', text: 'a' }], source: { kind: 'user' },
+    }), { surfaceOp: 'append' })
+    s.append('user/message', createUserMessage({
+      content: [{ type: 'text', text: 'b' }], source: { kind: 'user' },
+    }), { surfaceOp: 'append' })
+    s.append('assistant/message', {
+      turn: 1, step: 1,
+      message: createMessage({
+        role: 'assistant',
+        content: [{ type: 'text', text: 'summary' }],
+        source: {
+          kind: 'model',
+          ...{ provider: 'mock', model: 'mock' },
+        },
+      }),
+    }, { surfaceOp: { op: 'replace', start: 0, end: 0 }, sourceEventSeqs: [0] })
+    s.append('assistant/message', {
+      turn: 1, step: 2,
+      message: createMessage({
+        role: 'assistant',
+        content: [{ type: 'text', text: 'summary 2' }],
+        source: {
+          kind: 'model',
+          ...{ provider: 'mock', model: 'mock' },
+        },
+      }),
+    }, { surfaceOp: { op: 'replace', start: 2, end: 1 }, sourceEventSeqs: [2, 1] })
 
     const folded = foldSurface(s.events)
     expect(folded.nodes).toEqual(s.surface.nodes)
@@ -116,9 +332,21 @@ describe('SurfaceManager', () => {
   })
 
   it('does not retain fold-only replacement history in incremental state', () => {
-    const s = new Session(SessionId('incremental-state'))
-    s.append('user/message', { content: [{ type: 'text', text: 'a' }], source: { kind: 'user' } }, { surfaceOp: 'append' })
-    s.append('assistant/message', { provenance: { provider: 'mock', model: 'mock' }, turn: 1, step: 1, content: [{ type: 'text', text: 'b' }] }, { surfaceOp: { op: 'replace', start: 0, end: 0 }, sourceEventSeqs: [0] })
+    const s = Session.create(SessionId('incremental-state'))
+    s.append('user/message', createUserMessage({
+      content: [{ type: 'text', text: 'a' }], source: { kind: 'user' },
+    }), { surfaceOp: 'append' })
+    s.append('assistant/message', {
+      turn: 1, step: 1,
+      message: createMessage({
+        role: 'assistant',
+        content: [{ type: 'text', text: 'b' }],
+        source: {
+          kind: 'model',
+          ...{ provider: 'mock', model: 'mock' },
+        },
+      }),
+    }, { surfaceOp: { op: 'replace', start: 0, end: 0 }, sourceEventSeqs: [0] })
 
     expect(s.surface.nodes).toEqual([1])
     const manager = s.surface as unknown as { _state: object }
@@ -135,13 +363,15 @@ describe('SurfaceManager', () => {
     ] as SessionEvent[]
 
     expect(() => foldSurface(events)).toThrow(/start seq 42 not found/)
-    expect(() => new Session(SessionId('shared-fold-invalid'), events))
+    expect(() => Session.create(SessionId('shared-fold-invalid'), events))
       .toThrow(/start seq 42 not found/)
   })
 
   it('leaves incremental state unchanged when candidate validation fails', () => {
-    const s = new Session(SessionId('atomic-validation'))
-    s.append('user/message', { content: [{ type: 'text', text: 'a' }], source: { kind: 'user' } }, { surfaceOp: 'append' })
+    const s = Session.create(SessionId('atomic-validation'))
+    s.append('user/message', createUserMessage({
+      content: [{ type: 'text', text: 'a' }], source: { kind: 'user' },
+    }), { surfaceOp: 'append' })
     const surface = s.surface
     const nodes = surface.nodes
 
@@ -150,7 +380,17 @@ describe('SurfaceManager', () => {
 
     expect(() => s.append(
       'assistant/message',
-      { provenance: { provider: 'mock', model: 'mock' }, turn: 1, step: 1, content: [{ type: 'text', text: 'invalid' }] },
+      {
+        turn: 1, step: 1,
+        message: createMessage({
+          role: 'assistant',
+          content: [{ type: 'text', text: 'invalid' }],
+          source: {
+            kind: 'model',
+            ...{ provider: 'mock', model: 'mock' },
+          },
+        }),
+      },
       { surfaceOp: { op: 'replace', start: 0, end: 0 } },
     )).toThrow(/missing 0/)
 
@@ -160,7 +400,9 @@ describe('SurfaceManager', () => {
     expect(surface.replaceGeneration).toBe(0)
     expect(surface.nodes).toEqual(foldSurface(s.events).nodes)
 
-    s.append('user/message', { content: [{ type: 'text', text: 'b' }], source: { kind: 'user' } }, { surfaceOp: 'append' })
+    s.append('user/message', createUserMessage({
+      content: [{ type: 'text', text: 'b' }], source: { kind: 'user' },
+    }), { surfaceOp: 'append' })
     expect(surface.nodes).toBe(nodes)
     expect(surface.nodes).toEqual([0, 1])
     expect(surface.replaceGeneration).toBe(0)
@@ -172,7 +414,9 @@ describe('SurfaceManager', () => {
       type: 'user/message',
       seq: 0,
       time: 1,
-      data: { content: [{ type: 'text', text: 'hidden' }], source: { kind: 'user' } },
+      data: createUserMessage({
+        content: [{ type: 'text', text: 'hidden' }], source: { kind: 'user' },
+      }),
     }
 
     expect(() => foldSurface([malformed]))
@@ -184,7 +428,7 @@ describe('SurfaceManager', () => {
       type: 'turn/start',
       seq: 0,
       time: 1,
-      data: { turn: 1, trigger: { kind: 'message', source: { kind: 'user' } } },
+      data: { turn: 1 },
       surfaceOp: 'append',
     } as unknown as SessionEvent
 
@@ -201,31 +445,41 @@ describe('SurfaceManager', () => {
   })
 
   it('empty surface yields empty nodes', () => {
-    const s = new Session(SessionId('empty'))
-    // Only turn boundaries, no surface nodes.
-    s.append('turn/start', { turn: 1, trigger: { kind: 'message', source: { kind: 'user' } } })
+    const s = Session.create(SessionId('empty'))
+    s.append('turn/start', { turn: 1 })
     s.append('step/start', { turn: 1, step: 1 })
     s.append('step/end', { turn: 1, step: 1 })
     s.append('turn/end', { turn: 1, reason: { kind: 'completed' } })
     expect(s.surface.nodes.length).toBe(0)
-    // deriveMessages returns empty array
     expect(s.deriveMessages()).toEqual([])
   })
 
   it('picks up new events incrementally (delta processing)', () => {
     const s = surfaceSession()
     expect(s.surface.nodes.length).toBe(2)
-    // Append another surface node
-    s.append('tool/result', { turn: 1, step: 1, callId: CallId('c1'), content: [{ type: 'text', text: 'ok' }], isError: false }, { surfaceOp: 'append' })
+    s.append('tool/result', {
+      turn: 1, step: 1,
+      message: createToolResultMessage({
+        callId: CallId('c1'),
+        content: [{ type: 'text', text: 'ok' }],
+        isError: false,
+      }),
+    }, { surfaceOp: 'append' })
     expect(s.surface.nodes.length).toBe(3)
     expect(s.surface.nodes[2]!).toBe(4) // seq 4: after turn/end at seq 3
   })
 
   it('replays identically from a seeded log with surface markers', () => {
     const original = surfaceSession()
-    original.append('tool/result', { turn: 1, step: 1, callId: CallId('c1'), content: [{ type: 'text', text: 'ok' }], isError: false }, { surfaceOp: 'append' })
-    const replayed = new Session(SessionId('replay'), [...original.events])
-    // Surface rebuilds from the seeded log's markers.
+    original.append('tool/result', {
+      turn: 1, step: 1,
+      message: createToolResultMessage({
+        callId: CallId('c1'),
+        content: [{ type: 'text', text: 'ok' }],
+        isError: false,
+      }),
+    }, { surfaceOp: 'append' })
+    const replayed = Session.create(SessionId('replay'), [...original.events])
     expect(replayed.surface.nodes).toEqual([1, 2, 4])
     expect(replayed.deriveMessages()).toEqual(original.deriveMessages())
   })
@@ -233,71 +487,161 @@ describe('SurfaceManager', () => {
   it('rebuild with replace operation splices out shadowed nodes', () => {
     const s = surfaceSession()
     s.append('assistant/message',
-      { provenance: { provider: 'mock', model: 'mock' }, turn: 2, step: 1, content: [{ type: 'text', text: 'summary' }] },
+      {
+        turn: 2, step: 1,
+        message: createMessage({
+          role: 'assistant',
+          content: [{ type: 'text', text: 'summary' }],
+          source: {
+            kind: 'model',
+            ...{ provider: 'mock', model: 'mock' },
+          },
+        }),
+      },
       { surfaceOp: { op: 'replace', start: 1, end: 2 }, sourceEventSeqs: [1, 2] },
     )
     expect(s.surface.nodes).toEqual([4])
   })
 
   it('replace with both ends at real nodes splices only the range', () => {
-    const s = new Session(SessionId('range'))
-    s.append('user/message', { content: [{ type: 'text', text: 'a' }], source: { kind: 'user' } }, { surfaceOp: 'append' }) // seq 0
-    s.append('user/message', { content: [{ type: 'text', text: 'b' }], source: { kind: 'user' } }, { surfaceOp: 'append' }) // seq 1
-    s.append('user/message', { content: [{ type: 'text', text: 'c' }], source: { kind: 'user' } }, { surfaceOp: 'append' }) // seq 2
+    const s = Session.create(SessionId('range'))
+    s.append('user/message', createUserMessage({
+      content: [{ type: 'text', text: 'a' }], source: { kind: 'user' },
+    }), { surfaceOp: 'append' }) // seq 0
+    s.append('user/message', createUserMessage({
+      content: [{ type: 'text', text: 'b' }], source: { kind: 'user' },
+    }), { surfaceOp: 'append' }) // seq 1
+    s.append('user/message', createUserMessage({
+      content: [{ type: 'text', text: 'c' }], source: { kind: 'user' },
+    }), { surfaceOp: 'append' }) // seq 2
     // Replace seq 0 through 1 inclusive: shadow a and b, keep c.
     s.append('assistant/message',
-      { provenance: { provider: 'mock', model: 'mock' }, turn: 1, step: 1, content: [{ type: 'text', text: 'summary' }] },
+      {
+        turn: 1, step: 1,
+        message: createMessage({
+          role: 'assistant',
+          content: [{ type: 'text', text: 'summary' }],
+          source: {
+            kind: 'model',
+            ...{ provider: 'mock', model: 'mock' },
+          },
+        }),
+      },
       { surfaceOp: { op: 'replace', start: 0, end: 1 }, sourceEventSeqs: [0, 1] },
     ) // seq 3
     expect(s.surface.nodes).toEqual([3, 2])
   })
 
   it('single-node replacement (start === end)', () => {
-    const s = new Session(SessionId('single'))
-    s.append('user/message', { content: [{ type: 'text', text: 'a' }], source: { kind: 'user' } }, { surfaceOp: 'append' }) // seq 0
-    s.append('user/message', { content: [{ type: 'text', text: 'b' }], source: { kind: 'user' } }, { surfaceOp: 'append' }) // seq 1
+    const s = Session.create(SessionId('single'))
+    s.append('user/message', createUserMessage({
+      content: [{ type: 'text', text: 'a' }], source: { kind: 'user' },
+    }), { surfaceOp: 'append' }) // seq 0
+    s.append('user/message', createUserMessage({
+      content: [{ type: 'text', text: 'b' }], source: { kind: 'user' },
+    }), { surfaceOp: 'append' }) // seq 1
     // Replace only seq 1 (single node).
     s.append('assistant/message',
-      { provenance: { provider: 'mock', model: 'mock' }, turn: 1, step: 1, content: [{ type: 'text', text: 'x' }] },
+      {
+        turn: 1, step: 1,
+        message: createMessage({
+          role: 'assistant',
+          content: [{ type: 'text', text: 'x' }],
+          source: {
+            kind: 'model',
+            ...{ provider: 'mock', model: 'mock' },
+          },
+        }),
+      },
       { surfaceOp: { op: 'replace', start: 1, end: 1 }, sourceEventSeqs: [1] },
     ) // seq 2
     expect(s.surface.nodes).toEqual([0, 2])
   })
 
   it('throws when replace start is not found', () => {
-    const s = new Session(SessionId('bad-start'))
-    s.append('user/message', { content: [{ type: 'text', text: 'a' }], source: { kind: 'user' } }, { surfaceOp: 'append' }) // seq 0
+    const s = Session.create(SessionId('bad-start'))
+    s.append('user/message', createUserMessage({
+      content: [{ type: 'text', text: 'a' }], source: { kind: 'user' },
+    }), { surfaceOp: 'append' }) // seq 0
     expect(() => s.append('assistant/message',
-      { provenance: { provider: 'mock', model: 'mock' }, turn: 1, step: 1, content: [{ type: 'text', text: 'y' }] },
+      {
+        turn: 1, step: 1,
+        message: createMessage({
+          role: 'assistant',
+          content: [{ type: 'text', text: 'y' }],
+          source: {
+            kind: 'model',
+            ...{ provider: 'mock', model: 'mock' },
+          },
+        }),
+      },
       { surfaceOp: { op: 'replace', start: 5, end: 0 }, sourceEventSeqs: [0] },
     )).toThrow(/surface replace: start seq 5 not found/)
   })
 
   it('throws when replace end is not found', () => {
-    const s = new Session(SessionId('bad-end'))
-    s.append('user/message', { content: [{ type: 'text', text: 'a' }], source: { kind: 'user' } }, { surfaceOp: 'append' }) // seq 0
+    const s = Session.create(SessionId('bad-end'))
+    s.append('user/message', createUserMessage({
+      content: [{ type: 'text', text: 'a' }], source: { kind: 'user' },
+    }), { surfaceOp: 'append' }) // seq 0
     expect(() => s.append('assistant/message',
-      { provenance: { provider: 'mock', model: 'mock' }, turn: 1, step: 1, content: [{ type: 'text', text: 'y' }] },
+      {
+        turn: 1, step: 1,
+        message: createMessage({
+          role: 'assistant',
+          content: [{ type: 'text', text: 'y' }],
+          source: {
+            kind: 'model',
+            ...{ provider: 'mock', model: 'mock' },
+          },
+        }),
+      },
       { surfaceOp: { op: 'replace', start: 0, end: 99 }, sourceEventSeqs: [0] },
     )).toThrow(/surface replace: end seq 99 not found/)
   })
 
   it('throws when start is after end', () => {
-    const s = new Session(SessionId('reversed'))
-    s.append('user/message', { content: [{ type: 'text', text: 'a' }], source: { kind: 'user' } }, { surfaceOp: 'append' }) // seq 0
-    s.append('user/message', { content: [{ type: 'text', text: 'b' }], source: { kind: 'user' } }, { surfaceOp: 'append' }) // seq 1
+    const s = Session.create(SessionId('reversed'))
+    s.append('user/message', createUserMessage({
+      content: [{ type: 'text', text: 'a' }], source: { kind: 'user' },
+    }), { surfaceOp: 'append' }) // seq 0
+    s.append('user/message', createUserMessage({
+      content: [{ type: 'text', text: 'b' }], source: { kind: 'user' },
+    }), { surfaceOp: 'append' }) // seq 1
     // start=1, end=0 would be reversed order.
     expect(() => s.append('assistant/message',
-      { provenance: { provider: 'mock', model: 'mock' }, turn: 1, step: 1, content: [{ type: 'text', text: 'y' }] },
+      {
+        turn: 1, step: 1,
+        message: createMessage({
+          role: 'assistant',
+          content: [{ type: 'text', text: 'y' }],
+          source: {
+            kind: 'model',
+            ...{ provider: 'mock', model: 'mock' },
+          },
+        }),
+      },
       { surfaceOp: { op: 'replace', start: 1, end: 0 }, sourceEventSeqs: [1, 0] },
     )).toThrow(/start seq 1.*after end seq 0/)
   })
 
   it('sourceEventSeqs is snapshot so caller mutation does not affect logged event', () => {
-    const s = new Session(SessionId('immutable'))
-    s.append('user/message', { content: [{ type: 'text', text: 'source' }], source: { kind: 'user' } }, { surfaceOp: 'append' })
+    const s = Session.create(SessionId('immutable'))
+    s.append('user/message', createUserMessage({
+      content: [{ type: 'text', text: 'source' }], source: { kind: 'user' },
+    }), { surfaceOp: 'append' })
     const sources = [0]
-    s.append('assistant/message', { provenance: { provider: 'mock', model: 'mock' }, turn: 1, step: 1, content: [{ type: 'text', text: 'h' }] }, { surfaceOp: 'append', sourceEventSeqs: sources })
+    s.append('assistant/message', {
+      turn: 1, step: 1,
+      message: createMessage({
+        role: 'assistant',
+        content: [{ type: 'text', text: 'h' }],
+        source: {
+          kind: 'model',
+          ...{ provider: 'mock', model: 'mock' },
+        },
+      }),
+    }, { surfaceOp: 'append', sourceEventSeqs: sources })
     // Mutate caller's array after append.
     sources.push(1)
     sources[0] = 99
@@ -306,23 +650,51 @@ describe('SurfaceManager', () => {
   })
 
   it('replace starting at non-head position preserves surrounding order', () => {
-    const s = new Session(SessionId('mid-replace'))
-    s.append('user/message', { content: [{ type: 'text', text: 'a' }], source: { kind: 'user' } }, { surfaceOp: 'append' }) // seq 0
-    s.append('user/message', { content: [{ type: 'text', text: 'b' }], source: { kind: 'user' } }, { surfaceOp: 'append' }) // seq 1
-    s.append('user/message', { content: [{ type: 'text', text: 'c' }], source: { kind: 'user' } }, { surfaceOp: 'append' }) // seq 2
+    const s = Session.create(SessionId('mid-replace'))
+    s.append('user/message', createUserMessage({
+      content: [{ type: 'text', text: 'a' }], source: { kind: 'user' },
+    }), { surfaceOp: 'append' }) // seq 0
+    s.append('user/message', createUserMessage({
+      content: [{ type: 'text', text: 'b' }], source: { kind: 'user' },
+    }), { surfaceOp: 'append' }) // seq 1
+    s.append('user/message', createUserMessage({
+      content: [{ type: 'text', text: 'c' }], source: { kind: 'user' },
+    }), { surfaceOp: 'append' }) // seq 2
     // Replace the middle node (seq 1) only, keeping seq 0 and seq 2.
     s.append('assistant/message',
-      { provenance: { provider: 'mock', model: 'mock' }, turn: 1, step: 1, content: [{ type: 'text', text: 'x' }] },
+      {
+        turn: 1, step: 1,
+        message: createMessage({
+          role: 'assistant',
+          content: [{ type: 'text', text: 'x' }],
+          source: {
+            kind: 'model',
+            ...{ provider: 'mock', model: 'mock' },
+          },
+        }),
+      },
       { surfaceOp: { op: 'replace', start: 1, end: 1 }, sourceEventSeqs: [1] },
     ) // seq 3
     expect(s.surface.nodes).toEqual([0, 3, 2])
   })
 
   it('surfaceOp replace object is snapshot so caller mutation is isolated', () => {
-    const s = new Session(SessionId('immutable-op'))
-    s.append('user/message', { content: [{ type: 'text', text: 'a' }], source: { kind: 'user' } }, { surfaceOp: 'append' })
+    const s = Session.create(SessionId('immutable-op'))
+    s.append('user/message', createUserMessage({
+      content: [{ type: 'text', text: 'a' }], source: { kind: 'user' },
+    }), { surfaceOp: 'append' })
     const op = { op: 'replace' as const, start: 0, end: 0 }
-    s.append('assistant/message', { provenance: { provider: 'mock', model: 'mock' }, turn: 1, step: 1, content: [{ type: 'text', text: 's' }] }, { surfaceOp: op, sourceEventSeqs: [0] })
+    s.append('assistant/message', {
+      turn: 1, step: 1,
+      message: createMessage({
+        role: 'assistant',
+        content: [{ type: 'text', text: 's' }],
+        source: {
+          kind: 'model',
+          ...{ provider: 'mock', model: 'mock' },
+        },
+      }),
+    }, { surfaceOp: op, sourceEventSeqs: [0] })
     // Mutate caller's object after append.
     op.start = 99
     const logged = s.events[1]! as SurfaceEvent
@@ -342,31 +714,60 @@ describe('deriveMessages with surface', () => {
   })
 
   it('surface path skips non-surface events (chunks, boundaries)', () => {
-    const s = new Session(SessionId('filter'))
-    s.append('turn/start', { turn: 1, trigger: { kind: 'message', source: { kind: 'user' } } })
+    const s = Session.create(SessionId('filter'))
+    s.append('turn/start', { turn: 1 })
     s.append('assistant/chunk', { turn: 1, step: 1, chunk: { type: 'text-delta', index: 0, text: 'h' } })
     s.append('assistant/chunk', { turn: 1, step: 1, chunk: { type: 'text-delta', index: 1, text: 'i' } })
-    s.append('user/message', { content: [{ type: 'text', text: 'hello' }], source: { kind: 'user' } }, { surfaceOp: 'append' })
-    s.append('assistant/message', { provenance: { provider: 'mock', model: 'mock' }, turn: 1, step: 1, content: [{ type: 'text', text: 'hi' }] }, { surfaceOp: 'append' })
+    s.append('user/message', createUserMessage({
+      content: [{ type: 'text', text: 'hello' }], source: { kind: 'user' },
+    }), { surfaceOp: 'append' })
+    s.append('assistant/message', {
+      turn: 1, step: 1,
+      message: createMessage({
+        role: 'assistant',
+        content: [{ type: 'text', text: 'hi' }],
+        source: {
+          kind: 'model',
+          ...{ provider: 'mock', model: 'mock' },
+        },
+      }),
+    }, { surfaceOp: 'append' })
     s.append('turn/end', { turn: 1, reason: { kind: 'completed' } })
     // Chunks and boundaries are NOT in the surface, so only 2 messages.
     expect(s.deriveMessages()).toHaveLength(2)
   })
 
   it('deriveMessages via surface respects replace (shadowed nodes are excluded)', () => {
-    const s = new Session(SessionId('compacted'))
-    s.append('user/message', { content: [{ type: 'text', text: 'original' }], source: { kind: 'user' } }, { surfaceOp: 'append' })
-    s.append('assistant/message', { provenance: { provider: 'mock', model: 'mock' }, turn: 1, step: 1, content: [{ type: 'text', text: 'compacted' }] }, { surfaceOp: { op: 'replace', start: 0, end: 0 }, sourceEventSeqs: [0] })
+    const s = Session.create(SessionId('compacted'))
+    s.append('user/message', createUserMessage({
+      content: [{ type: 'text', text: 'original' }], source: { kind: 'user' },
+    }), { surfaceOp: 'append' })
+    s.append('assistant/message', {
+      turn: 1, step: 1,
+      message: createMessage({
+        role: 'assistant',
+        content: [{ type: 'text', text: 'compacted' }],
+        source: {
+          kind: 'model',
+          ...{ provider: 'mock', model: 'mock' },
+        },
+      }),
+    }, { surfaceOp: { op: 'replace', start: 0, end: 0 }, sourceEventSeqs: [0] })
     // Only the compaction node is visible.
     const messages = s.deriveMessages()
     expect(messages).toHaveLength(1)
     expect(messages[0]!.content[0]).toMatchObject({ type: 'text', text: 'compacted' })
   })
 
-  it('context/message and steering/message appear on surface', () => {
-    const s = new Session(SessionId('ctx'))
-    s.append('context/message', { content: [{ type: 'text', text: 'file changed' }], source: { kind: 'plugin', plugin: 'watcher' } }, { surfaceOp: 'append' })
-    s.append('steering/message', { turn: 1, content: [{ type: 'text', text: 'focus' }], source: { kind: 'user' } }, { surfaceOp: 'append' })
+  it('injected-context and user messages appear on surface', () => {
+    const s = Session.create(SessionId('ctx'))
+    s.append('user/message', createUserMessage({
+      content: [{ type: 'text', text: 'file changed' }], source: { kind: 'plugin', plugin: 'watcher' },
+    }), { surfaceOp: 'append' })
+    s.append('user/message', createUserMessage({
+      content: [{ type: 'text', text: 'focus' }],
+      source: { kind: 'user' },
+    }), { surfaceOp: 'append' })
     const messages = s.deriveMessages()
     expect(messages).toHaveLength(2)
     expect(messages[0]!.content).toEqual([{ type: 'text', text: 'file changed' }])
@@ -376,11 +777,21 @@ describe('deriveMessages with surface', () => {
 
 describe('Session.append surface opts', () => {
   it('records sourceEventSeqs and surfaceOp on the event', () => {
-    const s = new Session(SessionId('opts'))
-    s.append('turn/start', { turn: 1, trigger: { kind: 'message', source: { kind: 'user' } } })
+    const s = Session.create(SessionId('opts'))
+    s.append('turn/start', { turn: 1 })
     s.append('step/start', { turn: 1, step: 1 })
     const event = s.append('assistant/message',
-      { provenance: { provider: 'mock', model: 'mock' }, turn: 1, step: 1, content: [{ type: 'text', text: 'h' }] },
+      {
+        turn: 1, step: 1,
+        message: createMessage({
+          role: 'assistant',
+          content: [{ type: 'text', text: 'h' }],
+          source: {
+            kind: 'model',
+            ...{ provider: 'mock', model: 'mock' },
+          },
+        }),
+      },
       { surfaceOp: 'append', sourceEventSeqs: [0, 1] },
     )
     expect(event.sourceEventSeqs).toEqual([0, 1])
@@ -395,27 +806,47 @@ describe('Session.append surface opts', () => {
     // but _deriveOneMessage returns null for it, so the surface derivation path's
     // null-check is exercised — the node is on the surface yet produces no message.
     const seed: SessionEvent[] = [
-      { type: 'turn/start', seq: 0, time: 1, data: { turn: 1, trigger: { kind: 'message', source: { kind: 'user' } } } },
+      { type: 'turn/start', seq: 0, time: 1, data: { turn: 1 } },
       { type: 'step/start', seq: 1, time: 2, data: { turn: 1, step: 1 } },
-      { type: 'assistant/message', seq: 2, time: 3, data: { turn: 1, step: 1, content: [], provenance: { provider: 'mock', model: 'mock' } }, surfaceOp: 'append' },
+      { type: 'assistant/message', seq: 2, time: 3, data: {
+        turn: 1, step: 1,
+        message: createMessage({
+          role: 'assistant',
+          content: [],
+          source: {
+            kind: 'model',
+            ...{ provider: 'mock', model: 'mock' },
+          },
+        }),
+      }, surfaceOp: 'append' },
       { type: 'step/end', seq: 3, time: 4, data: { turn: 1, step: 1 } },
       { type: 'turn/end', seq: 4, time: 5, data: { turn: 1, reason: { kind: 'completed' } } },
     ]
-    const s = new Session(SessionId('nomessage'), seed)
+    const s = Session.create(SessionId('nomessage'), seed)
     // The empty assistant/message is on the surface but _deriveOneMessage returns null for it.
     expect(s.deriveMessages()).toHaveLength(0)
   })
 
   it('a non-surface event carries no surface fields', () => {
-    const s = new Session(SessionId('noopts'))
-    s.append('turn/start', { turn: 1, trigger: { kind: 'message', source: { kind: 'user' } } })
+    const s = Session.create(SessionId('noopts'))
+    s.append('turn/start', { turn: 1 })
     expect((s.events[0] as SessionEvent<SurfaceEventType>).sourceEventSeqs).toBeUndefined()
     expect((s.events[0] as SessionEvent<SurfaceEventType>).surfaceOp).toBeUndefined()
   })
 
   it('surfaceOp primitives are not cloned (they are immutable)', () => {
-    const s = new Session(SessionId('prim'))
-    const event = s.append('assistant/message', { provenance: { provider: 'mock', model: 'mock' }, turn: 1, step: 1, content: [] }, { surfaceOp: 'append' })
+    const s = Session.create(SessionId('prim'))
+    const event = s.append('assistant/message', {
+      turn: 1, step: 1,
+      message: createMessage({
+        role: 'assistant',
+        content: [],
+        source: {
+          kind: 'model',
+          ...{ provider: 'mock', model: 'mock' },
+        },
+      }),
+    }, { surfaceOp: 'append' })
     // The string 'append' is a primitive — identity-preserving is fine.
     expect(event.surfaceOp).toBe('append')
   })
@@ -426,11 +857,13 @@ describe('Session.append surface opts', () => {
     // SurfaceEvent — it would otherwise be silently dropped from the surface.
     const noMarker: SessionEvent = {
       type: 'user/message', seq: 0, time: 1,
-      data: { content: [{ type: 'text', text: 'hi' }], source: { kind: 'user' } },
+      data: createUserMessage({
+        content: [{ type: 'text', text: 'hi' }], source: { kind: 'user' },
+      }),
     }
     expect(isSurfaceEvent(noMarker)).toBe(false)
     // A non-surface type is rejected too (the type gate).
-    const boundary: SessionEvent = { type: 'turn/start', seq: 1, time: 1, data: { turn: 1, trigger: { kind: 'message', source: { kind: 'user' } } } }
+    const boundary: SessionEvent = { type: 'turn/start', seq: 1, time: 1, data: { turn: 1 } }
     expect(isSurfaceEvent(boundary)).toBe(false)
     // A properly-marked surface event narrows.
     const marked = { ...noMarker, surfaceOp: 'append' } as SurfaceEvent
@@ -443,8 +876,6 @@ describe('surface type guards', () => {
     expect(isSurfaceEligibleType('user/message')).toBe(true)
     expect(isSurfaceEligibleType('assistant/message')).toBe(true)
     expect(isSurfaceEligibleType('tool/result')).toBe(true)
-    expect(isSurfaceEligibleType('context/message')).toBe(true)
-    expect(isSurfaceEligibleType('steering/message')).toBe(true)
     expect(isSurfaceEligibleType('turn/start')).toBe(false)
     expect(isSurfaceEligibleType('assistant/chunk')).toBe(false)
   })
@@ -469,27 +900,67 @@ describe('surface type guards', () => {
       type: 'user/message',
       seq: 0,
       time: 0,
-      data: { content: [{ type: 'text', text: 'hi' }], source: { kind: 'user' } },
+      data: createUserMessage({
+        content: [{ type: 'text', text: 'hi' }], source: { kind: 'user' },
+      }),
     }
     expect(isSurfaceEligibleType(markerless.type)).toBe(true)
     expect(isSurfaceEvent(markerless)).toBe(false)
+  })
+
+  it('splits surface events into append-origin and replacement by their marker', () => {
+    const s = surfaceSession()
+    s.append('user/message', createUserMessage({
+      content: [{ type: 'text', text: 'checkpoint' }], source: { kind: 'plugin', plugin: 'compact' },
+    }), { surfaceOp: { op: 'replace', start: 1, end: 2 }, sourceEventSeqs: [1, 2] })
+    const appended = s.events.find(e => e.type === 'user/message')!
+    const replacement = s.events.at(-1)!
+
+    expect(isAppendSurfaceEvent(appended)).toBe(true)
+    expect(isReplacementSurfaceEvent(appended)).toBe(false)
+    expect(isAppendSurfaceEvent(replacement)).toBe(false)
+    expect(isReplacementSurfaceEvent(replacement)).toBe(true)
+  })
+
+  it('rejects log-only and markerless events from both marker guards', () => {
+    const s = surfaceSession()
+    const turnStart = s.events.find(e => e.type === 'turn/start')!
+    // A surface-eligible type whose mandatory marker is absent has no origin at
+    // all: it never entered the surface.
+    const markerless: SessionEvent = {
+      type: 'user/message',
+      seq: 0,
+      time: 0,
+      data: createUserMessage({
+        content: [{ type: 'text', text: 'hi' }], source: { kind: 'user' },
+      }),
+    }
+
+    expect(isAppendSurfaceEvent(turnStart)).toBe(false)
+    expect(isReplacementSurfaceEvent(turnStart)).toBe(false)
+    expect(isAppendSurfaceEvent(markerless)).toBe(false)
+    expect(isReplacementSurfaceEvent(markerless)).toBe(false)
   })
 })
 
 describe('SurfaceManager.replaceGeneration', () => {
   it('folds the pending log delta on access and counts replaces', () => {
-    const s = new Session(SessionId('gen'))
-    s.append('turn/start', { turn: 1, trigger: { kind: 'message', source: { kind: 'user' } } })
-    s.append('user/message', { content: [{ type: 'text', text: 'one' }], source: { kind: 'user' } }, { surfaceOp: 'append' })
-    s.append('user/message', { content: [{ type: 'text', text: 'two' }], source: { kind: 'user' } }, { surfaceOp: 'append' })
+    const s = Session.create(SessionId('gen'))
+    s.append('turn/start', { turn: 1 })
+    s.append('user/message', createUserMessage({
+      content: [{ type: 'text', text: 'one' }], source: { kind: 'user' },
+    }), { surfaceOp: 'append' })
+    s.append('user/message', createUserMessage({
+      content: [{ type: 'text', text: 'two' }], source: { kind: 'user' },
+    }), { surfaceOp: 'append' })
     // Read the generation FIRST — before nodes — so the getter itself folds
     // the pending delta rather than piggybacking on a nodes read.
     expect(s.surface.replaceGeneration).toBe(0)
 
     const nodes = s.surface.nodes
-    s.append('context/message', {
+    s.append('user/message', createUserMessage({
       content: [{ type: 'text', text: 'summary' }], source: { kind: 'plugin', plugin: 'compact' },
-    }, { surfaceOp: { op: 'replace', start: nodes[0]!, end: nodes[1]! }, sourceEventSeqs: [nodes[0]!, nodes[1]!] })
+    }), { surfaceOp: { op: 'replace', start: nodes[0]!, end: nodes[1]! }, sourceEventSeqs: [nodes[0]!, nodes[1]!] })
     expect(s.surface.replaceGeneration).toBe(1)
   })
 })

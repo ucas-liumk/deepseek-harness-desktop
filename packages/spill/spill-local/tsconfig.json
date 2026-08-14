@@ -6,9 +6,20 @@
   },
   "include": ["src"],
   "references": [
-    { "path": "../../../vendor/cosmokit" },
-    { "path": "../../../vendor/cordis" },
-    { "path": "../../../vendor/schemastery" },
-    { "path": "../spill" }
+    {
+      "path": "../../../vendor/cosmokit"
+    },
+    {
+      "path": "../../../vendor/cordis"
+    },
+    {
+      "path": "../../../vendor/schemastery"
+    },
+    {
+      "path": "../spill"
+    },
+    {
+      "path": "../../runtime-diagnostics/invariants"
+    }
   ]
 }

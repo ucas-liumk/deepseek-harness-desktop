@@ -21,6 +21,11 @@ export interface ReferenceViolation {
   ref: string
 }
 
+/** Whether a repository path is frozen Agent Note history, not evolving source prose. */
+export function isArchivedAgentNotePath(path: string): boolean {
+  return path.replaceAll('\\', '/').startsWith('.agents/notes/archived/')
+}
+
 /**
  * Expand repository-relative globs and deduplicate symlinked files.
  * @param root - absolute repository root.

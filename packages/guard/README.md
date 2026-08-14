@@ -1,9 +1,12 @@
 # guard/ — loop-hygiene guard family
 
-Behavioral guard plugins that watch the agent loop for unproductive patterns and nudge the model back on course. A single **product** package — there is no interface/implementation seam here, because a guard is a self-contained consumer of existing core seams (`tools/post-execute`, `agent/prompt-submit`, `agent/status`), not a swappable capability.
+English | [中文](README.zh.md)
+
+Behavioral guard plugins watch the agent loop for unproductive patterns and enforce per-call budgets. A guard is a self-contained consumer of core services and extension points, not a swappable capability.
 
 | Package | Role | ctx key |
 |---|---|---|
-| `repeat-tool-guard/` | Advisory reminders when an agent loops on identical tool calls | (listens on `ctx.tools`' waterfalls) |
+| [`repeat-tool-reminder/`](repeat-tool-reminder/README.md) | Advisory reminders for repeated tool calls | listens on tool and agent events |
+| [`timeout-policy/`](timeout-policy/README.md) | Arms per-call tool deadlines as deployment policy | registers a `tools/execute` listener |
 
-Reminders travel as `additionalContexts` on the `tools/post-execute` decision; the agent loop appends them as logged `context/message` events after the step's tool results (see [the tools package](../core/tools)), so everything a guard says to the model is reconstructable from the session log.
+Reminders travel as `additionalContexts` on the `tools/post-execute` decision and are appended as logged plugin-sourced `user/message` events ([tools](../../docs/subsystems/tools.md)); the timeout split across `dsh-timeout`, capability termination, and this policy layer is recorded in the [timeout-library Agent Note](../../.agents/notes/implemented/architecture/2026-07-06-timeout-deadline-library.md).

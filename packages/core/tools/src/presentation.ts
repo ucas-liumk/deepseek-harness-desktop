@@ -8,19 +8,17 @@
 import type { ContentBlock } from '@deepseek-ai/dsh-llm'
 
 /**
- * Category of a tool call, used by a UI to pick an icon / treatment. A neutral
- * vocabulary owned here (NOT an ACP type) so tools describe themselves without
- * depending on any client protocol; a UI bridge maps it to its own enum. The
- * member set mirrors the common ACP `ToolKind` values; `other` is the default.
+ * Category of a tool call, used by a UI to pick an icon or treatment. The
+ * provider-neutral vocabulary lets tools describe themselves without depending
+ * on a particular client; `other` is the default.
  */
 export type ToolCallKind = 'read' | 'edit' | 'delete' | 'move' | 'search' | 'execute' | 'fetch' | 'other'
 
 /**
  * A file location a tool reads or modifies, so a capable UI can "follow along" —
- * highlight or jump to the file (and line) as the tool runs. Provider-neutral;
- * a UI bridge maps it to its own affordance (the ACP bridge forwards it as
- * `tool_call.locations`). `path` is what the tool operated on (the model-facing
- * path); `line` is an optional 1-based line to focus (e.g. a read's offset).
+ * highlight or jump to the file (and line) as the tool runs. `path` is what the
+ * tool operated on (the model-facing path); `line` is an optional 1-based line
+ * to focus (e.g. a read's offset).
  */
 export interface FileLocation {
   path: string
@@ -29,10 +27,9 @@ export interface FileLocation {
 
 /**
  * A single-file change a tool is about to make, for a UI that renders inline
- * diffs (an editor's diff card). Provider-neutral; the ACP bridge forwards it as
- * a `{ type: 'diff' }` tool-call content block. `oldText` is `null` for a
- * new-file create (nothing to diff against); an overwrite also uses `null`,
- * because a call-time presenter has no access to the file's prior content.
+ * diffs. `oldText` is `null` for a new-file create (nothing to diff against);
+ * an overwrite also uses `null`, because a call-time presenter has no access to
+ * the file's prior content.
  */
 export interface FileDiff {
   path: string
@@ -63,8 +60,8 @@ export interface GenericCallView {
   /** Category for icon/treatment; defaults to `other` when omitted. */
   kind?: ToolCallKind
   /**
-   * The salient input to surface in a detail/expanded view (e.g. a background
-   * task id). Omit to show nothing; a string renders as-is, an object as pretty
+   * The salient input to show in a detail/expanded view (e.g. a background
+   * job id). Omit to show nothing; a string renders as-is, an object as pretty
    * JSON. NOT the full raw args object unless that is genuinely what a reader wants.
    */
   rawInput?: unknown
@@ -121,6 +118,18 @@ export interface DiffCallView {
 }
 
 /**
+ * One numbered line of a file, the unit a {@link ReadResultView} carries so a
+ * capable UI can render a syntax-highlighted, line-numbered code view. `number`
+ * is the 1-based line number in the file (a window past `offset` keeps the file's
+ * own numbering, not a 1-based re-count); `text` is the line without its trailing
+ * newline, already truncated to the read tool's per-line cap.
+ */
+export interface ReadFileLine {
+  number: number
+  text: string
+}
+
+/**
  * How a tool wants the COMPLETED call shown — the *result* state, after `execute`
  * returns. A `card`-tagged union mirroring {@link ToolCallView}: a UI switches on
  * `card`. Lets the tool reformat its result for a UI distinctly from the
@@ -128,7 +137,7 @@ export interface DiffCallView {
  * `ToolDefinition.presentResult`; omitting the method keeps the pending
  * title and renders the raw result content.
  */
-export type ToolResultView = GenericResultView | TerminalResultView | DiffResultView
+export type ToolResultView = GenericResultView | TerminalResultView | DiffResultView | SearchResultView | ReadResultView | WebResultView
 
 /**
  * The default completed card: an optional replacement title and reformatted
@@ -178,4 +187,203 @@ export interface DiffResultView {
   title?: string
   /** The change to show, in file order — applied contextual hunks, or a whole-file diff when there is no before-image. */
   diffs: FileDiff[]
+}
+
+/** One matched line inside a {@link SearchFileMatches} group: its 1-based line number and text. */
+export interface SearchLineMatch {
+  /** 1-based line number of the match within its file. */
+  lineNumber: number
+  /** The matched line text, as the tool surfaced it (the per-line preview budget already applied). */
+  line: string
+}
+
+/** One file's grouped content matches for a {@link SearchMatchesResultView}, in first-seen file order. */
+export interface SearchFileMatches {
+  /** The file the matches belong to (the model-facing display path). */
+  path: string
+  /** The file's matched lines, in output order. */
+  matches: SearchLineMatch[]
+}
+
+/**
+ * A completed content search (`grep`) rendered as a search card whose matches are
+ * grouped by file, so a capable UI can list each file as an expandable group of
+ * its matched lines. `shape: 'matches'` discriminates this variant from the path
+ * variant ({@link SearchPathsResultView}) within {@link SearchResultView}. The
+ * discriminant is `shape`, not `kind`, so it never collides with the
+ * {@link ToolCallKind} `kind` an icon-picking bridge reads off a call view.
+ */
+export interface SearchMatchesResultView {
+  card: 'search'
+  shape: 'matches'
+  /** Replacement title for the completed call. Omit to keep the pending-state title. */
+  title?: string
+  /** Matched lines grouped by file, in first-seen file order. */
+  files: SearchFileMatches[]
+  /**
+   * Whether the tool capped the inline result: `files` carries only the retained
+   * matches, not every match the search found. A UI shows a capped indicator so it
+   * never presents a partial group as complete.
+   */
+  truncated: boolean
+  /** Total matches the search found before capping (equals the retained count when not `truncated`). */
+  total: number
+}
+
+/**
+ * A completed path search (`glob`) rendered as a search card whose result is a flat
+ * path list. `shape: 'paths'` discriminates this variant from the grouped-matches
+ * variant ({@link SearchMatchesResultView}) within {@link SearchResultView}.
+ */
+export interface SearchPathsResultView {
+  card: 'search'
+  shape: 'paths'
+  /** Replacement title for the completed call. Omit to keep the pending-state title. */
+  title?: string
+  /** The discovered paths, in the tool's result order (the retained page when `truncated`). */
+  paths: string[]
+  /**
+   * Whether the tool capped the inline result: `paths` carries only the retained
+   * page, not every path the search found. A UI shows a capped indicator so it
+   * never presents a partial list as complete.
+   */
+  truncated: boolean
+  /** Total paths the search found before capping (equals `paths.length` when not `truncated`). */
+  total: number
+}
+
+/**
+ * A completed search rendered as a search card, the result-time view a discovery
+ * tool (`grep`, `glob`) returns from `presentResult`. One `card: 'search'` view
+ * with two `shape`-discriminated variants: grouped-by-file content matches
+ * ({@link SearchMatchesResultView}) and a flat path list
+ * ({@link SearchPathsResultView}). Both carry a `truncated`/`total` signal so a UI
+ * never presents a capped result as complete. The view carries no result text: a
+ * UI without a search card falls back to the raw `tool/result` content. There is
+ * no call-time analogue: a search call stays a {@link GenericCallView}
+ * (`kind: 'search'`) because the pending state has no matches or paths to show —
+ * the structured shape exists only after `execute`.
+ */
+export type SearchResultView = SearchMatchesResultView | SearchPathsResultView
+
+/**
+ * A completed file read rendered as a line-numbered, optionally syntax-highlighted
+ * code view by a capable UI. Set by a tool whose call reads file text (e.g.
+ * `read`); the pending state stays a {@link GenericCallView} (`kind: 'read'`)
+ * because a call carries no content until `execute` returns. The structured
+ * `lines`/`path`/`lang`/`totalLines` fields cannot be reconstructed from the
+ * model-facing result text alone, so the read tool projects them through its
+ * `output.presentationMeta` (persisted with the session log) and `presentResult`
+ * narrows that metadata back into this view on live and replay paths alike. A UI
+ * without the read capability falls back to `content` (the model-facing text with
+ * its envelope stripped), so this view degrades to the generic text card.
+ */
+export interface ReadResultView {
+  card: 'read'
+  /** Replacement title for the completed call. Omit to keep the pending-state title. */
+  title?: string
+  /** The read file's path (the model-facing path; the bridge relativizes it). */
+  path: string
+  /**
+   * The 1-based first line the window requested, preserved even when `lines` is
+   * empty (a byte cap below the first selected line yields an empty window) so a
+   * UI knows where the window starts and where a continuation resumes.
+   */
+  offset: number
+  /** The returned window's lines, in file order, each keeping its file line number. */
+  lines: ReadFileLine[]
+  /** Exact total line count in the file, so a UI can show a "showing N of M" affordance. */
+  totalLines: number
+  /**
+   * A syntax-highlighting language hint derived from the file extension (e.g.
+   * `ts`, `py`), or omitted when the extension maps to no known language so a UI
+   * renders the lines as plain text.
+   */
+  lang?: string
+  /**
+   * The model-facing result content with its envelope stripped, for a UI without
+   * the read capability. Omit to let such a UI render the raw result content.
+   */
+  content?: ContentBlock[]
+}
+
+/**
+ * One citeable source in a completed {@link WebSearchResultView}, the faithful
+ * projection of one web-search source. The presentation projection of `dsh-web`'s
+ * `WebSearchSource`: that Service Definition type is authoritative (core cannot depend
+ * on the web Service Definition, so the two are declared separately and MUST evolve together).
+ * A web tool projects this shape through `output.presentationMeta` because the
+ * render text cannot losslessly carry it (see the web-result-card Agent Note); its
+ * `presentResult` reads it back.
+ */
+export interface WebSource {
+  /** The source URL. */
+  url: string
+  /** The source title, when the provider returned one. */
+  title?: string
+  /** A short excerpt or summary, when the provider returned one. */
+  snippet?: string
+  /** Publication/crawl timestamp as a provider-supplied ISO-8601 string, when present. */
+  publishedAt?: string
+}
+
+/**
+ * A completed web retrieval rendered as a structured card by a capable UI. Set
+ * by a web tool whose call retrieves from the web (`web_search`, `web_fetch`).
+ * One `kind`-tagged union carries both shapes because both are web retrieval and
+ * a UI renders them with one component family; a UI switches on `kind`. An
+ * incapable UI falls back to the raw `tool/result` content (this view carries no
+ * `content` copy — see the web-result-card Agent Note). This is the result-time
+ * analogue of the `web_search`/`web_fetch` calls' generic call views
+ * (`kind: 'search'`/`'fetch'`); those tools keep their generic pending card and
+ * add only this completed card.
+ *
+ * The `kind` field here is this union's own discriminant, NOT a
+ * {@link ToolCallKind}: the two values deliberately match the tools' pending
+ * `ToolCallKind` (`'search'`/`'fetch'`) so a call and its result read as one
+ * category, but a new arm is a union edit plus a consumer branch, not any
+ * arbitrary `ToolCallKind` value.
+ */
+export type WebResultView = WebSearchResultView | WebFetchResultView
+
+/**
+ * The completed state of a `web_search` call: the structured sources the model
+ * cited, an optional provider answer, and whether the source list was cut to the
+ * result cap. A capable UI renders the sources as a citation list; a UI without
+ * the `web` capability falls back to the raw `tool/result` content.
+ */
+export interface WebSearchResultView {
+  card: 'web'
+  kind: 'search'
+  /** Replacement title for the completed call. Omit to keep the pending-state title. */
+  title?: string
+  /** The faithful, structured sources — the field render text cannot losslessly carry. */
+  sources: WebSource[]
+  /** The provider-generated answer text, when any. */
+  answer?: string
+  /** True when the web service cut the source list to honor the result cap. */
+  truncated: boolean
+}
+
+/**
+ * The completed state of a `web_fetch` call: the fetched URL, its HTTP status,
+ * and whether the content was cut. The body itself is already markdown in the
+ * raw `tool/result` content, so this card carries only the retrieval summary and
+ * a UI without the `web` capability falls back to that content.
+ */
+export interface WebFetchResultView {
+  card: 'web'
+  kind: 'fetch'
+  /** Replacement title for the completed call. Omit to keep the pending-state title. */
+  title?: string
+  /** The final URL after allowed redirects. */
+  url: string
+  /** HTTP status code of the fetched response. */
+  statusCode: number
+  /**
+   * True when the provider capped the decoded body, or the output cap or a
+   * pre-conversion source cut trimmed the rendered text (the effective
+   * truncation the model-facing text also reflects).
+   */
+  truncated: boolean
 }

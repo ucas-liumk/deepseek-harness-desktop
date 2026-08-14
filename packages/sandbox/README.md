@@ -1,13 +1,15 @@
 # sandbox/ — process-sandbox capability family
 
-The confinement half of the [capability-seam split](../../.agents/notes/implemented/architecture/2026-06-13-capability-seams.md): an abstract provider interface, platform backends, and the shared policy home. Consumers hand `ctx.sandbox` the exact argv they are about to spawn and spawn the returned (wrapped) argv instead; policy (`SandboxPolicy`: mode + workspace root) rides each call, so different consumers confine under different policies at the same instant. All **product** packages.
+English | [中文](README.zh.md)
+
+This family applies per-session confinement policy to process execution. It covers same-world subprocesses; isolated environments replace complete capability implementations instead of registering here.
 
 | Package | Role | ctx key |
 |---|---|---|
-| `sandbox/` | Abstract process-sandbox seam (the `SandboxProvider` contract + the mode/enforcement/policy vocabulary) plus the shared ESCALATION kit (`approveEscalation`, the strictly-wider ladder, the denial/hint markers) and the `writableRoots` derivation every enforcement dialect shares | `ctx.sandbox` |
-| `sandbox-local/` | Local backends by platform chain: Linux `bwrap` else the `landlock-run` launcher (the npm-distributed [`node-addon-landlock-run`](https://www.npmjs.com/package/node-addon-landlock-run) family, built and released from its own repository), darwin `sandbox-exec`/Seatbelt — multi-candidate chains functionally probed, sole candidates selected directly, verdict cached, fail-closed | (registers `ctx.sandbox`) |
-| `sandbox-policy/` | The policy home: the deployment default (mode + `workspace-write` boundary root) and the per-session `sandbox/mode` override (event + fold + write path). Both enforcing families read it, so bash and fs can never confine to different roots | `ctx.sandboxPolicy` |
+| [`sandbox/`](sandbox/README.md) | Defines the process-sandbox service and shared escalation vocabulary | `ctx.sandbox` |
+| [`sandbox-local/`](sandbox-local/README.md) | Provides local platform confinement backends | registers on `ctx.sandbox` |
+| [`sandbox-policy/`](sandbox-policy/README.md) | Resolves durable per-session sandbox policy | `ctx.sandboxPolicy` |
 
-The seam confines SAME-WORLD subprocesses only (shared filesystem and kernel). Containers, microVMs, and remote executors are NOT backends here — they replace whole capability implementations (`ctx.bash`, `ctx.fs`) as environment-coherent groups; the boundary is recorded in [the sandbox Agent Note](../../.agents/notes/implemented/feature/2026-07-06-sandbox.md).
+See the [sandbox decision](../../.agents/notes/implemented/feature/2026-07-06-sandbox.md) for the capability boundary and the [filesystem integration decision](../../.agents/notes/implemented/feature/2026-07-14-cross-family-fs-sandbox.md) for cross-family policy use.
 
-Consumers today: [`bash/bash-sandbox`](../bash/bash-sandbox/) (wraps `['bash', '-c', command]` through `ctx.sandbox`) and [`fs/fs-sandbox`](../fs/fs-sandbox/) (an in-process path fence, not an argv wrapper — reads `ctx.sandboxPolicy` and enforces the shared mode on write/edit). The cross-family boundary is the sandbox Agent Note's [cross-family fs sandbox](../../.agents/notes/implemented/feature/2026-07-14-cross-family-fs-sandbox.md) phase; the shared vocabulary lets both families teach the model one denial marker and one escalation flow.
+The subsystem reference — modes and enforcement, per-call policy, wrapped-argv dialects, fail-closed errors — is [docs/subsystems/sandbox.md](../../docs/subsystems/sandbox.md); the boundary and the cross-family phase live in the [sandbox](../../.agents/notes/implemented/feature/2026-07-06-sandbox.md) and [cross-family fs sandbox](../../.agents/notes/implemented/feature/2026-07-14-cross-family-fs-sandbox.md) Agent Notes.

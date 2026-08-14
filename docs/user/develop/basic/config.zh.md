@@ -9,8 +9,8 @@
 在插件中导出一个 `Config` 类型和同名的 Schemastery schema；默认值直接写在 schema 中：
 
 ```ts
-import type { Context } from 'cordis'
-import Schema from 'schemastery'
+import type { Context } from '@deepseek-ai/cordis'
+import Schema from '@deepseek-ai/schemastery'
 
 export const name = 'my-plugin'
 
@@ -31,13 +31,15 @@ export function apply(ctx: Context, config: Config) {
 }
 ```
 
-用户在 `cordis.yml` 中这样使用：
+在 `scratch-plugin/cordis.yml` 新插入的本地插件行中添加配置：
 
 ```yaml
-- name: './src/my-plugin.ts'
-  config:
-    greeting: 'Hi there'
-    maxRetries: 5
+- insert:
+    - id: hello
+      name: './src/my-plugin.ts'
+      config:
+        greeting: 'Hi there'
+        maxRetries: 5
 ```
 
 插件加载时，Cordis 会通过导出的 schema 校验配置，并填充未提供字段的默认值。不要导出普通对象作为 `Config`，因为它不满足 Cordis 要求的 Standard Schema 接口。
@@ -47,8 +49,8 @@ export function apply(ctx: Context, config: Config) {
 对于需要严格校验的场景，使用 Schemastery 定义 schema：
 
 ```ts
-import type { Context } from 'cordis'
-import Schema from 'schemastery'
+import type { Context } from '@deepseek-ai/cordis'
+import Schema from '@deepseek-ai/schemastery'
 
 export const name = 'validated-plugin'
 
@@ -75,7 +77,7 @@ Schema 在插件加载时执行校验。如果配置不合法，插件会加载�
 
 ### 无硬编码可调参数
 
-Harness 的约定：**任何两个部署可能想要不同值的东西，都应该是配置字段**。
+Harness 的约定：**凡是不同部署可能需要采用不同值的参数，都必须定义为配置字段**。
 
 ```ts
 // Wrong: hardcoded timeout.
@@ -91,28 +93,14 @@ export interface Config {
 
 ### 配置错误要响亮
 
-如果配置引用了未注册的 LLM 提供方路由或其他不存在的资源，应该尽早报错，而不是静默跳过：
-
-```ts
-import type { Context } from 'cordis'
-import type {} from '@deepseek-ai/dsh-llm'
-
-export interface ModelConfig {
-  provider: string
-}
-
-export function apply(ctx: Context, config: ModelConfig) {
-  if (!ctx.llm.listProviders().some(provider => provider.id === config.provider)) {
-    throw new Error(`LLM provider "${config.provider}" is not registered`)
-  }
-}
-```
+在 schema 中表达自身完备的约束，使无效配置在插件加载时失败。对服务或已注册资源的引用需要依赖注入；[服务教程](../framework/service.md) 会介绍这项约定。
 
 ## 配合 HMR
 
-配置变更会触发插件热替换：修改 `cordis.yml` 中某个插件的 `config`，框架会卸载旧实例、加载新实例。由于注册都是效果（自动清理），这个过程是安全的。
+配置变更会触发插件热替换：修改 `cordis.yml` 中某个插件的 `config` 后，框架会卸载旧实例并加载新实例。由于注册都属于 effect 并会自动清理，替换后不会保留旧实例的注册。
 
 ## 下一步
 
+- [打包与安装插件](./publish.md) — 把插件以可安装包的形式交付
 - [插件与生命周期](../framework/) — 深入了解插件的完整生命周期
 - [服务与依赖](../framework/service.md) — 让你的插件对外提供服务

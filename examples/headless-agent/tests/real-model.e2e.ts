@@ -4,7 +4,7 @@ import { fileURLToPath } from 'node:url'
 import { describe, expect, it } from 'vitest'
 import { runLoaderSmoke } from '@deepseek-ai/dsh-loader-smoke'
 
-const binScript = fileURLToPath(new URL('../../../packages/examples/cli-demo/src/bin.ts', import.meta.url))
+const binScript = fileURLToPath(new URL('./fixtures/headless-driver.ts', import.meta.url))
 const configPath = fileURLToPath(new URL('../cordis.yml', import.meta.url))
 const tsconfigPath = fileURLToPath(new URL('../../../tsconfig.json', import.meta.url))
 const hasKey = Boolean(process.env.DEEPSEEK_API_KEY)
@@ -16,9 +16,9 @@ describe.skipIf(!hasKey)('headless-agent with real model', () => {
       label: 'headless-agent real model',
       tempDirPrefix: 'headless-agent-real-',
       binScript,
+      libBinScript: binScript,
       configPath,
       binArgs: [
-        '--config',
         configPath,
         'Read task.txt, replace its complete contents with exactly "value=after" followed by a newline, read it again, and report briefly.',
       ],

@@ -5,11 +5,10 @@
  * never provider selection or network access.
  */
 
-import type { Context } from 'cordis'
+import type { Context } from '@deepseek-ai/cordis'
 import { defineTool } from '@deepseek-ai/dsh-tools'
-import type { GenericCallView } from '@deepseek-ai/dsh-tools'
-import type { ContentBlock } from '@deepseek-ai/dsh-llm'
-import type { WebSearchResult } from '@deepseek-ai/dsh-web'
+import type { GenericCallView, JsonValue, ToolResult, WebSearchResultView, WebSource } from '@deepseek-ai/dsh-tools'
+import type { WebSearchResult, WebSearchSource } from '@deepseek-ai/dsh-web'
 import type {} from '@deepseek-ai/dsh-system-prompt'
 
 /**
@@ -86,6 +85,117 @@ export function presentSearchCall(args: { query: string }): GenericCallView {
 }
 
 /**
+ * The `web_search` tool's private `tool/result` `meta` payload: the structured
+ * sources, the optional provider answer, and the truncation flag. Attached
+ * opaquely (as `JsonValue`) on the tool result and persisted with the session
+ * log, so `presentResult` reproduces the search card on replay. This projection
+ * is the only faithful route to the per-source fields, which the lossy render
+ * text cannot carry (the owning rationale is the web-result-card Agent Note).
+ */
+export interface WebSearchMeta {
+  /** The faithful structured sources, in result order. */
+  sources: WebSource[]
+  /** True when the seam cut the source list to honor the result cap. */
+  truncated: boolean
+  /** The provider-generated answer text, when any. */
+  answer?: string
+}
+
+/**
+ * Project one seam source into a plain object that omits every absent optional
+ * field. Shared by the canonical `execute` result and its replayable
+ * presentation meta so both carry byte-identical source shapes.
+ *
+ * @param source - one source from the `ctx.web` search outcome.
+ * @returns `{ url }` plus each present optional field.
+ */
+function projectSource(source: WebSearchSource): {
+  url: string
+  title?: string
+  snippet?: string
+  publishedAt?: string
+} {
+  return {
+    url: source.url,
+    ...source.title !== undefined ? { title: source.title } : {},
+    ...source.snippet !== undefined ? { snippet: source.snippet } : {},
+    ...source.publishedAt !== undefined ? { publishedAt: source.publishedAt } : {},
+  }
+}
+
+/**
+ * Project a validated `web_search` output value into its replayable
+ * presentation meta ({@link WebSearchMeta} as opaque JSON).
+ *
+ * @param value - the canonical `web_search` output value (the seam's result shape).
+ * @returns the structured sources, the truncation flag, and the answer when present.
+ */
+export function searchMetaFromValue(value: WebSearchResult): JsonValue {
+  return {
+    sources: value.sources.map(projectSource),
+    truncated: value.truncated,
+    ...value.content !== undefined ? { answer: value.content } : {},
+  }
+}
+
+/** Whether `value` is a valid {@link WebSource} (defensive narrowing from opaque `meta`). */
+function isWebSource(value: unknown): value is WebSource {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return false
+  const { url, title, snippet, publishedAt } = value as Record<string, unknown>
+  return typeof url === 'string'
+    && (title === undefined || typeof title === 'string')
+    && (snippet === undefined || typeof snippet === 'string')
+    && (publishedAt === undefined || typeof publishedAt === 'string')
+}
+
+/**
+ * Narrow opaque live or replayed result metadata to a {@link WebSearchMeta}.
+ * Malformed metadata returns `undefined` so presentation can fall back to the
+ * generic card instead of throwing during replay.
+ *
+ * @param meta - result metadata.
+ * @returns the validated search meta, or `undefined` for absent or malformed data.
+ */
+export function searchMetaFromResult(meta: unknown): WebSearchMeta | undefined {
+  if (typeof meta !== 'object' || meta === null || Array.isArray(meta)) return undefined
+  const { sources, truncated, answer } = meta as Record<string, unknown>
+  if (!Array.isArray(sources) || !sources.every(isWebSource)) return undefined
+  if (typeof truncated !== 'boolean') return undefined
+  if (answer !== undefined && typeof answer !== 'string') return undefined
+  return {
+    sources,
+    truncated,
+    ...answer !== undefined ? { answer } : {},
+  }
+}
+
+/**
+ * Completed-call presentation: a `web` search card carrying the faithful
+ * structured sources from `meta`. It sets no `content` copy — a UI without the
+ * `web` capability falls back to the raw `tool/result` content, which is the
+ * same text (see the web-result-card Agent Note).
+ *
+ * @param args - the raw tool arguments; `query` becomes the result-state title so
+ *   a window-truncated replay that dropped the call head still has one.
+ * @param result - the final model-facing tool result; `meta` carries the sources.
+ * @returns the search result view, or `undefined` (generic card) on failure or
+ *   malformed meta.
+ */
+export function presentSearchResult(args: { query: string }, result: ToolResult): WebSearchResultView | undefined {
+  if (result.isError) return undefined
+  const meta = searchMetaFromResult(result.meta)
+  if (meta === undefined) return undefined
+  return {
+    card: 'web',
+    kind: 'search',
+    title: args.query,
+    sources: meta.sources,
+    truncated: meta.truncated,
+    ...meta.answer !== undefined ? { answer: meta.answer } : {},
+  }
+}
+
+/**
  * Register the `web_search` tool and its system-prompt guidance.
  *
  * @param ctx - context whose `tools` and `systemPrompt` registries receive the
@@ -93,13 +203,22 @@ export function presentSearchCall(args: { query: string }): GenericCallView {
  * @param maxResults - the deployment's source cap, sent as every seam
  *   request's `maxResults`.
  * @param timeoutMs - the cooperative tool-call budget (ms) attached as the tool's
- *   `ToolDefinition.timeoutMs` for `@deepseek-ai/dsh-timeout-policy` to enforce.
+ *   `ToolDefinition.timeoutMs` for `@deepseek-ai/dsh-tool-call-timeout-policy` to enforce.
+ * @param fetchEnabled - whether the same composition exposes `web_fetch`, which
+ *   controls whether search guidance may recommend that follow-up tool.
  */
-export function applyWebSearchTool(ctx: Context, maxResults: number, timeoutMs: number): void {
+export function applyWebSearchTool(
+  ctx: Context,
+  maxResults: number,
+  timeoutMs: number,
+  fetchEnabled: boolean,
+): void {
   ctx.systemPrompt.section({
     name: 'tool:web_search',
     order: 110,
-    text: 'Use the web_search tool to discover current information on the web. It returns an optional answer plus a list of source URLs. Follow up with web_fetch when you need the full content of a specific result, and cite the relevant URLs as markdown links.',
+    text: fetchEnabled
+      ? 'Use the web_search tool to discover current information on the web. It returns an optional answer plus a list of source URLs. Follow up with web_fetch when you need the full content of a specific result, and cite the relevant URLs as markdown links.'
+      : 'Use the web_search tool to discover current information on the web. It returns an optional answer plus a list of source URLs. Use the returned source snippets when available, and cite the relevant URLs as markdown links.',
   })
 
   ctx.tools.register(defineTool({
@@ -108,17 +227,48 @@ export function applyWebSearchTool(ctx: Context, maxResults: number, timeoutMs: 
     parameters: {
       query: { type: 'string', required: true, description: 'The search query.' },
     },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          content: { type: 'string' },
+          sources: {
+            type: 'array',
+            required: true,
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                url: { type: 'string', required: true },
+                title: { type: 'string' },
+                snippet: { type: 'string' },
+                publishedAt: { type: 'string' },
+              },
+            },
+          },
+          truncated: { type: 'boolean', required: true },
+        },
+      },
+      render: (_args, value) => [{ type: 'text', text: formatSearchOutput(value) }],
+      presentationMeta: (_args, value) => searchMetaFromValue(value),
+    },
     timeoutMs,
     // Provider reads do not mutate parent-agent state.
     isConcurrencySafe: () => true,
-    async execute(args, exec): Promise<ContentBlock[]> {
+    async execute(args, exec) {
       const input = parseSearchArgs(args)
       const result = await ctx.web.search(
         { query: input.query, maxResults },
         exec.signal,
       )
-      return [{ type: 'text', text: formatSearchOutput(result) }]
+      return {
+        ...result.content !== undefined ? { content: result.content } : {},
+        sources: result.sources.map(projectSource),
+        truncated: result.truncated,
+      }
     },
     presentCall: presentSearchCall,
+    presentResult: (args, result) => presentSearchResult(args, result),
   }))
 }

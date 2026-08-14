@@ -1,6 +1,6 @@
 /**
  * Keyless entry-package tests — run on every host, no kernel or binary
- * required. Cover the JS seam's pure surface: grant-argv construction, the
+ * required. Cover the JavaScript API's pure surface: grant-argv construction, the
  * resolution contract (platform package → fallback), and probe verdicts over
  * fake launchers. Requires built `lib/` (`pnpm build:ts`).
  */
@@ -15,7 +15,7 @@ import {
   grantArgs,
   launcherPath,
   probe,
-} from 'node-addon-landlock-run';
+} from '@deepseek-ai/node-addon-landlock-run';
 
 // --- constants are part of the CLI contract ---
 assert.equal(LAUNCHER_BIN, 'landlock-run');
@@ -31,7 +31,7 @@ assert.deepEqual(
 assert.deepEqual(grantArgs({ readWrite: ['/a'], readOnly: ['/b'] }), ['--ro', '/b', '--rw', '/a']);
 
 // --- launcherPath: resolves the platform package next to its package.json ---
-const platformPackage = `node-addon-landlock-run-${process.platform}-${process.arch}`;
+const platformPackage = `@deepseek-ai/node-addon-landlock-run-${process.platform}-${process.arch}`;
 const resolvedViaSeam = launcherPath((specifier) => {
   assert.equal(specifier, `${platformPackage}/package.json`);
   return path.join('/fake-install', specifier);

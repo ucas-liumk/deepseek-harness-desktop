@@ -1,17 +1,19 @@
 import { describe, expect, it } from 'vitest'
-import { Context } from 'cordis'
-import Loader from '@cordisjs/plugin-loader'
+import { Context } from '@deepseek-ai/cordis'
+import Loader from '@deepseek-ai/cordis-plugin-loader'
 import { CallId } from '@deepseek-ai/dsh-llm'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
-import ToolRegistry from '@deepseek-ai/dsh-tools'
+import ToolRuntime from '@deepseek-ai/dsh-tools'
 import { Session, SessionId } from '@deepseek-ai/dsh-session'
 import type { TodoItem } from '@deepseek-ai/dsh-session'
 import { type Agent } from '@deepseek-ai/dsh-agent'
 
 import * as tool from '../src/index.ts'
 
+const testToolSignal = new AbortController().signal
+
 /**
- * Drives the REAL plugin body: mounts `dsh-tool-todo` on a real `ToolRegistry`
+ * Drives the REAL plugin body: mounts `dsh-tool-todo` on a real `ToolRuntime`
  * and invokes the registered `todo_write` tool through `ctx.tools.execute`,
  * with a fake parent Agent carrying a real `Session` — so the append the tool
  * makes is observable on a genuine session log (only the agent wrapper is a
@@ -20,15 +22,15 @@ import * as tool from '../src/index.ts'
 
 /** A parent Agent backed by a real Session — the tool reads `agent.session`. */
 function agentWithSession(id = 'parent-1'): Agent & { session: Session } {
-  const session = new Session(SessionId(id))
+  const session = Session.create(SessionId(id))
   return { id: SessionId(id), session } as unknown as Agent & { session: Session }
 }
 
-async function setup(): Promise<Context> {
+async function setup(allowParallelInProgress: boolean): Promise<Context> {
   const ctx = new Context()
   await ctx.plugin(SystemPrompt)
-  await ctx.plugin(ToolRegistry)
-  await ctx.plugin(tool)
+  await ctx.plugin(ToolRuntime)
+  await ctx.plugin(tool, { allowParallelInProgress })
   return ctx
 }
 
@@ -36,6 +38,7 @@ let callCounter = 0
 function callTodo(ctx: Context, args: unknown, over: { agent?: Agent | undefined } = {}) {
   const agent = 'agent' in over ? over.agent : agentWithSession()
   return ctx.tools.execute({
+    signal: testToolSignal,
     callId: CallId(`call-${++callCounter}`),
     name: 'todo_write',
     arguments: args,
@@ -49,7 +52,7 @@ function text(result: { content: { type: string; text?: string }[] }): string {
 
 describe('dsh-tool-todo', () => {
   it('registers a `todo_write` tool whose schema is an array of {content,status}', async () => {
-    const ctx = await setup()
+    const ctx = await setup(true)
     const schema = ctx.tools.schemas().find(s => s.name === 'todo_write')
     expect(schema).toBeDefined()
     const props = (schema!.parameters as { properties?: Record<string, unknown> }).properties ?? {}
@@ -62,7 +65,7 @@ describe('dsh-tool-todo', () => {
   })
 
   it('appends a todo/write event carrying the whole list to the calling session', async () => {
-    const ctx = await setup()
+    const ctx = await setup(true)
     const agent = agentWithSession('writer')
     const todos: TodoItem[] = [
       { content: 'plan', status: 'in_progress' },
@@ -70,6 +73,11 @@ describe('dsh-tool-todo', () => {
     ]
     const result = await callTodo(ctx, { todos }, { agent })
     expect(result.isError).toBe(false)
+    if (result.isError) throw new Error('expected todo_write success')
+    expect(result.value).toEqual({
+      todos,
+      counts: { pending: 1, inProgress: 1, completed: 0 },
+    })
     expect(text(result)).toContain('1 pending, 1 in progress, 0 completed')
 
     const event = agent.session.events.findLast(e => e.type === 'todo/write')!
@@ -77,7 +85,7 @@ describe('dsh-tool-todo', () => {
   })
 
   it('stores the trimmed content (the dedupe/length key), not the raw input', async () => {
-    const ctx = await setup()
+    const ctx = await setup(true)
     const agent = agentWithSession('trim')
     const result = await callTodo(ctx, { todos: [{ content: '  plan the work  ', status: 'pending' }] }, { agent })
     expect(result.isError).toBe(false)
@@ -87,7 +95,7 @@ describe('dsh-tool-todo', () => {
   })
 
   it('replaces the list on a second call (last-write-wins on the log)', async () => {
-    const ctx = await setup()
+    const ctx = await setup(true)
     const agent = agentWithSession('writer-2')
     await callTodo(ctx, { todos: [{ content: 'a', status: 'pending' }] }, { agent })
     await callTodo(ctx, { todos: [
@@ -103,37 +111,99 @@ describe('dsh-tool-todo', () => {
   })
 
   it('rejects a malformed status before execute runs (registry arg-validation)', async () => {
-    const ctx = await setup()
+    const ctx = await setup(true)
     const result = await callTodo(ctx, { todos: [{ content: 'x', status: 'doing' }] })
     expect(result.isError).toBe(true)
   })
 
   it('rejects a non-array todos argument', async () => {
-    const ctx = await setup()
+    const ctx = await setup(true)
     const result = await callTodo(ctx, { todos: 'nope' })
     expect(result.isError).toBe(true)
+  })
+
+  it('accepts several in_progress items at once (parallel work)', async () => {
+    const ctx = await setup(true)
+    const agent = agentWithSession('parallel')
+    const todos: TodoItem[] = [
+      { content: 'run subagent a', status: 'in_progress' },
+      { content: 'run subagent b', status: 'in_progress' },
+      { content: 'merge results', status: 'pending' },
+    ]
+    const result = await callTodo(ctx, { todos }, { agent })
+    expect(result.isError).toBe(false)
+    if (result.isError) throw new Error('expected todo_write success')
+    expect(result.value).toEqual({
+      todos,
+      counts: { pending: 1, inProgress: 2, completed: 0 },
+    })
+    expect(agent.session.events.findLast(e => e.type === 'todo/write')!.data.todos).toEqual(todos)
+  })
+
+  describe('allowParallelInProgress', () => {
+    const parallel = [
+      { content: 'run subagent a', status: 'in_progress' },
+      { content: 'run subagent b', status: 'in_progress' },
+    ]
+
+    it('false rejects a call marking several items in_progress', async () => {
+      const ctx = await setup(false)
+      const agent = agentWithSession('single-active')
+      const result = await callTodo(ctx, { todos: parallel }, { agent })
+      expect(result.isError).toBe(true)
+      expect(text(result)).toContain('at most one task may be in_progress')
+      // A rejected call must not reach the durable log.
+      expect(agent.session.events.some(e => e.type === 'todo/write')).toBe(false)
+    })
+
+    it('false still accepts one active item', async () => {
+      const ctx = await setup(false)
+      const todos: TodoItem[] = [
+        { content: 'run subagent a', status: 'in_progress' },
+        { content: 'run subagent b', status: 'pending' },
+      ]
+      const result = await callTodo(ctx, { todos })
+      expect(result.isError).toBe(false)
+    })
+
+    it('true accepts the very list false rejects', async () => {
+      const ctx = await setup(true)
+      const result = await callTodo(ctx, { todos: parallel })
+      expect(result.isError).toBe(false)
+    })
+
+    it('instructs the model to keep at most one active, while true instructs parallel', async () => {
+      const single = await setup(false)
+      const singleDesc = single.tools.schemas().find(s => s.name === 'todo_write')!.description
+      expect(singleDesc).toContain('Keep AT MOST ONE todo `in_progress`')
+      expect(singleDesc).not.toContain('several at once')
+
+      const parallelDesc = (await setup(true)).tools.schemas().find(s => s.name === 'todo_write')!.description
+      expect(parallelDesc).toContain('several at once when work genuinely runs in parallel')
+      expect(parallelDesc).not.toContain('AT MOST ONE')
+    })
   })
 
   it.each([
     { label: 'empty content', todos: [{ content: '   ', status: 'pending' }], fragment: 'non-empty' },
     { label: 'duplicate content', todos: [{ content: 'dup', status: 'pending' }, { content: 'dup', status: 'completed' }], fragment: 'duplicate' },
-    { label: 'two in_progress', todos: [{ content: 'a', status: 'in_progress' }, { content: 'b', status: 'in_progress' }], fragment: 'in_progress' },
+    { label: 'unknown item keys', todos: [{ content: 'a', status: 'pending', children: [] }], fragment: 'not a declared property' },
   ])('rejects $label as an isError result', async ({ todos, fragment }) => {
-    const ctx = await setup()
+    const ctx = await setup(true)
     const result = await callTodo(ctx, { todos })
     expect(result.isError).toBe(true)
     expect(text(result)).toContain(fragment)
   })
 
   it('rejects a non-agent caller (the list has no owning session)', async () => {
-    const ctx = await setup()
+    const ctx = await setup(true)
     const result = await callTodo(ctx, { todos: [{ content: 'a', status: 'pending' }] }, { agent: undefined })
     expect(result.isError).toBe(true)
     expect(text(result)).toContain('owning agent session')
   })
 
   it('presents the call with a stable title and the list as raw input', async () => {
-    const ctx = await setup()
+    const ctx = await setup(true)
     const def = ctx.tools.get('todo_write')!
     const todos = [{ content: 'a', status: 'pending' }]
     expect(def.presentCall?.({ todos })).toEqual({ card: 'generic', title: 'Update todo list', kind: 'other', rawInput: todos })
@@ -142,8 +212,8 @@ describe('dsh-tool-todo', () => {
   it('unregisters the tool when its contributing fiber is disposed (HMR-safety)', async () => {
     const ctx = new Context()
     await ctx.plugin(SystemPrompt)
-    await ctx.plugin(ToolRegistry)
-    const fiber = await ctx.plugin(tool)
+    await ctx.plugin(ToolRuntime)
+    const fiber = await ctx.plugin(tool, { allowParallelInProgress: true })
     expect(ctx.tools.schemas().some(s => s.name === 'todo_write')).toBe(true)
     await fiber.dispose()
     expect(ctx.tools.schemas().some(s => s.name === 'todo_write')).toBe(false)

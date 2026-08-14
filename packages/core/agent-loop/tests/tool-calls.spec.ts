@@ -4,22 +4,24 @@
  */
 
 import { describe, expect, it } from 'vitest'
-import { Context } from 'cordis'
-import { CallId, StreamChunk } from '@deepseek-ai/dsh-llm'
+import { Context } from '@deepseek-ai/cordis'
+import { createUserMessage, CallId, StreamChunk  } from '@deepseek-ai/dsh-llm'
 import SessionStore, { SessionEvent, SessionId } from '@deepseek-ai/dsh-session'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
-import LlmService from '@deepseek-ai/dsh-llm'
-import ToolRegistry, { defineTool, type PostToolDecision, type PreToolDecision } from '@deepseek-ai/dsh-tools'
+import LlmRuntime from '@deepseek-ai/dsh-llm'
+import ToolRuntime, { defineContentToolFixture, TOOL_ABORTED_BEFORE_DISPATCH, TOOL_RUNTIME_SCHEDULER, type PostToolDecision, type PreToolDecision } from '@deepseek-ai/dsh-tools'
 import AgentRegistry, { type Agent } from '@deepseek-ai/dsh-agent'
-import AgentLoop from '@deepseek-ai/dsh-agent-loop'
+import AgentLoop, { DEFAULT_MAX_PARALLEL_TOOL_CALLS } from '@deepseek-ai/dsh-agent-loop'
 import { MockAdapter, textResponse } from './mock-adapter.ts'
+import { CodeRuntime } from '@deepseek-ai/dsh-code-runtime'
+import type { CodeRunRequest, CodeRunResult } from '@deepseek-ai/dsh-code-runtime'
 
 async function harness(adapter: MockAdapter, maxParallelToolCalls?: number) {
   const ctx = new Context()
-  await ctx.plugin(LlmService)
+  await ctx.plugin(LlmRuntime)
   await ctx.plugin(SessionStore)
   await ctx.plugin(SystemPrompt, { persona: '' })
-  await ctx.plugin(ToolRegistry)
+  await ctx.plugin(ToolRuntime)
   await ctx.plugin(AgentRegistry)
   await ctx.plugin(AgentLoop, {
     agents: [],
@@ -31,7 +33,7 @@ async function harness(adapter: MockAdapter, maxParallelToolCalls?: number) {
 
 function waitForIdle(ctx: Context, agent: Agent): Promise<void> {
   return new Promise((resolve) => {
-    const dispose = ctx.on('agent/status', (subject, status) => {
+    const dispose = ctx.on('agent/status', ({ agent: subject, status }) => {
       if (subject === agent && status === 'idle') { dispose(); resolve() }
     })
   })
@@ -61,7 +63,7 @@ function multiCall(calls: { id: string; name: string; args: object }[]): StreamC
 function gatedTool(name: string, parallel: boolean) {
   const gates = new Map<string, () => void>()
   const started: string[] = []
-  const tool = defineTool({
+  const tool = defineContentToolFixture({
     name,
     description: `gated ${name}`,
     parameters: { id: { type: 'string', required: true } },
@@ -105,7 +107,7 @@ describe('tool-call scheduler: grouping and barriers', () => {
     ctx.tools.register(gated.tool)
     const agent = ctx.agentLoop.create(SessionId('a1'), { provider: 'mock', model: 'mock' })
 
-    agent.send([{ type: 'text', text: 'go' }])
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'go' }], source: { kind: 'user' } }))
     await until(() => gated.started.length === 3)
     expect(gated.started).toEqual(['1', '2', '3'])
     gated.release('1'); gated.release('2'); gated.release('3')
@@ -123,17 +125,17 @@ describe('tool-call scheduler: grouping and barriers', () => {
       textResponse('done'),
     ])
     const ctx = await harness(adapter)
-    ctx.tools.register(defineTool({
+    ctx.tools.register(defineContentToolFixture({
       name: 'r', description: 'read', parameters: { id: { type: 'string', required: true } },
       isConcurrencySafe: () => true,
       async execute(args) { order.push(`r-start-${args.id}`); order.push(`r-end-${args.id}`); return [{ type: 'text', text: 'r' }] },
     }))
-    ctx.tools.register(defineTool({
+    ctx.tools.register(defineContentToolFixture({
       name: 'w', description: 'write', parameters: { id: { type: 'string', required: true } },
       async execute(args) { order.push(`w-${args.id}`); return [{ type: 'text', text: 'w' }] },
     }))
     const agent = ctx.agentLoop.create(SessionId('a1'), { provider: 'mock', model: 'mock' })
-    agent.send([{ type: 'text', text: 'go' }])
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'go' }], source: { kind: 'user' } }))
     await waitForIdle(ctx, agent)
 
     expect(order).toEqual(['r-start-A1', 'r-end-A1', 'w-A2', 'r-start-A3', 'r-end-A3'])
@@ -150,14 +152,14 @@ describe('tool-call scheduler: grouping and barriers', () => {
     ])
     const ctx = await harness(adapter)
     const replacement = gatedExclusiveTool('x')
-    const disposeSafe = ctx.tools.register(defineTool({
+    const disposeSafe = ctx.tools.register(defineContentToolFixture({
       name: 'x',
       description: 'initially safe',
       parameters: { id: { type: 'string', required: true } },
       isConcurrencySafe: () => true,
       async execute(args) { return [{ type: 'text', text: `old-${args.id}` }] },
     }))
-    ctx.tools.register(defineTool({
+    ctx.tools.register(defineContentToolFixture({
       name: 'replace',
       description: 'replace x',
       parameters: { id: { type: 'string', required: true } },
@@ -169,7 +171,7 @@ describe('tool-call scheduler: grouping and barriers', () => {
     }))
     const agent = ctx.agentLoop.create(SessionId('a1'), { provider: 'mock', model: 'mock' })
 
-    agent.send([{ type: 'text', text: 'go' }])
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'go' }], source: { kind: 'user' } }))
     await until(() => replacement.started.length === 1)
     await new Promise(r => setTimeout(r, 5))
     expect(replacement.started).toEqual(['1'])
@@ -200,11 +202,11 @@ describe('tool-call scheduler: grouping and barriers', () => {
     })
     const agent = ctx.agentLoop.create(SessionId('a1'), { provider: 'mock', model: 'mock' })
 
-    agent.send([{ type: 'text', text: 'go' }])
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'go' }], source: { kind: 'user' } }))
     await until(() => initial.started.length === 2)
     initial.release('1')
     await until(() => events(agent).some(event =>
-      event.type === 'tool/result' && event.data.callId === CallId('c1')))
+      event.type === 'tool/result' && event.data.message.source.callId === CallId('c1')))
     await new Promise(r => setTimeout(r, 5))
     expect(replacement.started).toEqual([])
     initial.release('2')
@@ -226,7 +228,7 @@ describe('tool-call scheduler: model-order results despite out-of-order settleme
     ctx.tools.register(gated.tool)
     const agent = ctx.agentLoop.create(SessionId('a1'), { provider: 'mock', model: 'mock' })
 
-    agent.send([{ type: 'text', text: 'go' }])
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'go' }], source: { kind: 'user' } }))
     await until(() => gated.started.length === 2)
     gated.release('2')
     await new Promise(r => setTimeout(r, 5))
@@ -236,7 +238,7 @@ describe('tool-call scheduler: model-order results despite out-of-order settleme
     await waitForIdle(ctx, agent)
 
     const results = events(agent).filter(e => e.type === 'tool/result')
-    expect(results.map(e => e.data.callId)).toEqual([CallId('c1'), CallId('c2')])
+    expect(results.map(e => e.data.message.source.callId)).toEqual([CallId('c1'), CallId('c2')])
   })
 
   it('derived history pairs calls in model order regardless of tool/call log interleaving', async () => {
@@ -248,7 +250,7 @@ describe('tool-call scheduler: model-order results despite out-of-order settleme
     const gated = gatedParallelTool('p')
     ctx.tools.register(gated.tool)
     const agent = ctx.agentLoop.create(SessionId('a1'), { provider: 'mock', model: 'mock' })
-    agent.send([{ type: 'text', text: 'go' }])
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'go' }], source: { kind: 'user' } }))
     await until(() => gated.started.length === 2)
     gated.release('2'); gated.release('1')
     await waitForIdle(ctx, agent)
@@ -274,13 +276,14 @@ describe('tool-call scheduler: rolling pool honors maxParallelToolCalls', () => 
 
   it('defaults the cap when direct construction bypasses the config schema', async () => {
     const ctx = new Context()
-    await ctx.plugin(LlmService)
+    await ctx.plugin(LlmRuntime)
     await ctx.plugin(SessionStore)
     await ctx.plugin(SystemPrompt, { persona: '' })
-    await ctx.plugin(ToolRegistry)
+    await ctx.plugin(ToolRuntime)
     await ctx.plugin(AgentRegistry)
 
-    expect(() => new AgentLoop(ctx, { agents: [] })).not.toThrow()
+    const loop = new AgentLoop(ctx, { agents: [] })
+    expect(loop.config.maxParallelToolCalls).toBe(DEFAULT_MAX_PARALLEL_TOOL_CALLS)
     await ctx.fiber.dispose()
   })
 
@@ -294,7 +297,7 @@ describe('tool-call scheduler: rolling pool honors maxParallelToolCalls', () => 
     ctx.tools.register(gated.tool)
     const agent = ctx.agentLoop.create(SessionId('a1'), { provider: 'mock', model: 'mock' })
 
-    agent.send([{ type: 'text', text: 'go' }])
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'go' }], source: { kind: 'user' } }))
     await until(() => gated.started.length === 2)
     await new Promise(r => setTimeout(r, 5))
     expect(gated.started).toEqual(['1', '2'])
@@ -303,14 +306,16 @@ describe('tool-call scheduler: rolling pool honors maxParallelToolCalls', () => 
     expect(gated.started).toEqual(['1', '2', '3'])
     expect(events(agent)
       .filter(e => e.type === 'tool/call' || e.type === 'tool/result')
-      .map(e => `${e.type}:${String(e.data.callId)}`)
+      .map(e => e.type === 'tool/call'
+        ? `${e.type}:${String(e.data.callId)}`
+        : `${e.type}:${String(e.data.message.source.callId)}`)
       .slice(0, 4))
       .toEqual(['tool/call:c1', 'tool/call:c2', 'tool/result:c1', 'tool/call:c3'])
     gated.release('2'); gated.release('3')
     await until(() => gated.started.length === 4)
     gated.release('4')
     await waitForIdle(ctx, agent)
-    expect(events(agent).filter(e => e.type === 'tool/result').map(e => e.data.callId))
+    expect(events(agent).filter(e => e.type === 'tool/result').map(e => e.data.message.source.callId))
       .toEqual([CallId('c1'), CallId('c2'), CallId('c3'), CallId('c4')])
   })
 
@@ -323,7 +328,7 @@ describe('tool-call scheduler: rolling pool honors maxParallelToolCalls', () => 
     const gated = gatedParallelTool('p')
     ctx.tools.register(gated.tool)
     const agent = ctx.agentLoop.create(SessionId('a1'), { provider: 'mock', model: 'mock' })
-    agent.send([{ type: 'text', text: 'go' }])
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'go' }], source: { kind: 'user' } }))
     await until(() => gated.started.length === 1)
     await new Promise(r => setTimeout(r, 5))
     expect(gated.started).toEqual(['1'])
@@ -339,17 +344,17 @@ describe('tool-call scheduler: rolling pool honors maxParallelToolCalls', () => 
       textResponse('done'),
     ])
     const ctx = new Context()
-    await ctx.plugin(LlmService)
+    await ctx.plugin(LlmRuntime)
     await ctx.plugin(SessionStore)
     await ctx.plugin(SystemPrompt, { persona: '' })
-    await ctx.plugin(ToolRegistry)
+    await ctx.plugin(ToolRuntime)
     await ctx.plugin(AgentRegistry)
     await ctx.plugin(AgentLoop, { agents: [], maxParallelToolCalls: 1 })
     ctx.llm.registerAdapter(['mock'], adapter)
     const gated = gatedParallelTool('p')
     ctx.tools.register(gated.tool)
     const agent = ctx.agentLoop.create(SessionId('a1'), { provider: 'mock', model: 'mock' })
-    agent.send([{ type: 'text', text: 'go' }])
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'go' }], source: { kind: 'user' } }))
     await until(() => gated.started.length === 1)
     await new Promise(r => setTimeout(r, 5))
     expect(gated.started).toEqual(['1'])
@@ -376,7 +381,7 @@ describe('tool-call scheduler: ordered middleware and additional contexts', () =
     ctx.on('tools/post-execute', async (exec, _result, next): Promise<PostToolDecision> => { post.push(String(exec.callId)); return next() })
     const agent = ctx.agentLoop.create(SessionId('a1'), { provider: 'mock', model: 'mock' })
 
-    agent.send([{ type: 'text', text: 'go' }])
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'go' }], source: { kind: 'user' } }))
     await until(() => gated.started.length === 3)
     gated.release('3'); gated.release('2'); gated.release('1')
     await waitForIdle(ctx, agent)
@@ -394,20 +399,22 @@ describe('tool-call scheduler: ordered middleware and additional contexts', () =
     const gated = gatedParallelTool('p')
     ctx.tools.register(gated.tool)
     ctx.on('tools/post-execute', async (exec, _result): Promise<PostToolDecision> =>
-      ({ kind: 'accept', additionalContexts: [{ content: [{ type: 'text', text: `ctx-${exec.callId}` }], source: { kind: 'plugin', plugin: 'p' } }] }))
+      ({ kind: 'accept', additionalContexts: [createUserMessage({
+        content: [{ type: 'text', text: `ctx-${exec.callId}` }], source: { kind: 'plugin', plugin: 'p' },
+      })] }))
     const agent = ctx.agentLoop.create(SessionId('a1'), { provider: 'mock', model: 'mock' })
 
-    agent.send([{ type: 'text', text: 'go' }])
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'go' }], source: { kind: 'user' } }))
     await until(() => gated.started.length === 2)
     gated.release('2'); gated.release('1')
     await waitForIdle(ctx, agent)
 
     const log = events(agent)
-    const contextTexts = log.filter(e => e.type === 'context/message')
-      .map(e => (e.data.content[0] as { text: string }).text)
+    const contextTexts = log.filter(e => e.type === 'user/message' && e.data.source.kind === 'plugin')
+      .map(e => ((e.data as { content: { text: string }[] }).content[0]!).text)
     expect(contextTexts).toEqual(['ctx-c1', 'ctx-c2'])
     const lastResult = log.findLastIndex(e => e.type === 'tool/result')
-    const firstContext = log.findIndex(e => e.type === 'context/message')
+    const firstContext = log.findIndex(e => e.type === 'user/message' && e.data.source.kind === 'plugin')
     expect(lastResult).toBeLessThan(firstContext)
   })
 
@@ -435,7 +442,7 @@ describe('tool-call scheduler: ordered middleware and additional contexts', () =
     })
     const agent = ctx.agentLoop.create(SessionId('a1'), { provider: 'mock', model: 'mock' })
 
-    agent.send([{ type: 'text', text: 'go' }])
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'go' }], source: { kind: 'user' } }))
     await until(() => gated.started.length === 1)
     gated.release('1')
     await waitForIdle(ctx, agent)
@@ -443,9 +450,9 @@ describe('tool-call scheduler: ordered middleware and additional contexts', () =
     expect(gated.started).toEqual(['1'])
     expect(post).toEqual(['c1', 'c2'])
     const results = events(agent).filter(e => e.type === 'tool/result')
-    expect(results.map(e => e.data.callId)).toEqual([CallId('c1'), CallId('c2'), CallId('c3')])
-    expect((results[1]!.data.content[0] as { text: string }).text).toContain('blocked by policy')
-    expect((results[2]!.data.content[0] as { text: string }).text).toContain('pre exploded')
+    expect(results.map(e => e.data.message.source.callId)).toEqual([CallId('c1'), CallId('c2'), CallId('c3')])
+    expect((results[1]!.data.message.content[0].content[0] as { text: string }).text).toContain('blocked by policy')
+    expect((results[2]!.data.message.content[0].content[0] as { text: string }).text).toContain('pre exploded')
   })
 })
 
@@ -461,27 +468,27 @@ describe('tool-call scheduler: abort handling', () => {
     const agent = ctx.agentLoop.create(SessionId('a1'), { provider: 'mock', model: 'mock' })
     ctx.on('session/event', (session, event) => {
       if (session === agent.session && event.type === 'assistant/message') {
-        ;(agent as unknown as { currentAbort?: AbortController }).currentAbort?.abort('already aborted')
+        agent.cancel({ kind: 'user' })
       }
     })
 
-    agent.send([{ type: 'text', text: 'go' }])
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'go' }], source: { kind: 'user' } }))
     await waitForIdle(ctx, agent)
 
     expect(gated.started).toEqual([])
     expect(events(agent).filter(e => e.type === 'tool/call').map(e => e.data.callId))
       .toEqual([CallId('c1'), CallId('c2')])
     expect(events(agent).filter(e => e.type === 'tool/result').map(e => ({
-      callId: e.data.callId,
-      isError: e.data.isError,
+      callId: e.data.message.source.callId,
+      isError: e.data.message.content[0].isError,
       error: e.data.error,
     }))).toEqual([
-      { callId: CallId('c1'), isError: true, error: { name: 'AbortError', code: 'ABORTED' } },
-      { callId: CallId('c2'), isError: true, error: { name: 'AbortError', code: 'ABORTED' } },
+      { callId: CallId('c1'), isError: true, error: { name: 'AbortError', code: TOOL_ABORTED_BEFORE_DISPATCH } },
+      { callId: CallId('c2'), isError: true, error: { name: 'AbortError', code: TOOL_ABORTED_BEFORE_DISPATCH } },
     ])
   })
 
-  it('stops starting siblings when abort fires during ordered pre-execute', async () => {
+  it('skips dispatch and stops starting siblings when abort fires during ordered pre-execute', async () => {
     const adapter = new MockAdapter([
       multiCall([{ id: 'c1', name: 'p', args: { id: '1' } }, { id: 'c2', name: 'p', args: { id: '2' } }]),
       textResponse('should never be requested'),
@@ -492,43 +499,46 @@ describe('tool-call scheduler: abort handling', () => {
     const agent = ctx.agentLoop.create(SessionId('a1'), { provider: 'mock', model: 'mock' })
     ctx.on('tools/pre-execute', async (exec, next): Promise<PreToolDecision> => {
       if (exec.callId === CallId('c1')) {
-        ;(agent as unknown as { currentAbort?: AbortController }).currentAbort?.abort('pre cancelled')
+        agent.cancel({ kind: 'user' })
       }
       return next()
     })
 
-    agent.send([{ type: 'text', text: 'go' }])
-    await until(() => gated.started.length === 1)
-    await new Promise(r => setTimeout(r, 5))
-    expect(gated.started).toEqual(['1'])
-    gated.release('1')
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'go' }], source: { kind: 'user' } }))
     await waitForIdle(ctx, agent)
 
+    expect(gated.started).toEqual([])
     expect(events(agent).filter(e => e.type === 'tool/call').map(e => e.data.callId))
       .toEqual([CallId('c1'), CallId('c2')])
-    expect(events(agent).filter(e => e.type === 'tool/result').map(e => e.data.callId))
-      .toEqual([CallId('c1'), CallId('c2')])
-    expect(events(agent).filter(e => e.type === 'tool/result').at(-1)?.data)
-      .toMatchObject({ callId: CallId('c2'), isError: true, error: { name: 'AbortError', code: 'ABORTED' } })
+    expect(events(agent).filter(e => e.type === 'tool/result').map(e => ({
+      callId: e.data.message.source.callId,
+      isError: e.data.message.content[0].isError,
+      error: e.data.error,
+    }))).toEqual([
+      { callId: CallId('c1'), isError: true, error: { name: 'AbortError', code: TOOL_ABORTED_BEFORE_DISPATCH } },
+      { callId: CallId('c2'), isError: true, error: { name: 'AbortError', code: TOOL_ABORTED_BEFORE_DISPATCH } },
+    ])
   })
 
-  it('stops replenishing after abort, commits started results, and drains accepted additional contexts', async () => {
+  it('stops replenishing after abort, commits started results, and parks accepted additional contexts', async () => {
     const adapter = new MockAdapter([
       multiCall([1, 2, 3, 4].map(n => ({ id: `c${n}`, name: 'p', args: { id: String(n) } }))),
-      textResponse('should never be requested'),
+      textResponse('after wake'),
     ])
     const ctx = await harness(adapter, 2)
     const gated = gatedParallelTool('p')
     ctx.tools.register(gated.tool)
     ctx.on('tools/post-execute', async (exec, _result, next): Promise<PostToolDecision> => ({
       ...await next(),
-      additionalContexts: [{ content: [{ type: 'text', text: `ctx-${exec.callId}` }], source: { kind: 'plugin', plugin: 'p' } }],
+      additionalContexts: [createUserMessage({
+        content: [{ type: 'text', text: `ctx-${exec.callId}` }], source: { kind: 'plugin', plugin: 'p' },
+      })],
     }))
     const agent = ctx.agentLoop.create(SessionId('a1'), { provider: 'mock', model: 'mock' })
 
-    agent.send([{ type: 'text', text: 'go' }])
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'go' }], source: { kind: 'user' } }))
     await until(() => gated.started.length === 2)
-    ;(agent as unknown as { currentAbort?: AbortController }).currentAbort?.abort('stop now')
+    agent.cancel({ kind: 'user' })
     gated.release('1')
     gated.release('2')
     await waitForIdle(ctx, agent)
@@ -536,18 +546,45 @@ describe('tool-call scheduler: abort handling', () => {
     expect(gated.started).toEqual(['1', '2'])
     expect(events(agent).filter(e => e.type === 'tool/call').map(e => e.data.callId))
       .toEqual([CallId('c1'), CallId('c2'), CallId('c3'), CallId('c4')])
-    expect(events(agent).filter(e => e.type === 'tool/result').map(e => e.data.callId))
+    expect(events(agent).filter(e => e.type === 'tool/result').map(e => e.data.message.source.callId))
       .toEqual([CallId('c1'), CallId('c2'), CallId('c3'), CallId('c4')])
-    expect(events(agent).filter(e => e.type === 'tool/result').slice(-2).map(e => e.data))
+    expect(events(agent).filter(e => e.type === 'tool/result').slice(-2).map(e => ({
+      callId: e.data.message.source.callId,
+      isError: e.data.message.content[0].isError,
+      error: e.data.error,
+    })))
       .toEqual([
-        expect.objectContaining({ callId: CallId('c3'), isError: true, error: { name: 'AbortError', code: 'ABORTED' } }),
-        expect.objectContaining({ callId: CallId('c4'), isError: true, error: { name: 'AbortError', code: 'ABORTED' } }),
+        {
+          callId: CallId('c3'),
+          isError: true,
+          error: { name: 'AbortError', code: TOOL_ABORTED_BEFORE_DISPATCH },
+        },
+        {
+          callId: CallId('c4'),
+          isError: true,
+          error: { name: 'AbortError', code: TOOL_ABORTED_BEFORE_DISPATCH },
+        },
       ])
-    const settled = events(agent).filter(e => e.type === 'tool/result' || e.type === 'context/message')
+    const settled = events(agent).filter(e => e.type === 'tool/result'
+      || (e.type === 'user/message' && e.data.source.kind === 'plugin'))
     expect(settled.map(e => e.type))
-      .toEqual(['tool/result', 'tool/result', 'tool/result', 'tool/result', 'context/message', 'context/message'])
-    expect(settled.filter(e => e.type === 'context/message')
-      .map(e => (e.data.content[0] as { text: string }).text))
+      .toEqual(['tool/result', 'tool/result', 'tool/result', 'tool/result'])
+    expect(agent.inbox.nextStep.map(message => message.content[0]))
+      .toEqual([
+        { type: 'text', text: 'ctx-c1' },
+        { type: 'text', text: 'ctx-c2' },
+      ])
+
+    const idle = waitForIdle(ctx, agent)
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'wake' }], source: { kind: 'user' } }))
+    await idle
+
+    expect(events(agent).flatMap(e =>
+      e.type === 'user/message'
+        && e.data.source.kind === 'plugin'
+        && e.data.content[0]?.type === 'text'
+        ? [e.data.content[0].text]
+        : []))
       .toEqual(['ctx-c1', 'ctx-c2'])
   })
 
@@ -564,7 +601,7 @@ describe('tool-call scheduler: abort handling', () => {
     const gated = gatedParallelTool('p')
     const exclusive: string[] = []
     ctx.tools.register(gated.tool)
-    ctx.tools.register(defineTool({
+    ctx.tools.register(defineContentToolFixture({
       name: 'x',
       description: 'exclusive',
       parameters: { id: { type: 'string', required: true } },
@@ -572,9 +609,9 @@ describe('tool-call scheduler: abort handling', () => {
     }))
     const agent = ctx.agentLoop.create(SessionId('a1'), { provider: 'mock', model: 'mock' })
 
-    agent.send([{ type: 'text', text: 'go' }])
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'go' }], source: { kind: 'user' } }))
     await until(() => gated.started.length === 2)
-    ;(agent as unknown as { currentAbort?: AbortController }).currentAbort?.abort('stop before barrier')
+    agent.cancel({ kind: 'user' })
     gated.release('1')
     gated.release('2')
     await waitForIdle(ctx, agent)
@@ -583,6 +620,143 @@ describe('tool-call scheduler: abort handling', () => {
     expect(events(agent).filter(e => e.type === 'tool/call').map(e => e.data.callId))
       .toEqual([CallId('c1'), CallId('c2'), CallId('c3')])
     expect(events(agent).filter(e => e.type === 'tool/result').at(-1)?.data)
-      .toMatchObject({ callId: CallId('c3'), isError: true, error: { name: 'AbortError', code: 'ABORTED' } })
+      .toMatchObject({
+        message: {
+          source: { kind: 'tool', callId: CallId('c3') },
+          content: [{ isError: true }],
+        },
+        error: { name: 'AbortError', code: TOOL_ABORTED_BEFORE_DISPATCH },
+      })
+  })
+})
+
+describe('tool-call scheduler: failure quiescence', () => {
+  it('stops new dispatches and drains started bodies before surfacing the first failure', async () => {
+    const adapter = new MockAdapter([
+      multiCall([
+        { id: 'c1', name: 'p', args: { id: '1' } },
+        { id: 'c2', name: 'p', args: { id: '2' } },
+        { id: 'c3', name: 'p', args: { id: '3' } },
+      ]),
+    ])
+    const ctx = await harness(adapter, 3)
+    const gated = gatedParallelTool('p')
+    ctx.tools.register(gated.tool)
+    // The registry contains expected failures as results; replace its internal
+    // view only to inject the invariant violation this boundary must contain.
+    const scheduler = ctx.tools[TOOL_RUNTIME_SCHEDULER]
+    const prepare = scheduler.prepare.bind(scheduler)
+    const dispatch = scheduler.dispatch.bind(scheduler)
+    const prepareGate = Promise.withResolvers<undefined>()
+    let thirdPrepareEntered = false
+    scheduler.prepare = async (exec) => {
+      const prepared = await prepare(exec)
+      if (exec.callId === CallId('c3')) {
+        thirdPrepareEntered = true
+        await prepareGate.promise
+      }
+      return prepared
+    }
+    const schedulerError = new Error('scheduler exploded')
+    const drainedError = new Error('sibling failed while draining')
+    let rejectFirst: ((error: Error) => void) | undefined
+    scheduler.dispatch = exec => exec.callId === CallId('c1')
+      ? new Promise((_resolve, reject) => { rejectFirst = reject })
+      : dispatch(exec).then(() => { throw drainedError })
+    const agent = ctx.agentLoop.create(SessionId('scheduler-failure'), { provider: 'mock', model: 'mock' })
+    let idle = false
+    const idlePromise = waitForIdle(ctx, agent).then(() => { idle = true })
+
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'go' }], source: { kind: 'user' } }))
+    await until(() => gated.started.includes('2') && thirdPrepareEntered && rejectFirst !== undefined)
+    rejectFirst?.(schedulerError)
+    await new Promise<void>(resolve => setImmediate(resolve))
+    prepareGate.resolve(undefined)
+    await new Promise<void>(resolve => setImmediate(resolve))
+
+    const startedBeforeDrain = [...gated.started]
+    const idleBeforeDrain = idle
+    const turnEndBeforeDrain = events(agent).find(event => event.type === 'turn/end')
+    for (const id of gated.pending()) gated.release(id)
+    await idlePromise
+
+    expect(startedBeforeDrain).toEqual(['2'])
+    expect(idleBeforeDrain).toBe(false)
+    expect(turnEndBeforeDrain).toBeUndefined()
+    expect(gated.pending()).toEqual([])
+    expect(events(agent).findLast(event => event.type === 'turn/end')).toMatchObject({
+      data: { reason: { kind: 'error', error: { message: schedulerError.message, code: 'UNKNOWN' } } },
+    })
+  })
+})
+
+describe('code-mode native-tool denial through the agent loop', () => {
+  /** A minimal in-process code runtime for test purposes — never actually runs. */
+  class FakeCodeRuntime extends CodeRuntime {
+    readonly language = 'typescript'
+    readonly isolation = 'fake' as const
+    async run(_request: CodeRunRequest): Promise<CodeRunResult> {
+      return { logs: [] }
+    }
+  }
+
+  async function codeModeHarness(adapter: MockAdapter) {
+    const ctx = new Context()
+    await ctx.plugin(LlmRuntime)
+    await ctx.plugin(SessionStore)
+    await ctx.plugin(SystemPrompt, { persona: '' })
+    await ctx.plugin(ToolRuntime, { mode: 'code' })
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- FakeCodeRuntime is an internal test helper with an opaque type shape
+    await ctx.plugin(FakeCodeRuntime as any)
+    await ctx.plugin(AgentRegistry)
+    await ctx.plugin(AgentLoop, { agents: [] })
+    ctx.llm.registerAdapter(['mock'], adapter)
+    return ctx
+  }
+
+  it('denies a model-direct native-tool call under code mode: tool body never runs and session records UNKNOWN_TOOL', async () => {
+    let toolInvoked = false
+    const tool = defineContentToolFixture({
+      name: 'write',
+      description: 'Write a file.',
+      parameters: {
+        file_path: { type: 'string', required: true },
+        content: { type: 'string', required: true },
+      },
+      async execute(_args, _exec) {
+        toolInvoked = true
+        return [{ type: 'text', text: 'written' }]
+      },
+    })
+
+    // Scripted model emits a native tool call under code mode — the wire
+    // never advertised it, but a non-compliant provider may still emit one.
+    const adapter = new MockAdapter([
+      [
+        ...multiCall([{ id: 'call-1', name: 'write', args: { file_path: '/tmp/test', content: 'hello' } }]),
+        ...textResponse('ok'),
+      ],
+    ])
+
+    const ctx = await codeModeHarness(adapter)
+    ctx.tools.register(tool)
+
+    const agent = ctx.agentLoop.create(SessionId('code-native'), { provider: 'mock', model: 'mock' })
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'write a file' }], source: { kind: 'user' } }))
+    await waitForIdle(ctx, agent)
+
+    // The tool body must NOT have executed — the collapse denied the call
+    // at createExecution, before the body could start.
+    expect(toolInvoked).toBe(false)
+
+    // The session must record a tool/result with UNKNOWN_TOOL error so the
+    // transcript faithfully captures that the call was denied.
+    const sessionEvents = events(agent)
+    const toolResult = sessionEvents.find(e => e.type === 'tool/result')
+    expect(toolResult).toBeDefined()
+    expect(toolResult!.data.error).toMatchObject({
+      name: 'ToolNotFoundError',
+      code: 'UNKNOWN_TOOL',
+    })
   })
 })

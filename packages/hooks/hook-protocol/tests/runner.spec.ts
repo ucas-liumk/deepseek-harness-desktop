@@ -1,21 +1,22 @@
-import { describe, expect, it } from 'vitest'
-import type { BashExecRequest, BashExecSpec, BashExecutor, BashRunResult } from '@deepseek-ai/dsh-bash'
+import { describe, expect, expectTypeOf, it } from 'vitest'
+import type { ShellExecRequest, ShellExecSpec, ShellExecutor, ShellRunResult } from '@deepseek-ai/dsh-shell'
 import { DEFAULT_HOOK_TIMEOUT_MS, runHook } from '@deepseek-ai/dsh-hook-protocol'
+import type { RunHookOptions } from '@deepseek-ai/dsh-hook-protocol'
 
 /**
- * A minimal stand-in for the bits of {@link BashExecutor} that {@link runHook}
+ * A minimal stand-in for the bits of {@link ShellExecutor} that {@link runHook}
  * actually calls (`resolve` then `run`). `runHook` is pure plumbing over those
- * two methods, so a duck-typed recorder is the right test seam — the REAL
+ * two methods, so a duck-typed recorder is the right test hook — the REAL
  * executor (dsh-bash-local) is exercised end-to-end by the hook-bridge plugins
  * that consume this library, not here.
  */
-function recordingBash(run: (spec: BashExecSpec) => Promise<BashRunResult>): {
-  bash: BashExecutor
-  specs: BashExecSpec[]
+function recordingBash(run: (spec: ShellExecSpec) => Promise<ShellRunResult>): {
+  bash: ShellExecutor
+  specs: ShellExecSpec[]
 } {
-  const specs: BashExecSpec[] = []
+  const specs: ShellExecSpec[] = []
   const bash = {
-    resolve(request: BashExecRequest): BashExecSpec {
+    resolve(request: ShellExecRequest): ShellExecSpec {
       // Carry the request through verbatim, defaulting the required spec fields —
       // exactly what dsh-bash-local's resolve does for the fields runHook sets.
       return {
@@ -26,18 +27,18 @@ function recordingBash(run: (spec: BashExecSpec) => Promise<BashRunResult>): {
         ...request.signal ? { signal: request.signal } : {},
         ...request.stdin !== undefined ? { stdin: request.stdin } : {},
         ...request.env !== undefined ? { env: request.env } : {},
-        sandboxMode: request.sandboxMode,
+        sandboxPolicy: request.sandboxPolicy,
       }
     },
-    async run(spec: BashExecSpec): Promise<BashRunResult> {
+    async run(spec: ShellExecSpec): Promise<ShellRunResult> {
       specs.push(spec)
       return run(spec)
     },
-  } as unknown as BashExecutor
+  } as unknown as ShellExecutor
   return { bash, specs }
 }
 
-function result(over: Partial<BashRunResult> = {}): BashRunResult {
+function result(over: Partial<ShellRunResult> = {}): ShellRunResult {
   return {
     exitCode: 0,
     signal: null,
@@ -51,12 +52,18 @@ function result(over: Partial<BashRunResult> = {}): BashRunResult {
 }
 
 const clock = () => { let t = 0; return () => (t += 5) } // +5ms per call → duration 5
+const testSignal = (): AbortSignal => new AbortController().signal
 
 describe('runHook — payload + env + stdin plumbing', () => {
+  it('requires an explicit caller-owned abort signal', () => {
+    expectTypeOf<RunHookOptions['signal']>().toEqualTypeOf<AbortSignal>()
+  })
+
   it('serializes the payload to stdin (with trailing newline when requested)', async () => {
     const { bash, specs } = recordingBash(async () => result({ stdout: { text: '', truncated: false } }))
     await runHook(bash, { command: 'my-hook.sh' }, {
       payload: { hook_event_name: 'PreToolUse', tool_name: 'Bash' },
+      signal: testSignal(),
       defaultTimeoutMs: 60000,
       trailingNewline: true,
     }, clock())
@@ -66,14 +73,14 @@ describe('runHook — payload + env + stdin plumbing', () => {
 
   it('omits the trailing newline when trailingNewline is false (Codex)', async () => {
     const { bash, specs } = recordingBash(async () => result())
-    await runHook(bash, { command: 'h' }, { payload: { a: 1 }, defaultTimeoutMs: 1000, trailingNewline: false }, clock())
+    await runHook(bash, { command: 'h' }, { payload: { a: 1 }, signal: testSignal(), defaultTimeoutMs: 1000, trailingNewline: false }, clock())
     expect(specs[0]!.stdin).toBe('{"a":1}')
   })
 
   it('threads env and cwd into the request', async () => {
     const { bash, specs } = recordingBash(async () => result())
     await runHook(bash, { command: 'h' }, {
-      payload: {}, env: { CLAUDE_PROJECT_DIR: '/proj' }, cwd: '/work',
+      payload: {}, env: { CLAUDE_PROJECT_DIR: '/proj' }, cwd: '/work', signal: testSignal(),
       defaultTimeoutMs: 1000, trailingNewline: true,
     }, clock())
     expect(specs[0]!.env).toEqual({ CLAUDE_PROJECT_DIR: '/proj' })
@@ -82,13 +89,13 @@ describe('runHook — payload + env + stdin plumbing', () => {
 
   it('a per-hook timeoutSec (seconds) overrides the default (ms)', async () => {
     const { bash, specs } = recordingBash(async () => result())
-    await runHook(bash, { command: 'h', timeoutSec: 3 }, { payload: {}, defaultTimeoutMs: 60000, trailingNewline: true }, clock())
+    await runHook(bash, { command: 'h', timeoutSec: 3 }, { payload: {}, signal: testSignal(), defaultTimeoutMs: 60000, trailingNewline: true }, clock())
     expect(specs[0]!.timeoutMs).toBe(3000)
   })
 
   it('falls back to the default timeout when the hook sets none', async () => {
     const { bash, specs } = recordingBash(async () => result())
-    await runHook(bash, { command: 'h' }, { payload: {}, defaultTimeoutMs: 60000, trailingNewline: true }, clock())
+    await runHook(bash, { command: 'h' }, { payload: {}, signal: testSignal(), defaultTimeoutMs: 60000, trailingNewline: true }, clock())
     expect(specs[0]!.timeoutMs).toBe(60000)
     expect(DEFAULT_HOOK_TIMEOUT_MS).toBe(600_000) // the CC/Codex reference default (10 minutes)
   })
@@ -106,7 +113,7 @@ describe('runHook — outcome decoding + duration', () => {
     const { bash } = recordingBash(async () => result({
       exitCode: 0, stdout: { text: JSON.stringify({ decision: 'block', reason: 'no' }), truncated: false },
     }))
-    const { output, durationMs } = await runHook(bash, { command: 'h' }, { payload: {}, defaultTimeoutMs: 1000, trailingNewline: true }, clock())
+    const { output, durationMs } = await runHook(bash, { command: 'h' }, { payload: {}, signal: testSignal(), defaultTimeoutMs: 1000, trailingNewline: true }, clock())
     expect(output.decision).toBe('block')
     expect(output.reason).toBe('no')
     expect(durationMs).toBe(5)
@@ -114,7 +121,7 @@ describe('runHook — outcome decoding + duration', () => {
 
   it('a signal death (exitCode null) decodes as undefined exit (non-blocking error)', async () => {
     const { bash } = recordingBash(async () => result({ exitCode: null, signal: 'SIGKILL', stderr: { text: 'killed', truncated: false } }))
-    const { output } = await runHook(bash, { command: 'h' }, { payload: {}, defaultTimeoutMs: 1000, trailingNewline: true }, clock())
+    const { output } = await runHook(bash, { command: 'h' }, { payload: {}, signal: testSignal(), defaultTimeoutMs: 1000, trailingNewline: true }, clock())
     expect(output.exitCode).toBeUndefined()
     expect(output.decision).toBeUndefined()
     expect(output.stderr).toBe('killed')
@@ -122,7 +129,7 @@ describe('runHook — outcome decoding + duration', () => {
 
   it('an executor rejection (infra fault) becomes a non-blocking error, never throws', async () => {
     const { bash } = recordingBash(async () => { throw new Error('bad workdir: ENOENT') })
-    const { output } = await runHook(bash, { command: 'h' }, { payload: {}, defaultTimeoutMs: 1000, trailingNewline: true }, clock())
+    const { output } = await runHook(bash, { command: 'h' }, { payload: {}, signal: testSignal(), defaultTimeoutMs: 1000, trailingNewline: true }, clock())
     expect(output.exitCode).toBeUndefined()
     expect(output.stderr).toBe('bad workdir: ENOENT')
     expect(output.decision).toBeUndefined()
@@ -130,7 +137,7 @@ describe('runHook — outcome decoding + duration', () => {
 
   it('a non-Error rejection is stringified onto stderr', async () => {
     const { bash } = recordingBash(async () => { throw 'plain string fault' })
-    const { output } = await runHook(bash, { command: 'h' }, { payload: {}, defaultTimeoutMs: 1000, trailingNewline: true }, clock())
+    const { output } = await runHook(bash, { command: 'h' }, { payload: {}, signal: testSignal(), defaultTimeoutMs: 1000, trailingNewline: true }, clock())
     expect(output.stderr).toBe('plain string fault')
   })
 
@@ -140,7 +147,7 @@ describe('runHook — outcome decoding + duration', () => {
       stdout: { text: JSON.stringify({ hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny' } }), truncated: false },
     }))
     const { output } = await runHook(bash, { command: 'h' }, {
-      payload: {}, defaultTimeoutMs: 1000, trailingNewline: true, expectedEventName: 'Stop',
+      payload: {}, signal: testSignal(), defaultTimeoutMs: 1000, trailingNewline: true, expectedEventName: 'Stop',
     }, clock())
     // A PreToolUse block on a Stop hook is malformed → its decision is discarded.
     expect(output.hookEventName).toBe('PreToolUse')

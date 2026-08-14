@@ -9,8 +9,8 @@ Accept configuration supplied through `cordis.yml`.
 Export a `Config` type and a same-named Schemastery schema. Put defaults directly on the schema fields:
 
 ```ts
-import type { Context } from 'cordis'
-import Schema from 'schemastery'
+import type { Context } from '@deepseek-ai/cordis'
+import Schema from '@deepseek-ai/schemastery'
 
 export const name = 'my-plugin'
 
@@ -31,13 +31,15 @@ export function apply(ctx: Context, config: Config) {
 }
 ```
 
-Configure it in `cordis.yml`:
+Add the configuration to the inserted local plugin row in `scratch-plugin/cordis.yml`:
 
 ```yaml
-- name: './src/my-plugin.ts'
-  config:
-    greeting: 'Hi there'
-    maxRetries: 5
+- insert:
+    - id: hello
+      name: './src/my-plugin.ts'
+      config:
+        greeting: 'Hi there'
+        maxRetries: 5
 ```
 
 When loading the plugin, Cordis uses the exported schema to validate configuration and fill defaults. Do not export a plain object as `Config`; it does not implement the Standard Schema interface required by Cordis.
@@ -47,8 +49,8 @@ When loading the plugin, Cordis uses the exported schema to validate configurati
 Use Schemastery to express stricter validation:
 
 ```ts
-import type { Context } from 'cordis'
-import Schema from 'schemastery'
+import type { Context } from '@deepseek-ai/cordis'
+import Schema from '@deepseek-ai/schemastery'
 
 export const name = 'validated-plugin'
 
@@ -91,22 +93,7 @@ The test is whether `cordis.yml` can change the value without a code edit.
 
 ### Fail loudly on invalid configuration
 
-If configuration refers to an unregistered LLM provider route or another nonexistent resource, fail early instead of silently skipping it:
-
-```ts
-import type { Context } from 'cordis'
-import type {} from '@deepseek-ai/dsh-llm'
-
-export interface ModelConfig {
-  provider: string
-}
-
-export function apply(ctx: Context, config: ModelConfig) {
-  if (!ctx.llm.listProviders().some(provider => provider.id === config.provider)) {
-    throw new Error(`LLM provider "${config.provider}" is not registered`)
-  }
-}
-```
+Express self-contained constraints in the schema so invalid configuration fails while the plugin loads. References to services or registered resources require dependency injection; the [services tutorial](../framework/service.md) introduces that contract.
 
 ## Work with HMR
 
@@ -114,5 +101,6 @@ A configuration edit hot-replaces the plugin: the framework unloads the old inst
 
 ## Next steps
 
+- [Package and install a plugin](./publish.md) — ship the plugin as an installable package
 - [Plugins and lifecycle](../framework/) — understand the full plugin lifecycle
 - [Services and dependencies](../framework/service.md) — provide a service to other plugins

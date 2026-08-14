@@ -11,6 +11,7 @@ import { gfmFromMarkdown } from 'mdast-util-gfm'
 import { gfm } from 'micromark-extension-gfm'
 import { JSDOM } from 'jsdom'
 import type { Nodes } from 'mdast'
+import { isArchivedAgentNotePath } from './repo-files.ts'
 
 const root = resolve(import.meta.dirname, '..')
 
@@ -65,6 +66,7 @@ const seen = new Set<string>()
 let checkedFiles = 0
 for (const pattern of PATTERNS) {
   for (const match of globSync(pattern, { cwd: root })) {
+    if (isArchivedAgentNotePath(match)) continue
     const real = realpathSync(resolve(root, match))
     if (seen.has(real)) continue
     seen.add(real)
@@ -79,7 +81,12 @@ Object.defineProperty(globalThis, 'window', { value: window })
 Object.defineProperty(globalThis, 'document', { value: window.document })
 Object.defineProperty(globalThis, 'navigator', { value: window.navigator })
 const mermaid = (await import('mermaid')).default
-mermaid.initialize({ startOnLoad: false })
+// maxEdges: mermaid's default 500-edge render guard; the module graph grows
+// with every package edge and crossed it legitimately. Raise the guard here
+// (a secure config settable only via initialize) rather than trimming edges.
+// The graph passed 1000 the same way it passed 500, so the headroom doubles
+// again rather than being set to whatever the current count happens to be.
+mermaid.initialize({ startOnLoad: false, maxEdges: 2000 })
 for (const block of blocks) {
   try {
     await mermaid.parse(block.source, { suppressErrors: false })

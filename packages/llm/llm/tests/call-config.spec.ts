@@ -5,7 +5,9 @@
  */
 
 import { describe, expect, it } from 'vitest'
-import { callConfigEquals, deepFreeze } from '../src/call-config.ts'
+import { callConfigEquals, deepFreeze, isAgentLoopRequest, markAgentLoopRequest } from '../src/call-config.ts'
+import { ReasoningEffortId } from '../src/brand.ts'
+import type { GenerateOptions } from '../src/types.ts'
 
 describe('callConfigEquals', () => {
   it('compares every field, including the stop list element-wise', () => {
@@ -13,6 +15,11 @@ describe('callConfigEquals', () => {
     expect(callConfigEquals(base, base)).toBe(true)
     expect(callConfigEquals(base, { provider: 'x', model: 'm' })).toBe(false)
     expect(callConfigEquals(base, { provider: 'p', model: 'x' })).toBe(false)
+    expect(callConfigEquals({ ...base, reasoningEffort: ReasoningEffortId('high') }, base)).toBe(false)
+    expect(callConfigEquals(
+      { ...base, reasoningEffort: ReasoningEffortId('high') },
+      { ...base, reasoningEffort: ReasoningEffortId('high') },
+    )).toBe(true)
     expect(callConfigEquals({ ...base, temperature: 0.5 }, base)).toBe(false)
     expect(callConfigEquals({ ...base, maxTokens: 1 }, { ...base, maxTokens: 2 })).toBe(false)
     expect(callConfigEquals({ ...base, stop: ['a'] }, base)).toBe(false)
@@ -54,5 +61,41 @@ describe('deepFreeze', () => {
     cyclic.self = cyclic
     deepFreeze(cyclic)
     expect(Object.isFrozen(cyclic)).toBe(true)
+  })
+
+  it('freezes nesting deeper than the JavaScript call stack', () => {
+    const depth = 5_000
+    const root: unknown[] = []
+    let cursor = root
+    for (let index = 0; index < depth; index++) {
+      const child: unknown[] = []
+      cursor.push(child)
+      cursor = child
+    }
+
+    deepFreeze(root)
+
+    cursor = root
+    for (let index = 0; index < depth; index++) {
+      expect(Object.isFrozen(cursor)).toBe(true)
+      cursor = cursor[0] as unknown[]
+    }
+    expect(Object.isFrozen(cursor)).toBe(true)
+  })
+})
+
+describe('agent-loop request identity', () => {
+  it('marks only the exact request object and preserves its identity', () => {
+    const request: GenerateOptions = {
+      provider: 'mock',
+      model: 'model',
+      messages: [],
+    }
+    const copy = { ...request }
+
+    expect(isAgentLoopRequest(request)).toBe(false)
+    expect(markAgentLoopRequest(request)).toBe(request)
+    expect(isAgentLoopRequest(request)).toBe(true)
+    expect(isAgentLoopRequest(copy)).toBe(false)
   })
 })

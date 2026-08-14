@@ -1,7 +1,0 @@
-{
-  "steps": [
-    { "op": "initialize", "terminalOutput": true },
-    { "op": "newSession" },
-    { "op": "prompt", "text": "Use the bash tool to run exactly: echo TERMINAL_OK. Then reply with the single word DONE and stop." }
-  ]
-}

@@ -4,35 +4,26 @@
  * @module @deepseek-ai/dsh-token-meter
  */
 
-import { Context, Service } from 'cordis'
-import z from 'schemastery'
+import { Context, Service } from '@deepseek-ai/cordis'
+import z from '@deepseek-ai/schemastery'
 import { BlockAssembler, deepFreeze } from '@deepseek-ai/dsh-llm'
-import type { ContentBlock, Message, TokenUsage } from '@deepseek-ai/dsh-llm'
-import type { EpochHeader, Session, SessionEvent, SurfaceEvent } from '@deepseek-ai/dsh-session'
+import type { Message, TokenUsage } from '@deepseek-ai/dsh-llm'
+import type { EpochHeader, Session, SessionEvent } from '@deepseek-ai/dsh-session'
 import { canonicalHeader, headerEquals, isSurfaceEvent } from '@deepseek-ai/dsh-session'
+// Type-only: resolves the optional projection registry Context declaration.
+import type {} from '@deepseek-ai/dsh-session-projection'
 import type {
   TokenMeasurement,
   TokenMeasurementBaseline,
   TokenMeterConfig,
   TokenSurfaceNode,
 } from './types.ts'
+import { contextBreakdownProjectionDefinition } from './breakdown-projection.ts'
+import { contextPressureProjectionDefinition, tokenUsageProjectionDefinition } from './usage-projection.ts'
+import { estimateContent, estimateHeader, estimateMessage, ROLE_OVERHEAD } from './estimate.ts'
+import { foldSurfaceTokens } from './surface-fold.ts'
 
 export type * from './types.ts'
-
-/** Default service-wide provider context capacity. */
-const DEFAULT_CONTEXT_WINDOW = 128_000
-
-/** Complete public configuration key set. */
-const TOKEN_METER_CONFIG_KEYS: ReadonlySet<string> = new Set(['contextWindow'])
-
-/** Fixed text-density estimate used until exact tokenization is needed. */
-const CHARS_PER_TOKEN = 4
-
-/** Per-block structural overhead for JSON framing and type tags. */
-const BLOCK_OVERHEAD = 4
-
-/** Role-field framing overhead added to every priced message. */
-const ROLE_OVERHEAD = 4
 
 interface MeasurementAnchor {
   readonly header: EpochHeader | undefined
@@ -47,11 +38,6 @@ interface ReplayState {
   surfaceTokens: number
   stepStart: { turn: number; step: number; surfaceTokens: number } | undefined
   anchor: MeasurementAnchor | undefined
-}
-
-interface PreparedSurfaceMutation {
-  readonly tokens: number
-  commit(state: ReplayState): void
 }
 
 /** Sum disjoint provider usage buckets without double-counting reasoning output. */
@@ -74,48 +60,35 @@ function optionalHeaderEquals(
 /** Reject stale or misspelled keys before defaults can hide them. */
 function validateConfigKeys(config: TokenMeterConfig): void {
   for (const key of Object.keys(config)) {
-    if (!TOKEN_METER_CONFIG_KEYS.has(key)) {
-      throw new Error(
-        `TokenMeterConfig: unknown key "${key}" (allowed: contextWindow)`,
-      )
-    }
+    throw new Error(`TokenMeterConfig: unknown key "${key}" (no settings are supported)`)
   }
 }
 
-/** Resolve and validate the one service-wide context capacity. */
-function resolveContextWindow(config: TokenMeterConfig): number {
-  validateConfigKeys(config)
-  const contextWindow = config.contextWindow === undefined
-    ? DEFAULT_CONTEXT_WINDOW
-    : config.contextWindow
-  if (!Number.isInteger(contextWindow) || contextWindow <= 0) {
-    throw new Error(
-      `TokenMeterConfig: contextWindow (${contextWindow}) must be a positive integer`,
-    )
-  }
-  return contextWindow
-}
-
-declare module 'cordis' {
+declare module '@deepseek-ai/cordis' {
   interface Context {
-    tokenMeter: TokenMeterService
+    tokenMeter: TokenMeter
   }
 }
 
 /** Replay owner for one service-wide estimator and isolated per-session folds. */
-export class TokenMeterService extends Service {
-  static Config: z<TokenMeterConfig> = z.object({
-    contextWindow: z.number().step(1).min(1).default(DEFAULT_CONTEXT_WINDOW),
-  })
-
-  /** Provider context-window capacity used by pressure consumers. */
-  readonly contextWindow: number
+export class TokenMeter extends Service {
+  // Schemastery preserves untrusted loader keys on an empty object schema;
+  // the public type excludes settings while validateConfigKeys rejects them.
+  static Config: z<TokenMeterConfig> = z.object({}) as unknown as z<TokenMeterConfig>
 
   private readonly states = new WeakMap<Session, ReplayState>()
 
   constructor(ctx: Context, config: TokenMeterConfig = {}) {
     super(ctx, 'tokenMeter')
-    this.contextWindow = resolveContextWindow(config)
+    validateConfigKeys(config)
+
+    // Projection registration is an optional child: compositions without the
+    // generic registry keep the meter's standalone read shape.
+    ctx.inject(['sessionProjections'], (projectionCtx) => {
+      projectionCtx.sessionProjections.register(tokenUsageProjectionDefinition)
+      projectionCtx.sessionProjections.register(contextPressureProjectionDefinition)
+      projectionCtx.sessionProjections.register(contextBreakdownProjectionDefinition)
+    })
 
     // Readers catch up independently, while eager observation bounds ordinary
     // read latency without creating state for sessions no consumer has read.
@@ -158,7 +131,7 @@ export class TokenMeterService extends Service {
     } else {
       baseline = {
         kind: 'estimated',
-        tokens: this._estimateHeader(header) + state.surfaceTokens,
+        tokens: estimateHeader(header) + state.surfaceTokens,
       }
       surfaceDeltaTokens = 0
     }
@@ -174,12 +147,13 @@ export class TokenMeterService extends Service {
   }
 
   /**
-   * Heuristically price one model-visible message.
+   * Heuristically price one model-visible message (instance face of the pure
+   * `estimateMessage` export from `estimate.ts`).
    * @param message - message to price without mutation.
    * @returns content and role-framing tokens under the fixed service heuristic.
    */
   estimateMessage(message: Message): number {
-    return this._estimateContent(message.content) + ROLE_OVERHEAD
+    return estimateMessage(message)
   }
 
   /** Catch one session's fold up to the current durable tail. */
@@ -198,7 +172,7 @@ export class TokenMeterService extends Service {
     }
 
     while (state.consumedEvents < session.events.length) {
-      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion -- contiguous session seqs index the durable log
+      // oxlint-disable-next-line typescript/no-non-null-assertion -- contiguous session seqs index the durable log
       const event = session.events[state.consumedEvents]!
       this._foldEvent(session, state, event)
       state.consumedEvents += 1
@@ -232,7 +206,7 @@ export class TokenMeterService extends Service {
         if (state.stepStart === undefined
           || state.stepStart.turn !== event.data.turn
           || state.stepStart.step !== event.data.step) {
-          throw new Error(`token meter: step/end at seq ${event.seq} has no matching step/start boundary`)
+          throw new Error(`token meter: step/end at seq ${event.seq} has no matching step/start event`)
         }
         nextStepStart = undefined
         break
@@ -241,7 +215,7 @@ export class TokenMeterService extends Service {
     }
 
     const surface = isSurfaceEvent(event)
-      ? this._prepareSurfaceMutation(session, state, event)
+      ? foldSurfaceTokens(state.surface, event)
       : undefined
 
     if (event.type === 'assistant/message') {
@@ -249,11 +223,11 @@ export class TokenMeterService extends Service {
       if (stepStart === undefined
         || stepStart.turn !== event.data.turn
         || stepStart.step !== event.data.step) {
-        throw new Error(`token meter: assistant/message at seq ${event.seq} has no matching step/start boundary`)
+        throw new Error(`token meter: assistant/message at seq ${event.seq} has no matching step/start event`)
       }
 
       // assistant/message is surface-mandatory at every append/seed boundary.
-      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+      // oxlint-disable-next-line typescript/no-non-null-assertion
       const eventTokens = surface!.tokens
       if (event.data.usage !== undefined && nextHeader !== undefined) {
         const providerAssistantTokens = this._estimateProviderAssistant(
@@ -263,7 +237,7 @@ export class TokenMeterService extends Service {
         )
         const anchorSurfaceTokens = stepStart.surfaceTokens + providerAssistantTokens
         const providerTokens = usageTokens(event.data.usage)
-        const estimatedAnchorTokens = this._estimateHeader(nextHeader) + anchorSurfaceTokens
+        const estimatedAnchorTokens = estimateHeader(nextHeader) + anchorSurfaceTokens
         nextAnchor = {
           header: nextHeader,
           surfaceTokens: anchorSurfaceTokens,
@@ -280,7 +254,7 @@ export class TokenMeterService extends Service {
           surfaceTokens: anchorSurfaceTokens,
           baseline: {
             kind: 'estimated',
-            tokens: this._estimateHeader(nextHeader) + anchorSurfaceTokens,
+            tokens: estimateHeader(nextHeader) + anchorSurfaceTokens,
           },
         }
       }
@@ -288,57 +262,17 @@ export class TokenMeterService extends Service {
 
     state.header = nextHeader
     state.stepStart = nextStepStart
-    if (surface !== undefined) surface.commit(state)
+    if (surface !== undefined) {
+      state.surface = surface.nodes
+      state.surfaceTokens += surface.deltaTokens
+    }
     state.anchor = nextAnchor
   }
 
-  /** Validate one surface operation and return its allocation-light commit. */
-  private _prepareSurfaceMutation(
-    session: Session,
-    state: ReplayState,
-    event: SurfaceEvent,
-  ): PreparedSurfaceMutation {
-    const tokens = this._estimateSurfaceEvent(session, event)
-    const op = event.surfaceOp
-    if (op === 'append') {
-      return {
-        tokens,
-        commit(target) {
-          target.surface.push({ seq: event.seq, tokens })
-          target.surfaceTokens += tokens
-        },
-      }
-    }
-
-    const startIdx = state.surface.findIndex(node => node.seq === op.start)
-    const endIdx = state.surface.findIndex(node => node.seq === op.end)
-    if (startIdx === -1 || endIdx === -1 || startIdx > endIdx) {
-      throw new Error(
-        `token meter: replace at seq ${event.seq} has invalid current range ${op.start}-${op.end}`,
-      )
-    }
-    const removedTokens = state.surface
-      .slice(startIdx, endIdx + 1)
-      .reduce((total, node) => total + node.tokens, 0)
-    return {
-      tokens,
-      commit(target) {
-        target.surface.splice(startIdx, endIdx - startIdx + 1, { seq: event.seq, tokens })
-        target.surfaceTokens += tokens - removedTokens
-      },
-    }
-  }
-
-  /** Price one current surface event exactly as it projects to a request. */
-  private _estimateSurfaceEvent(session: Session, event: SurfaceEvent): number {
-    const message = session.deriveEventMessage(event)
-    return message === null ? 0 : this.estimateMessage(message)
-  }
-
   /**
-   * Reassemble provider output from exact chunk provenance for a usage anchor.
-   * Missing legacy provenance conservatively treats the durable output as the
-   * provider output; explicit empty provenance prices a known empty stream.
+   * Reassemble provider output from the exact cited chunk seqs for a usage anchor.
+   * Missing legacy source seqs conservatively treat the durable output as the
+   * provider output; an explicit empty list prices a known empty stream.
    */
   private _estimateProviderAssistant(
     session: Session,
@@ -361,7 +295,7 @@ export class TokenMeterService extends Service {
       // Session construction validates contiguous seqs, and the explicit
       // earlier-than-assistant check above therefore guarantees existence.
       const source = session.events[seq]
-      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+      // oxlint-disable-next-line typescript/no-non-null-assertion
       const sourceEvent = source!
       if (sourceEvent.type !== 'assistant/chunk') {
         throw new Error(`token meter: assistant/message at seq ${event.seq} source seq ${seq} is not assistant/chunk`)
@@ -371,49 +305,9 @@ export class TokenMeterService extends Service {
       }
       assembler.push(sourceEvent.data.chunk)
     }
-    const providerMessage = assembler.message()
-    return providerMessage.content.length === 0 ? 0 : this.estimateMessage(providerMessage)
-  }
-
-  /** Price content blocks recursively under the fixed density heuristic. */
-  private _estimateContent(blocks: readonly ContentBlock[]): number {
-    let tokens = 0
-    for (const block of blocks) {
-      switch (block.type) {
-        case 'text':
-        case 'reasoning':
-          tokens += Math.ceil(block.text.length / CHARS_PER_TOKEN) + BLOCK_OVERHEAD
-          break
-        case 'tool-call':
-          tokens += Math.ceil(block.name.length / CHARS_PER_TOKEN)
-            + Math.ceil(block.arguments.length / CHARS_PER_TOKEN)
-            + BLOCK_OVERHEAD
-          break
-        case 'tool-result':
-          tokens += this._estimateContent(block.content) + BLOCK_OVERHEAD
-          break
-        default:
-          // ContentBlockMap is merge-extensible; unknown blocks retain a
-          // conservative structural JSON price under the fixed heuristic.
-          tokens += BLOCK_OVERHEAD + Math.ceil(JSON.stringify(block).length / CHARS_PER_TOKEN)
-      }
-    }
-    return tokens
-  }
-
-  /** Price the canonical non-surface request envelope. */
-  private _estimateHeader(header: EpochHeader | undefined): number {
-    if (header === undefined) return 0
-    let tokens = 0
-    for (const message of header.messagePrefix ?? []) tokens += this.estimateMessage(message)
-    if (header.system !== undefined) {
-      tokens += Math.ceil(header.system.length / CHARS_PER_TOKEN) + ROLE_OVERHEAD
-    }
-    if (header.tools !== undefined && header.tools.length > 0) {
-      tokens += Math.ceil(JSON.stringify(header.tools).length / CHARS_PER_TOKEN) + BLOCK_OVERHEAD
-    }
-    return tokens
+    const providerContent = assembler.blocks()
+    return providerContent.length === 0 ? 0 : estimateContent(providerContent) + ROLE_OVERHEAD
   }
 }
 
-export default TokenMeterService
+export default TokenMeter

@@ -1,7 +1,0 @@
-{
-  "name": "repl-agent-example",
-  "private": true,
-  "version": "0.0.1",
-  "type": "module",
-  "description": "Runnable demo: an agent REPL UI with DeepSeek V4 and coding tools"
-}

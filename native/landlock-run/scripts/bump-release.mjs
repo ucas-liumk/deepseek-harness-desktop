@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
- * Bump every package (workspace root + packages/*) to one version, refresh
- * the lockfile, and verify. Usage: `pnpm release:bump <major|minor|patch|x.y.z>`.
+ * Bump the launcher workspace root and packages/* to one version, refresh the
+ * repository lockfile, and verify. Usage: `pnpm release:bump <major|minor|patch|x.y.z>`.
  */
 
 import fs from 'node:fs';
@@ -11,14 +11,15 @@ import { packageDirs, readJson, root } from './repo.mjs';
 
 const bump = process.argv[2];
 const releaseTypes = new Set(['major', 'minor', 'patch']);
+const repositoryRoot = path.resolve(root, '../..');
 
 function writeJson(file, value) {
   fs.writeFileSync(file, `${JSON.stringify(value, null, 2)}\n`);
 }
 
-function run(command, args) {
+function run(command, args, cwd = root) {
   const result = spawnSync(command, args, {
-    cwd: root,
+    cwd,
     stdio: 'inherit',
     env: { ...process.env, CI: 'true' },
   });
@@ -84,7 +85,7 @@ for (const file of files) {
   console.log(`${file}: ${targetVersion}`);
 }
 
-run('pnpm', ['install', '--ignore-scripts', '--lockfile-only']);
+run('pnpm', ['install', '--ignore-scripts', '--lockfile-only'], repositoryRoot);
 run('node', ['./scripts/verify-release.mjs']);
 
 console.log(`Release version bumped to ${targetVersion}`);

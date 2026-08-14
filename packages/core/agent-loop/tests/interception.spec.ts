@@ -1,29 +1,38 @@
-import { describe, expect, it } from 'vitest'
-import { Context } from 'cordis'
-import LlmService, { CallId, type Message } from '@deepseek-ai/dsh-llm'
-import SessionStore, { SessionId, type SessionEvent, type TurnEndReason } from '@deepseek-ai/dsh-session'
+import { describe, expect, it, vi } from 'vitest'
+import { Context } from '@deepseek-ai/cordis'
+import LlmRuntime, { createUserMessage, CallId  } from '@deepseek-ai/dsh-llm'
+import SessionStore, {
+  SessionId,
+  type SessionEvent,
+  type TurnEndReason,
+  type UserMessage,
+} from '@deepseek-ai/dsh-session'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
-import ToolRegistry, { defineTool, type PostToolDecision, type PreToolDecision } from '@deepseek-ai/dsh-tools'
-import AgentRegistry, { type Agent, type ContinuationDecision, type PromptDecision, type SessionStartSource } from '@deepseek-ai/dsh-agent'
+import ToolRuntime, { defineContentToolFixture, type PostToolDecision, type PreToolDecision } from '@deepseek-ai/dsh-tools'
+import AgentRegistry, {
+  type Agent,
+  type PreStepDecision,
+  type SessionStartSource,
+} from '@deepseek-ai/dsh-agent'
 
 import AgentLoop from '@deepseek-ai/dsh-agent-loop'
 import { MockAdapter, textResponse, toolCallResponse } from './mock-adapter.ts'
 
 /**
- * The interception seams introduced by the hooks taxonomy: `agent/prompt-submit`,
- * `agent/session-start`, the reshaped `agent/turn-continuation`
- * ({@link ContinuationDecision}), and the `tools/pre-execute` / `tools/post-execute`
+ * The interception points introduced by the hooks taxonomy: `agent/pre-step`,
+ * `agent/session-start`, `agent/turn-stopping`, and the
+ * `tools/pre-execute` / `tools/post-execute`
  * split with `additionalContexts` buffering. These verify the canonical event
- * surface a hook bridge (or a native plugin) programs against, WITHOUT any
+ * API a hook bridge (or a native plugin) programs against, WITHOUT any
  * external protocol — a native plugin uses the typed decisions directly.
  */
 
 async function harness(adapter: MockAdapter) {
   const ctx = new Context()
-  await ctx.plugin(LlmService)
+  await ctx.plugin(LlmRuntime)
   await ctx.plugin(SessionStore)
   await ctx.plugin(SystemPrompt)
-  await ctx.plugin(ToolRegistry)
+  await ctx.plugin(ToolRuntime)
   await ctx.plugin(AgentRegistry)
   await ctx.plugin(AgentLoop, { agents: [] })
   ctx.llm.registerAdapter(['mock'], adapter)
@@ -32,7 +41,7 @@ async function harness(adapter: MockAdapter) {
 
 function waitForIdle(ctx: Context, agent: Agent): Promise<void> {
   return new Promise((resolve) => {
-    const dispose = ctx.on('agent/status', (subject, status) => {
+    const dispose = ctx.on('agent/status', ({ agent: subject, status }) => {
       if (subject === agent && status === 'idle') {
         dispose()
         resolve()
@@ -42,22 +51,22 @@ function waitForIdle(ctx: Context, agent: Agent): Promise<void> {
 }
 
 function send(agent: Agent, text: string) {
-  agent.send([{ type: 'text', text }])
+  agent.followup(createUserMessage({ content: [{ type: 'text', text }], source: { kind: 'user' } }))
 }
 
 function events(agent: Agent): SessionEvent[] {
   return [...agent.session.events]
 }
 
-describe('agent/prompt-submit', () => {
-  it('allow (default via next) records the user/message unchanged', async () => {
+describe('agent/pre-step', () => {
+  it('enter (default via next) records the user/message unchanged', async () => {
     const adapter = new MockAdapter([textResponse('ok')])
     const ctx = await harness(adapter)
     const agent = ctx.agentLoop.create(SessionId('a1'), { provider: 'mock', model: 'mock' })
 
     const seen: string[] = []
-    ctx.on('agent/prompt-submit', async (_agent, content, _source, next) => {
-      seen.push(content.map(b => (b.type === 'text' ? b.text : '')).join(''))
+    ctx.on('agent/pre-step', async ({ messages }, next) => {
+      seen.push(messages[0]!.content.map(b => (b.type === 'text' ? b.text : '')).join(''))
       return next()
     })
 
@@ -69,13 +78,94 @@ describe('agent/prompt-submit', () => {
     expect(userMsg?.type === 'user/message' && userMsg.data.content).toEqual([{ type: 'text', text: 'hello' }])
   })
 
-  it('allow with content REWRITES the prompt before it is recorded', async () => {
+  it('reports the request coordinates for initial and tool-continuation prompts', async () => {
+    const adapter = new MockAdapter([
+      toolCallResponse('c1', 'echo', { text: 'hi' }),
+      textResponse('done'),
+    ])
+    const ctx = await harness(adapter)
+    ctx.tools.register(defineContentToolFixture({
+      name: 'echo',
+      description: 'echo',
+      parameters: { text: { type: 'string', required: true } },
+      execute: async ({ text }) => [{ type: 'text', text }],
+    }))
+    const agent = ctx.agentLoop.create(SessionId('prompt-coordinates'), { provider: 'mock', model: 'mock' })
+    const seen: Array<{ turn: number; step: number; messages: number }> = []
+    ctx.on('agent/pre-step', async ({ messages, turn, step }, next) => {
+      seen.push({ turn, step, messages: messages.length })
+      return next()
+    })
+
+    send(agent, 'hello')
+    await waitForIdle(ctx, agent)
+
+    expect(seen).toEqual([
+      { turn: 1, step: 1, messages: 1 },
+      { turn: 1, step: 2, messages: 0 },
+    ])
+  })
+
+  it('publishes frozen input without replacing its identity', async () => {
+    const adapter = new MockAdapter([textResponse('ok')])
+    const ctx = await harness(adapter)
+    const agent = ctx.agentLoop.create(SessionId('owned-input'), { provider: 'mock', model: 'mock' })
+    const entered = Promise.withResolvers<undefined>()
+    const decision = Promise.withResolvers<PreStepDecision>()
+    const observed: UserMessage[] = []
+    ctx.on('agent/pre-step', async ({ agent: subject, messages }) => {
+      if (subject !== agent) return { kind: 'enter', messages }
+      const message = messages[0]!
+      expect(Object.isFrozen(message)).toBe(true)
+      expect(Object.isFrozen(message.content)).toBe(true)
+      expect(Object.isFrozen(message.content[0])).toBe(true)
+      expect(Object.isFrozen(message.source)).toBe(true)
+      expect(() => {
+        const block = message.content[0]
+        if (block?.type === 'text') block.text = 'listener mutation'
+      }).toThrow()
+      observed.push(message)
+      entered.resolve(undefined)
+      return decision.promise
+    })
+    const input: UserMessage = createUserMessage({
+      content: [{ type: 'text', text: 'accepted text' }],
+      source: { kind: 'plugin', plugin: 'accepted source' },
+    })
+
+    const idle = waitForIdle(ctx, agent)
+    agent.followup(input)
+    await entered.promise
+    const block = input.content[0]
+    expect(() => {
+      if (block?.type === 'text') block.text = 'caller mutation'
+    }).toThrow(TypeError)
+    expect(() => {
+      if (input.source.kind === 'plugin') input.source.plugin = 'caller mutation'
+    }).toThrow(TypeError)
+    decision.resolve({ kind: 'enter', messages: [input] })
+    await idle
+
+    expect(observed).toHaveLength(1)
+    expect(observed[0]).not.toBe(input)
+    expect(observed[0]).toMatchObject({
+      content: [{ type: 'text', text: 'accepted text' }],
+      source: { kind: 'plugin', plugin: 'accepted source' },
+    })
+    const userMsg = events(agent).find(event => event.type === 'user/message')
+    expect(userMsg?.type === 'user/message' && userMsg.data).toEqual(input)
+  })
+
+  it('enter with content rewrites the prompt before it is recorded', async () => {
     const adapter = new MockAdapter([textResponse('ok')])
     const ctx = await harness(adapter)
     const agent = ctx.agentLoop.create(SessionId('a1'), { provider: 'mock', model: 'mock' })
 
-    ctx.on('agent/prompt-submit', async (): Promise<PromptDecision> =>
-      ({ kind: 'allow', content: [{ type: 'text', text: 'REWRITTEN' }] }))
+    ctx.on('agent/pre-step', async ({ messages }): Promise<PreStepDecision> =>
+      ({
+        kind: 'enter',
+        messages: [{ ...messages[0]!, content: [{ type: 'text', text: 'REWRITTEN' }] }],
+      }))
 
     send(agent, 'original')
     await waitForIdle(ctx, agent)
@@ -87,149 +177,359 @@ describe('agent/prompt-submit', () => {
     expect(JSON.stringify(adapter.requests[0]!.messages)).not.toContain('original')
   })
 
-  it('allow with additionalContexts injects separate context/message events into the turn', async () => {
+  it('enter with additional messages records separately sourced context in the turn', async () => {
     const adapter = new MockAdapter([textResponse('ok')])
     const ctx = await harness(adapter)
     const agent = ctx.agentLoop.create(SessionId('a1'), { provider: 'mock', model: 'mock' })
 
-    const meta = { kind: 'prompt-context', version: 1 }
-    ctx.on('agent/prompt-submit', async (): Promise<PromptDecision> =>
+    ctx.on('agent/pre-step', async ({ messages }): Promise<PreStepDecision> =>
       ({
-        kind: 'allow',
-        additionalContexts: [{
+        kind: 'enter',
+        messages: [...messages, createUserMessage({
           content: [{ type: 'text', text: '<system-reminder>extra ctx</system-reminder>' }],
           source: { kind: 'plugin', plugin: 'test' },
-          meta,
-        }],
+        })],
       }))
 
     send(agent, 'go')
     await waitForIdle(ctx, agent)
 
     const log = events(agent)
-    const userMsg = log.find(e => e.type === 'user/message')
-    const ctxMsg = log.find(e => e.type === 'context/message')
+    const userMsg = log.find(e => e.type === 'user/message' && e.data.source.kind === 'user')
+    const ctxMsg = log.find(e => e.type === 'user/message' && e.data.source.kind === 'plugin')
     expect(userMsg).toBeDefined()
-    expect(ctxMsg?.type === 'context/message' && ctxMsg.data.content).toEqual([{ type: 'text', text: '<system-reminder>extra ctx</system-reminder>' }])
-    expect(ctxMsg?.type === 'context/message' && ctxMsg.data.source).toEqual({ kind: 'plugin', plugin: 'test' })
-    expect(ctxMsg?.type === 'context/message' && ctxMsg.data.meta).toEqual(meta)
+    expect(ctxMsg?.type === 'user/message' && ctxMsg.data.content).toEqual([{ type: 'text', text: '<system-reminder>extra ctx</system-reminder>' }])
+    expect(ctxMsg?.type === 'user/message' && ctxMsg.data.source).toEqual({ kind: 'plugin', plugin: 'test' })
     const sent = JSON.stringify(adapter.requests[0]!.messages)
     expect(sent).toContain('extra ctx')
   })
 
-  it('runs pre-step after prompt rewrites and injected context become durable', async () => {
-    const adapter = new MockAdapter([textResponse('ok')])
+  it('does not open another step when a completed turn rewrites pending input to empty', async () => {
+    const adapter = new MockAdapter([textResponse('done')])
     const ctx = await harness(adapter)
-    const agent = ctx.agentLoop.create(SessionId('a1'), { provider: 'mock', model: 'mock' })
-
-    ctx.on('agent/prompt-submit', async (): Promise<PromptDecision> =>
-      ({
-        kind: 'allow',
-        content: [{ type: 'text', text: 'REWRITTEN prompt' }],
-        additionalContexts: [{ content: [{ type: 'text', text: 'injected ctx' }], source: { kind: 'plugin', plugin: 'test' } }],
+    const agent = ctx.agentLoop.create(SessionId('empty-completed-continuation'), {
+      provider: 'mock',
+      model: 'mock',
+    })
+    ctx.on('agent/turn-stopping', ({ agent: subject }) => {
+      subject.inject(createUserMessage({
+        content: [{ type: 'text', text: 'pending context' }],
+        source: { kind: 'plugin', plugin: 'test' },
       }))
-
-    let preStepDerived: string | undefined
-    ctx.on('agent/pre-step', (subject, _turn, step) => {
-      if (subject === agent && step === 1) preStepDerived = JSON.stringify(subject.session.deriveMessages())
+    })
+    ctx.on('agent/pre-step', async ({ step }, next) => {
+      const decision = await next()
+      return step === 1 || decision.kind === 'reject'
+        ? decision
+        : { kind: 'enter', messages: [] }
     })
 
-    send(agent, 'ORIGINAL prompt')
-    await waitForIdle(ctx, agent)
+    send(agent, 'finish once')
+    await agent.whenIdle()
 
-    expect(preStepDerived).toBeDefined()
-    expect(preStepDerived).toContain('REWRITTEN prompt')
-    expect(preStepDerived).toContain('injected ctx')
-    expect(preStepDerived).not.toContain('ORIGINAL prompt')
+    expect(adapter.requests).toHaveLength(1)
+    expect(events(agent).filter(event => event.type === 'step/start')).toHaveLength(1)
   })
 
-  it('block drops the (only) prompt → zero-step turn ends rejected, model never called', async () => {
+  it('reject closes the claimed prompt turn without a step or model call', async () => {
     const adapter = new MockAdapter([textResponse('should not run')])
     const ctx = await harness(adapter)
     const agent = ctx.agentLoop.create(SessionId('a1'), { provider: 'mock', model: 'mock' })
 
-    ctx.on('agent/prompt-submit', async (): Promise<PromptDecision> =>
-      ({ kind: 'block', reason: 'blocked by policy' }))
+    ctx.on('agent/pre-step', async (): Promise<PreStepDecision> => ({ kind: 'reject' }))
 
     const reasons: TurnEndReason[] = []
     ctx.on('session/event', (_s, event: SessionEvent) => { if (event.type === 'turn/end') reasons.push(event.data.reason) })
 
-    send(agent, 'do something')
-    await waitForIdle(ctx, agent)
+    agent.followup(createUserMessage({ content: [{ type: 'text', text: 'do something' }], source: { kind: 'user' } }))
+    await agent.whenIdle()
 
     // the model was never called
     expect(adapter.requests).toHaveLength(0)
-    // the turn opened and closed balanced, with no user/message and no step
     const log = events(agent)
-    expect(log.some(e => e.type === 'turn/start')).toBe(true)
-    expect(log.some(e => e.type === 'turn/end')).toBe(true)
+    expect(log.filter(e => e.type === 'turn/start' || e.type === 'turn/end').map(e => e.type))
+      .toEqual(['turn/start', 'turn/end'])
     expect(log.some(e => e.type === 'user/message')).toBe(false)
     expect(log.some(e => e.type === 'step/start')).toBe(false)
-    // the veto is recorded durably as a prompt/blocked in the open turn
-    const blocked = log.find(e => e.type === 'prompt/blocked')
-    expect(blocked?.type === 'prompt/blocked' && blocked.data).toMatchObject({
-      content: [{ type: 'text', text: 'do something' }],
-      reason: 'blocked by policy',
-    })
-    // ended rejected with the block reason
-    expect(reasons).toEqual([{ kind: 'rejected', reason: 'blocked by policy' }])
-    const turnEnd = log.findLast(e => e.type === 'turn/end')
-    expect(turnEnd?.type === 'turn/end' && turnEnd.data.reason).toEqual({ kind: 'rejected', reason: 'blocked by policy' })
+    expect(reasons).toEqual([{ kind: 'blocked' }])
   })
 
-  it('adjacent blocked and allowed prompts keep independent turn outcomes', async () => {
-    const adapter = new MockAdapter([textResponse('ran once')])
+  it('stages inject and steer during pre-step for the entered turn', async () => {
+    const adapter = new MockAdapter([textResponse('ok')])
+    const ctx = await harness(adapter)
+    const agent = ctx.agentLoop.create(SessionId('pre-step-outbox'), { provider: 'mock', model: 'mock' })
+    const entered = Promise.withResolvers<undefined>()
+    const decision = Promise.withResolvers<PreStepDecision>()
+    let claimed: UserMessage[] = []
+    let firstProposal = true
+    ctx.on('agent/pre-step', async ({ messages }) => {
+      if (!firstProposal) return { kind: 'enter', messages }
+      firstProposal = false
+      claimed = messages
+      entered.resolve(undefined)
+      return decision.promise
+    })
+
+    const idle = waitForIdle(ctx, agent)
+    send(agent, 'entered prompt')
+    await entered.promise
+    expect(agent.status).toBe('running')
+    expect(events(agent).some(event => event.type === 'turn/start')).toBe(true)
+
+    agent.inject(createUserMessage({
+      content: [{ type: 'text', text: 'attached context' }],
+      source: { kind: 'plugin', plugin: 'test' },
+    }))
+    agent.steer(createUserMessage({ content: [{ type: 'text', text: 'pre-step steering' }], source: { kind: 'user' } }))
+    expect(events(agent).some(event => event.type === 'user/message')).toBe(false)
+    expect(agent.inbox.nextStep.map(message => message.content[0]))
+      .toEqual([
+        { type: 'text', text: 'attached context' },
+        { type: 'text', text: 'pre-step steering' },
+      ])
+
+    decision.resolve({ kind: 'enter', messages: claimed })
+    await idle
+    expect(agent.inbox.hasPending).toBe(false)
+
+    const staged = events(agent).filter(event =>
+      event.type === 'turn/start' || event.type === 'user/message')
+    expect(staged.map(event => event.type)).toEqual([
+      'turn/start',
+      'user/message',
+      'user/message',
+      'user/message',
+    ])
+    expect(staged[1]?.type === 'user/message' && staged[1].data.content)
+      .toEqual([{ type: 'text', text: 'entered prompt' }])
+    expect(staged[2]?.type === 'user/message' && staged[2].data.content)
+      .toEqual([{ type: 'text', text: 'attached context' }])
+    expect(staged[3]?.type === 'user/message' && staged[3].data.content)
+      .toEqual([{ type: 'text', text: 'pre-step steering' }])
+    const firstRequest = JSON.stringify(adapter.requests[0]?.messages)
+    expect(firstRequest).toContain('entered prompt')
+    expect(firstRequest).not.toContain('attached context')
+    expect(firstRequest).not.toContain('pre-step steering')
+    const nextRequest = JSON.stringify(adapter.requests[1]?.messages)
+    expect(nextRequest).toContain('attached context')
+    expect(nextRequest).toContain('pre-step steering')
+  })
+
+  it('preserves input staged after the blocked batch was claimed', async () => {
+    const adapter = new MockAdapter([textResponse('retried')])
+    const ctx = await harness(adapter)
+    const agent = ctx.agentLoop.create(SessionId('blocked-pre-step-outbox'), { provider: 'mock', model: 'mock' })
+    const entered = Promise.withResolvers<undefined>()
+    const decision = Promise.withResolvers<PreStepDecision>()
+    const disposeBlock = ctx.on('agent/pre-step', async () => {
+      entered.resolve(undefined)
+      return decision.promise
+    })
+
+    const blockedIdle = waitForIdle(ctx, agent)
+    send(agent, 'blocked prompt')
+    await entered.promise
+    agent.inject(createUserMessage({
+      content: [{ type: 'text', text: 'staged context' }],
+      source: { kind: 'plugin', plugin: 'test' },
+    }))
+    agent.steer(createUserMessage({ content: [{ type: 'text', text: 'staged steering' }], source: { kind: 'user' } }))
+    decision.resolve({ kind: 'reject' })
+    await blockedIdle
+
+    expect(agent.inbox.nextStep.map(message => message.content[0]))
+      .toEqual([
+        { type: 'text', text: 'staged context' },
+        { type: 'text', text: 'staged steering' },
+      ])
+    expect(events(agent).filter(event => event.type === 'turn/start' || event.type === 'turn/end')
+      .map(event => event.type)).toEqual(['turn/start', 'turn/end'])
+    expect(adapter.requests).toEqual([])
+
+    disposeBlock()
+    send(agent, 'resume')
+    await waitForIdle(ctx, agent)
+
+    const staged = events(agent).filter(event =>
+      event.type === 'user/message')
+    expect(staged.map(event => event.type)).toEqual([
+      'user/message',
+      'user/message',
+      'user/message',
+    ])
+    expect(JSON.stringify(adapter.requests[0]?.messages)).not.toContain('blocked prompt')
+    expect(JSON.stringify(adapter.requests[0]?.messages)).toContain('staged context')
+    expect(JSON.stringify(adapter.requests[0]?.messages)).toContain('staged steering')
+  })
+
+  it('preserves later queued work when a step is rejected', async () => {
+    const adapter = new MockAdapter([
+      textResponse('continued'),
+      textResponse('wake reply'),
+    ])
+    const ctx = await harness(adapter)
+    const agent = ctx.agentLoop.create(SessionId('rejected-pre-step-order'), {
+      provider: 'mock',
+      model: 'mock',
+    })
+    ctx.on('agent/pre-step', async ({ messages }, next) => {
+      const decision = await next()
+      return messages.some(message =>
+        message.content.some(block => block.type === 'text' && block.text === 'blocked prompt'))
+        ? { kind: 'reject' as const }
+        : decision
+    })
+    ctx.on('agent/pre-step', async ({ agent: subject, messages }, next) => {
+      if (messages.some(message =>
+        message.content.some(block => block.type === 'text' && block.text === 'blocked prompt'))) {
+        subject.inject(createUserMessage({
+          content: [{ type: 'text', text: 'earlier state change' }],
+          source: { kind: 'plugin', plugin: 'test' },
+        }))
+        subject.steer(createUserMessage({
+          content: [{ type: 'text', text: 'earlier steering' }],
+          source: { kind: 'user' },
+        }))
+      }
+      return next()
+    })
+
+    const idle = waitForIdle(ctx, agent)
+    send(agent, 'blocked prompt')
+    send(agent, 'later prompt')
+    await idle
+
+    expect(events(agent).filter(event => event.type === 'turn/start' || event.type === 'turn/end')
+      .map(event => event.type)).toEqual(['turn/start', 'turn/end'])
+    expect(agent.inbox.nextStep.map(message => message.content[0]))
+      .toEqual([
+        { type: 'text', text: 'earlier state change' },
+        { type: 'text', text: 'earlier steering' },
+      ])
+    expect(agent.inbox.nextTurn.map(message => message.content[0]))
+      .toEqual([{ type: 'text', text: 'later prompt' }])
+    expect(adapter.requests).toEqual([])
+
+    const resumed = waitForIdle(ctx, agent)
+    send(agent, 'wake')
+    await resumed
+    const request = JSON.stringify(adapter.requests[0]?.messages)
+    expect(request).toContain('earlier state change')
+    expect(request).toContain('earlier steering')
+    expect(request).toContain('later prompt')
+    expect(request).not.toContain('blocked prompt')
+  })
+
+  it('preserves context-only injection staged after pre-step began', async () => {
+    const adapter = new MockAdapter([textResponse('continued')])
+    const ctx = await harness(adapter)
+    const agent = ctx.agentLoop.create(SessionId('rejected-pre-step-context'), { provider: 'mock', model: 'mock' })
+    const entered = Promise.withResolvers<undefined>()
+    const decision = Promise.withResolvers<PreStepDecision>()
+    const disposeBlock = ctx.on('agent/pre-step', async () => {
+      entered.resolve(undefined)
+      return decision.promise
+    })
+
+    const idle = waitForIdle(ctx, agent)
+    send(agent, 'blocked prompt')
+    await entered.promise
+    agent.inject(createUserMessage({
+      content: [{ type: 'text', text: 'independent context' }],
+      source: { kind: 'plugin', plugin: 'test' },
+    }))
+    decision.resolve({ kind: 'reject' })
+    await idle
+
+    const log = events(agent)
+    expect(log.some(event => event.type === 'user/message')).toBe(false)
+    expect(agent.inbox.nextStep.map(message => message.content[0]))
+      .toEqual([{ type: 'text', text: 'independent context' }])
+    expect(adapter.requests).toEqual([])
+
+    disposeBlock()
+    const resumed = waitForIdle(ctx, agent)
+    send(agent, 'wake')
+    await resumed
+    expect(JSON.stringify(adapter.requests[0]?.messages)).toContain('independent context')
+    expect(JSON.stringify(adapter.requests[0]?.messages)).not.toContain('blocked prompt')
+  })
+
+  it('leaves inbox state unchanged when its durable append fails', async () => {
+    const adapter = new MockAdapter([])
+    const ctx = await harness(adapter)
+    const agent = ctx.agentLoop.create(SessionId('rejected-pre-step-append-failure'), {
+      provider: 'mock',
+      model: 'mock',
+    })
+    vi.spyOn(agent.session, 'append').mockImplementationOnce(() => {
+      throw new Error('append unavailable')
+    })
+
+    expect(() => {
+      send(agent, 'blocked prompt')
+    }).toThrow('append unavailable')
+    expect(events(agent)).toEqual([])
+    expect(agent.inbox.hasPending).toBe(false)
+    expect(agent.status).toBe('idle')
+  })
+
+  it('a blocked prompt preserves adjacent queued prompts', async () => {
+    const adapter = new MockAdapter([
+      textResponse('safe reply'),
+      textResponse('wake reply'),
+    ])
     const ctx = await harness(adapter)
     const agent = ctx.agentLoop.create(SessionId('a1'), { provider: 'mock', model: 'mock' })
 
-    ctx.on('agent/prompt-submit', async (_agent, content, _source, next): Promise<PromptDecision> => {
-      const text = content.map(b => (b.type === 'text' ? b.text : '')).join('')
-      return text === 'secret' ? { kind: 'block', reason: 'policy: no secrets' } : next()
+    ctx.on('agent/pre-step', async ({ messages }, next): Promise<PreStepDecision> => {
+      const text = messages.flatMap(message => message.content)
+        .map(b => (b.type === 'text' ? b.text : '')).join('')
+      return text === 'secret'
+        ? { kind: 'reject' }
+        : next()
     })
 
     const reasons: TurnEndReason[] = []
     ctx.on('session/event', (_s, event: SessionEvent) => { if (event.type === 'turn/end') reasons.push(event.data.reason) })
 
-    // Both sends land before the driver wakes, but each remains its own turn.
     send(agent, 'secret')
     send(agent, 'safe')
     await waitForIdle(ctx, agent)
 
     const log = events(agent)
-    // The allowed prompt became a user/message and drove exactly one model call.
-    const userMsgs = log.filter(e => e.type === 'user/message')
-    expect(userMsgs).toHaveLength(1)
-    expect(userMsgs[0]?.type === 'user/message' && userMsgs[0].data.content).toEqual([{ type: 'text', text: 'safe' }])
-    expect(adapter.requests.length).toBeGreaterThanOrEqual(1)
-    // the blocked prompt is durably recorded, with its content + reason
-    const blocked = log.filter(e => e.type === 'prompt/blocked')
-    expect(blocked).toHaveLength(1)
-    expect(blocked[0]?.type === 'prompt/blocked' && blocked[0].data).toMatchObject({
-      content: [{ type: 'text', text: 'secret' }],
-      reason: 'policy: no secrets',
-    })
-    expect(log.filter(e => e.type === 'turn/start')).toHaveLength(2)
-    expect(reasons).toEqual([
-      { kind: 'rejected', reason: 'policy: no secrets' },
-      { kind: 'completed' },
-    ])
+    expect(log.filter(e => e.type === 'user/message')).toHaveLength(0)
+    expect(adapter.requests).toHaveLength(0)
+    expect(log.filter(e => e.type === 'turn/start')).toHaveLength(1)
+    expect(log.filter(e => e.type === 'turn/end')).toHaveLength(1)
+    expect(reasons).toEqual([{ kind: 'blocked' }])
+    expect(agent.inbox.nextTurn.map(message => message.content[0]))
+      .toEqual([{ type: 'text', text: 'safe' }])
+
+    const resumed = waitForIdle(ctx, agent)
+    send(agent, 'wake')
+    await resumed
+    expect(JSON.stringify(adapter.requests[0]?.messages)).toContain('safe')
+    expect(JSON.stringify(adapter.requests[0]?.messages)).not.toContain('secret')
   })
 
-  it('a throwing prompt-submit listener ends its turn balanced while an adjacent message survives', async () => {
+  it('a throwing pre-step listener reports the driver error and retains adjacent work', async () => {
     const adapter = new MockAdapter([textResponse('after')])
     const ctx = await harness(adapter)
     const agent = ctx.agentLoop.create(SessionId('a1'), { provider: 'mock', model: 'mock' })
 
     let threw = false
-    ctx.on('agent/prompt-submit', async () => {
+    ctx.on('agent/pre-step', async ({ messages }) => {
       if (!threw) { threw = true; throw new Error('prompt hook broke') }
-      return { kind: 'allow' as const }
+      return { kind: 'enter' as const, messages }
     })
     const errors: Error[] = []
     const reasons: TurnEndReason[] = []
     const statuses: string[] = []
-    ctx.on('agent/error', (_a, _t, _s, error) => void errors.push(error))
-    ctx.on('agent/status', (subject, status) => { if (subject === agent) statuses.push(status) })
+    ctx.on('agent/error', ({ error }) => {
+      if (error instanceof Error) errors.push(error)
+    })
+    ctx.on('agent/status', ({ agent: subject, status }) => { if (subject === agent) statuses.push(status) })
     ctx.on('session/event', (session, event) => {
       if (session === agent.session && event.type === 'turn/end') reasons.push(event.data.reason)
     })
@@ -238,19 +538,18 @@ describe('agent/prompt-submit', () => {
     send(agent, 'first')
     send(agent, 'second')
     await idle
-    expect(errors.map(e => e.message)).toEqual(['prompt hook broke'])
-    // The failed prompt forms one balanced error turn; the adjacent prompt forms
-    // the following normal turn without an intermediate idle transition.
+    expect(errors).toEqual([expect.objectContaining({ message: 'prompt hook broke' })])
     const log = events(agent)
-    expect(log.filter(e => e.type === 'turn/start')).toHaveLength(2)
-    expect(log.filter(e => e.type === 'turn/end')).toHaveLength(2)
-    expect(reasons).toEqual([
-      { kind: 'error', step: 0, message: 'prompt hook broke' },
-      { kind: 'completed' },
-    ])
+    expect(log.filter(e => e.type === 'turn/start')).toHaveLength(1)
+    expect(log.filter(e => e.type === 'turn/end')).toHaveLength(1)
+    expect(reasons).toEqual([{
+      kind: 'error',
+      error: { message: 'prompt hook broke', code: 'UNKNOWN' },
+    }])
     expect(statuses).toEqual(['running', 'idle'])
-    expect(adapter.requests).toHaveLength(1)
-    expect(JSON.stringify(adapter.requests[0]!.messages)).toContain('second')
+    expect(adapter.requests).toHaveLength(0)
+    expect(agent.inbox.nextTurn.map(message => message.content[0]))
+      .toEqual([{ type: 'text', text: 'second' }])
   })
 })
 
@@ -260,7 +559,7 @@ describe('agent/session-start', () => {
     const ctx = await harness(adapter)
 
     const sources: SessionStartSource[] = []
-    ctx.on('agent/session-start', (_agent, source) => void sources.push(source))
+    ctx.on('agent/session-start', ({ source }) => void sources.push(source))
 
     const agent = ctx.agentLoop.create(SessionId('a1'), { provider: 'mock', model: 'mock' })
     // fires synchronously at create, before any turn
@@ -277,8 +576,8 @@ describe('agent/session-start', () => {
     const adapter = new MockAdapter([textResponse('ok')])
     const ctx = await harness(adapter)
 
-    ctx.on('agent/session-start', (agent) => {
-      agent.inject([{ type: 'text', text: 'session preamble' }], { source: { kind: 'plugin', plugin: 'test' } })
+    ctx.on('agent/session-start', ({ agent }) => {
+      agent.inject(createUserMessage({ content: [{ type: 'text', text: 'session preamble' }], source: { kind: 'plugin', plugin: 'test' } }))
     })
 
     const agent = ctx.agentLoop.create(SessionId('a1'), { provider: 'mock', model: 'mock' })
@@ -288,8 +587,8 @@ describe('agent/session-start', () => {
     // the injected context reached the model on the first (only) request
     expect(JSON.stringify(adapter.requests[0]!.messages)).toContain('session preamble')
     // and is recorded with the plugin source, never mislabeled as a user prompt
-    const ctxMsg = events(agent).find(e => e.type === 'context/message')
-    expect(ctxMsg?.type === 'context/message' && ctxMsg.data.source).toEqual({ kind: 'plugin', plugin: 'test' })
+    const ctxMsg = events(agent).find(e => e.type === 'user/message' && e.data.source.kind === 'plugin')
+    expect(ctxMsg?.type === 'user/message' && ctxMsg.data.source).toEqual({ kind: 'plugin', plugin: 'test' })
   })
 
   it('a throwing session-start listener does not abort agent construction', async () => {
@@ -309,236 +608,6 @@ describe('agent/session-start', () => {
   })
 })
 
-describe('agent/session-prefix', () => {
-  it('dispatches to global and matching agent-scope listeners only', async () => {
-    const adapter = new MockAdapter([textResponse('a done'), textResponse('b done')])
-    const ctx = await harness(adapter)
-    const agentA = ctx.agentLoop.create(SessionId('prefix-a'), { provider: 'mock', model: 'mock' })
-    const agentB = ctx.agentLoop.create(SessionId('prefix-b'), { provider: 'mock', model: 'mock' })
-    const seen: string[] = []
-    ctx.on('agent/session-prefix', async (agent, _prefix, _signal, next) => {
-      seen.push(`global:${agent.id}`)
-      return next()
-    })
-    agentA.ctx.on('agent/session-prefix', async (agent, _prefix, _signal, next) => {
-      seen.push(`a:${agent.id}`)
-      return next()
-    })
-    agentB.ctx.on('agent/session-prefix', async (agent, _prefix, _signal, next) => {
-      seen.push(`b:${agent.id}`)
-      return next()
-    })
-
-    send(agentA, 'run a')
-    await waitForIdle(ctx, agentA)
-    send(agentB, 'run b')
-    await waitForIdle(ctx, agentB)
-
-    expect(seen).toEqual([
-      'global:prefix-a', 'a:prefix-a',
-      'global:prefix-b', 'b:prefix-b',
-    ])
-  })
-
-  it('composes once per loop instance and fronts every request; the header records it; history stays untouched', async () => {
-    const adapter = new MockAdapter([
-      toolCallResponse('c1', 'echo', { text: 'ping' }),
-      textResponse('done'),
-      textResponse('again'),
-    ])
-    const ctx = await harness(adapter)
-    ctx.tools.register(defineTool({
-      name: 'echo', description: 'echo', parameters: { text: { type: 'string' } },
-      async execute(args) { return [{ type: 'text', text: String(args.text) }] },
-    }))
-    const agent = ctx.agentLoop.create(SessionId('a1'), { provider: 'mock', model: 'mock' })
-
-    const reminder: Message = { role: 'user', content: [{ type: 'text', text: '<system-reminder>catalog</system-reminder>' }] }
-    let composed = 0
-    ctx.on('agent/session-prefix', async (_agent, _prefix, _signal, next): Promise<Message[]> => {
-      composed += 1
-      return [...await next(), reminder]
-    })
-
-    send(agent, 'go')
-    await waitForIdle(ctx, agent)
-    send(agent, 'next turn')
-    await waitForIdle(ctx, agent)
-
-    // Three requests (two turns), ONE composition: the frozen product is
-    // reused verbatim, so the prefix cannot drift mid-session.
-    expect(adapter.requests).toHaveLength(3)
-    expect(composed).toBe(1)
-    for (const request of adapter.requests) {
-      expect(request.messages[0]).toEqual(reminder)
-    }
-    // The anchoring snapshot is the prefix's durable record — and the ONLY
-    // header event: reuse means no changed snapshot ever.
-    const headerEvents = events(agent).filter(e => e.type === 'request/header')
-    expect(headerEvents).toHaveLength(1)
-    expect(headerEvents[0]?.type === 'request/header' && headerEvents[0].data.header.messagePrefix).toEqual([reminder])
-    // Never session history: the derivation starts at the real user prompt.
-    expect(agent.session.deriveMessages()[0]).toEqual({ role: 'user', content: [{ type: 'text', text: 'go' }] })
-  })
-
-  it('composes before the first pre-step and records the prefix on the request header', async () => {
-    const adapter = new MockAdapter([textResponse('ok')])
-    const ctx = await harness(adapter)
-    const agent = ctx.agentLoop.create(SessionId('a1'), { provider: 'mock', model: 'mock' })
-
-    const reminder: Message = { role: 'user', content: [{ type: 'text', text: 'opener' }] }
-    const order: string[] = []
-    ctx.on('agent/session-prefix', async (_agent, _prefix, _signal, next): Promise<Message[]> => {
-      order.push('compose')
-      return [reminder, ...await next()]
-    })
-    ctx.on('agent/pre-step', () => {
-      order.push('pre-step')
-    })
-
-    send(agent, 'hi')
-    await waitForIdle(ctx, agent)
-
-    expect(order).toEqual(['compose', 'pre-step'])
-    expect(agent.session.requestHeader()?.messagePrefix).toEqual([reminder])
-  })
-
-  it('the canonical prepend pattern composes contributions in registration order', async () => {
-    const adapter = new MockAdapter([textResponse('ok')])
-    const ctx = await harness(adapter)
-    const agent = ctx.agentLoop.create(SessionId('a1'), { provider: 'mock', model: 'mock' })
-
-    // Both listeners use the canonical `[mine, ...await next()]` prepend: the
-    // waterfall unwinds innermost-first (the second listener's array is built
-    // first), so prepending puts the FIRST-registered contribution first.
-    ctx.on('agent/session-prefix', async (_agent, _prefix, _signal, next): Promise<Message[]> => {
-      return [{ role: 'user', content: [{ type: 'text', text: 'first' }] }, ...await next()]
-    })
-    ctx.on('agent/session-prefix', async (_agent, _prefix, _signal, next): Promise<Message[]> => {
-      return [{ role: 'user', content: [{ type: 'text', text: 'second' }] }, ...await next()]
-    })
-
-    send(agent, 'hi')
-    await waitForIdle(ctx, agent)
-
-    const texts = adapter.requests[0]!.messages.map(m => m.content[0]?.type === 'text' ? m.content[0].text : '')
-    expect(texts).toEqual(['first', 'second', 'hi'])
-  })
-
-  it('with no contributions the header omits messagePrefix and the request is the bare derivation', async () => {
-    const adapter = new MockAdapter([textResponse('ok')])
-    const ctx = await harness(adapter)
-    const agent = ctx.agentLoop.create(SessionId('a1'), { provider: 'mock', model: 'mock' })
-
-    // A listener that delegates without contributing — the canonical no-op.
-    ctx.on('agent/session-prefix', async (_agent, _prefix, _signal, next) => next())
-
-    send(agent, 'hi')
-    await waitForIdle(ctx, agent)
-
-    const headerEvent = events(agent).find(e => e.type === 'request/header')
-    expect(headerEvent?.type === 'request/header' && 'messagePrefix' in headerEvent.data.header).toBe(false)
-    expect(adapter.requests[0]!.messages).toEqual([{ role: 'user', content: [{ type: 'text', text: 'hi' }] }])
-  })
-
-  it('the frozen seed rejects in-place mutation — a contribution is a returned extension', async () => {
-    const adapter = new MockAdapter([textResponse('ok')])
-    const ctx = await harness(adapter)
-    const agent = ctx.agentLoop.create(SessionId('a1'), { provider: 'mock', model: 'mock' })
-
-    let mutationError: unknown
-    ctx.on('agent/session-prefix', async (_agent, prefix, _signal, next): Promise<Message[]> => {
-      try {
-        prefix.push({ role: 'user', content: [{ type: 'text', text: 'smuggled' }] })
-      } catch (error: unknown) {
-        mutationError = error
-      }
-      return next()
-    })
-
-    send(agent, 'hi')
-    await waitForIdle(ctx, agent)
-
-    expect(mutationError).toBeInstanceOf(TypeError)
-    expect(adapter.requests[0]!.messages).toEqual([{ role: 'user', content: [{ type: 'text', text: 'hi' }] }])
-  })
-
-  it('mutating a listener-held reference after composition cannot alter later requests (the cache is a frozen clone)', async () => {
-    const adapter = new MockAdapter([
-      toolCallResponse('c1', 'echo', { text: 'ping' }),
-      textResponse('done'),
-    ])
-    const ctx = await harness(adapter)
-    ctx.tools.register(defineTool({
-      name: 'echo', description: 'echo', parameters: { text: { type: 'string' } },
-      async execute(args) { return [{ type: 'text', text: String(args.text) }] },
-    }))
-    const agent = ctx.agentLoop.create(SessionId('a1'), { provider: 'mock', model: 'mock' })
-
-    const held: Message = { role: 'user', content: [{ type: 'text', text: 'v1' }] }
-    ctx.on('agent/session-prefix', async (_agent, _prefix, _signal, next): Promise<Message[]> => [...await next(), held])
-
-    send(agent, 'go')
-    await waitForIdle(ctx, agent)
-
-    // The listener mutates the object it contributed AFTER composition; the
-    // cached prefix is a deep-frozen clone, so step 2's request is unchanged.
-    held.content = [{ type: 'text', text: 'v2' }]
-    expect(adapter.requests[1]!.messages[0]).toEqual({ role: 'user', content: [{ type: 'text', text: 'v1' }] })
-    expect(events(agent).filter(e => e.type === 'request/header')).toHaveLength(1)
-  })
-})
-
-
-describe('agent/turn-continuation (ContinuationDecision)', () => {
-  it('a continue decision with a reason records next-step steering in the same turn', async () => {
-    const adapter = new MockAdapter([textResponse('step 1 no tools'), textResponse('step 2')])
-    const ctx = await harness(adapter)
-    const agent = ctx.agentLoop.create(SessionId('a1'), { provider: 'mock', model: 'mock' })
-
-    let forced = false
-    ctx.on('agent/turn-continuation', async (_agent, _turn, _default, next): Promise<ContinuationDecision> => {
-      if (!forced) {
-        forced = true
-        return { action: 'continue', reason: { content: [{ type: 'text', text: 'keep going on the goal' }], source: { kind: 'plugin', plugin: 'goal' } } }
-      }
-      return next()
-    })
-
-    send(agent, 'go')
-    await waitForIdle(ctx, agent)
-
-    const log = events(agent)
-    // The continuation stays in the turn, is logged with provenance before step 2,
-    // and reaches that step's request.
-    expect(log.filter(e => e.type === 'turn/start')).toHaveLength(1)
-    expect(log.filter(e => e.type === 'step/start')).toHaveLength(2)
-    const steering = log.find(e => e.type === 'steering/message')
-    expect(steering?.type === 'steering/message' && steering.data.content).toEqual([{ type: 'text', text: 'keep going on the goal' }])
-    expect(steering?.type === 'steering/message' && steering.data.source).toEqual({ kind: 'plugin', plugin: 'goal' })
-    expect(JSON.stringify(adapter.requests[1]!.messages)).toContain('keep going on the goal')
-  })
-
-  it('a stop decision ends the turn even when the step had tool calls', async () => {
-    const adapter = new MockAdapter([toolCallResponse('c1', 'echo', { text: 'hi' })])
-    const ctx = await harness(adapter)
-    ctx.tools.register(defineTool({
-      name: 'echo', description: 'echo', parameters: { text: { type: 'string' } },
-      async execute(args) { return [{ type: 'text', text: String(args.text) }] },
-    }))
-    const agent = ctx.agentLoop.create(SessionId('a1'), { provider: 'mock', model: 'mock' })
-
-    ctx.on('agent/turn-continuation', async (): Promise<ContinuationDecision> => ({ action: 'stop' }))
-
-    send(agent, 'go')
-    await waitForIdle(ctx, agent)
-
-    // default would have continued (had tool calls), but the stop decision wins
-    expect(adapter.requests).toHaveLength(1)
-    expect(events(agent).some(e => e.type === 'tool/result')).toBe(true)
-  })
-})
-
 describe('tool additionalContexts buffering across a step', () => {
   it('appends each call\'s contexts only AFTER all tool/results, preserving adjacency', async () => {
     // One assistant step with TWO tool calls; the second model response stops.
@@ -552,7 +621,7 @@ describe('tool additionalContexts buffering across a step', () => {
     ]
     const adapter = new MockAdapter([twoCalls, textResponse('done')])
     const ctx = await harness(adapter)
-    ctx.tools.register(defineTool({
+    ctx.tools.register(defineContentToolFixture({
       name: 'echo', description: 'echo', parameters: { text: { type: 'string' } },
       async execute(args) { return [{ type: 'text', text: String(args.text) }] },
     }))
@@ -562,43 +631,44 @@ describe('tool additionalContexts buffering across a step', () => {
     ctx.on('tools/post-execute', async (exec, _result): Promise<PostToolDecision> =>
       ({
         kind: 'accept',
-        additionalContexts: [{
+        additionalContexts: [createUserMessage({
           content: [{ type: 'text', text: `ctx-${exec.callId}` }],
           source: { kind: 'plugin', plugin: 'p' },
-          meta: { callId: exec.callId },
-        }],
+        })],
       }))
 
     send(agent, 'go')
     await waitForIdle(ctx, agent)
 
-    // Event order in the log: both tool/results, THEN both context/messages —
+    // Event order in the log: both tool/results, THEN both injected contexts —
     // never interleaved (which would break tool-call/result adjacency).
-    const types = events(agent).map(e => e.type)
-    const firstResult = types.indexOf('tool/result')
-    const lastResult = types.lastIndexOf('tool/result')
-    const firstCtx = types.indexOf('context/message')
+    const injected = events(agent).filter(e => e.type === 'user/message' && e.data.source.kind === 'plugin')
+    const seqs = events(agent)
+    const firstResult = seqs.findIndex(e => e.type === 'tool/result')
+    const lastResult = seqs.map(e => e.type).lastIndexOf('tool/result')
+    const firstCtx = seqs.findIndex(e => e === injected[0])
     expect(firstResult).toBeGreaterThanOrEqual(0)
     expect(lastResult).toBeGreaterThan(firstResult) // two results
     expect(firstCtx).toBeGreaterThan(lastResult)    // context only after ALL results
     // both contexts present
-    const ctxTexts = events(agent)
-      .filter(e => e.type === 'context/message')
-      .flatMap(e => (e.type === 'context/message' ? e.data.content : []))
+    const ctxTexts = injected
+      .flatMap(e => (e.type === 'user/message' ? e.data.content : []))
       .map(b => (b.type === 'text' ? b.text : ''))
     expect(ctxTexts).toEqual(['ctx-c1', 'ctx-c2'])
-    const contextEvents = events(agent).filter(e => e.type === 'context/message')
-    expect(contextEvents.map(e => e.type === 'context/message' && e.data.meta)).toEqual([{ callId: 'c1' }, { callId: 'c2' }])
   })
 
   it('appends multiple contexts deferred by one composite tool after its outer result', async () => {
     const adapter = new MockAdapter([toolCallResponse('c1', 'composite', {}), textResponse('done')])
     const ctx = await harness(adapter)
-    ctx.tools.register(defineTool({
+    ctx.tools.register(defineContentToolFixture({
       name: 'composite', description: 'composite', parameters: {},
       async execute(_args, exec) {
-        exec.deferContext({ content: [{ type: 'text', text: 'nested-a' }], source: { kind: 'plugin', plugin: 'a' }, meta: { order: 1 } })
-        exec.deferContext({ content: [{ type: 'text', text: 'nested-b' }], source: { kind: 'plugin', plugin: 'b' }, meta: { order: 2 } })
+        exec.deferContext(createUserMessage({
+          content: [{ type: 'text', text: 'nested-a' }], source: { kind: 'plugin', plugin: 'a' },
+        }))
+        exec.deferContext(createUserMessage({
+          content: [{ type: 'text', text: 'nested-b' }], source: { kind: 'plugin', plugin: 'b' },
+        }))
         return [{ type: 'text', text: 'outer result' }]
       },
     }))
@@ -609,14 +679,13 @@ describe('tool additionalContexts buffering across a step', () => {
 
     const log = events(agent)
     const resultIndex = log.findIndex(event => event.type === 'tool/result')
-    const contextEvents = log.filter(event => event.type === 'context/message')
+    const contextEvents = log.filter(event => event.type === 'user/message' && event.data.source.kind === 'plugin')
     expect(resultIndex).toBeGreaterThanOrEqual(0)
     expect(log.findIndex(event => event === contextEvents[0])).toBeGreaterThan(resultIndex)
-    expect(contextEvents.map(event => event.type === 'context/message' && event.data.source)).toEqual([
+    expect(contextEvents.map(event => event.type === 'user/message' && event.data.source)).toEqual([
       { kind: 'plugin', plugin: 'a' },
       { kind: 'plugin', plugin: 'b' },
     ])
-    expect(contextEvents.map(event => event.type === 'context/message' && event.data.meta)).toEqual([{ order: 1 }, { order: 2 }])
   })
 })
 
@@ -625,7 +694,7 @@ describe('tools/pre-execute gate (native-plugin permission pattern, end-to-end t
     const adapter = new MockAdapter([toolCallResponse('c1', 'danger', {}), textResponse('ok')])
     const ctx = await harness(adapter)
     let ran = false
-    ctx.tools.register(defineTool({
+    ctx.tools.register(defineContentToolFixture({
       name: 'danger', description: 'danger', parameters: {},
       async execute() { ran = true; return [{ type: 'text', text: 'should not run' }] },
     }))
@@ -641,9 +710,9 @@ describe('tools/pre-execute gate (native-plugin permission pattern, end-to-end t
 
     expect(ran).toBe(false)
     const result = events(agent).find(e => e.type === 'tool/result')
-    expect(result?.type === 'tool/result' && result.data.isError).toBe(true)
+    expect(result?.type === 'tool/result' && result.data.message.content[0].isError).toBe(true)
     expect(result?.type === 'tool/result'
-      && result.data.content.some(b => b.type === 'text' && b.text.includes('blocked dangerous tool'))).toBe(true)
+      && result.data.message.content[0].content.some(b => b.type === 'text' && b.text.includes('blocked dangerous tool'))).toBe(true)
   })
 })
 
@@ -655,16 +724,16 @@ describe('worked example: a native hook plugin is just a cordis plugin on the se
     name: 'native-guard',
     apply(ctx: Context) {
       // 1. SessionStart: seed a standing instruction.
-      ctx.on('agent/session-start', (agent, source) => {
-        agent.inject(
-          [{ type: 'text', text: `policy active (started: ${source})` }],
-          { source: { kind: 'plugin', plugin: 'native-guard' } },
-        )
+      ctx.on('agent/session-start', ({ agent, source }) => {
+        agent.inject(createUserMessage({ content: [{ type: 'text', text: `policy active (started: ${source})` }], source: { kind: 'plugin', plugin: 'native-guard' } }))
       })
-      // 2. PromptSubmit: block a forbidden prompt, annotate the rest.
-      ctx.on('agent/prompt-submit', async (_agent, content, _source, next): Promise<PromptDecision> => {
-        const text = content.map(b => (b.type === 'text' ? b.text : '')).join('')
-        if (text.includes('rm -rf')) return { kind: 'block', reason: 'destructive prompt blocked' }
+      // 2. PreStep: reject a forbidden prompt, annotate the rest.
+      ctx.on('agent/pre-step', async ({ messages }, next): Promise<PreStepDecision> => {
+        const text = messages.flatMap(message => message.content)
+          .map(b => (b.type === 'text' ? b.text : '')).join('')
+        if (text.includes('rm -rf')) {
+          return { kind: 'reject' }
+        }
         return next()
       })
       // 3. PreToolUse: deny a dangerous tool by name.
@@ -676,7 +745,9 @@ describe('worked example: a native hook plugin is just a cordis plugin on the se
       ctx.on('tools/post-execute', async (_exec, _result, next): Promise<PostToolDecision> => {
         const decision = await next()
         if (decision.kind === 'accept') {
-          return { kind: 'accept', additionalContexts: [{ content: [{ type: 'text', text: 'audited' }], source: { kind: 'plugin', plugin: 'native-guard' } }] }
+          return { kind: 'accept', additionalContexts: [createUserMessage({
+            content: [{ type: 'text', text: 'audited' }], source: { kind: 'plugin', plugin: 'native-guard' },
+          })] }
         }
         return decision
       })
@@ -687,7 +758,7 @@ describe('worked example: a native hook plugin is just a cordis plugin on the se
     const adapter = new MockAdapter([toolCallResponse('c1', 'echo', { text: 'hi' }), textResponse('done')])
     const ctx = await harness(adapter)
     await ctx.plugin(NativeGuard)
-    ctx.tools.register(defineTool({
+    ctx.tools.register(defineContentToolFixture({
       name: 'echo', description: 'echo', parameters: { text: { type: 'string' } },
       async execute(args) { return [{ type: 'text', text: String(args.text) }] },
     }))
@@ -698,19 +769,19 @@ describe('worked example: a native hook plugin is just a cordis plugin on the se
 
     const log = events(agent)
     // session-start preamble injected
-    expect(log.some(e => e.type === 'context/message'
+    expect(log.some(e => e.type === 'user/message' && e.data.source.kind === 'plugin'
       && e.data.content.some(b => b.type === 'text' && b.text.includes('policy active (started: startup)')))).toBe(true)
-    // prompt allowed → user/message recorded
-    expect(log.some(e => e.type === 'user/message')).toBe(true)
+    // prompt allowed → user-sourced user/message recorded
+    expect(log.some(e => e.type === 'user/message' && e.data.source.kind === 'user')).toBe(true)
     // tool ran (echo allowed) and post-execute attached "audited" context
-    expect(log.some(e => e.type === 'tool/result' && !e.data.isError)).toBe(true)
-    expect(log.some(e => e.type === 'context/message'
+    expect(log.some(e => e.type === 'tool/result' && !e.data.message.content[0].isError)).toBe(true)
+    expect(log.some(e => e.type === 'user/message' && e.data.source.kind === 'plugin'
       && e.data.content.some(b => b.type === 'text' && b.text === 'audited'))).toBe(true)
     // NO hook/* events — a native plugin needs none
     expect(log.some(e => e.type.startsWith('hook/'))).toBe(false)
   })
 
-  it('the same plugin blocks a destructive prompt → rejected turn, model never called', async () => {
+  it('the same plugin blocks a destructive prompt inside a no-step turn', async () => {
     const adapter = new MockAdapter([textResponse('should not run')])
     const ctx = await harness(adapter)
     await ctx.plugin(NativeGuard)
@@ -720,10 +791,10 @@ describe('worked example: a native hook plugin is just a cordis plugin on the se
     ctx.on('session/event', (_s, event: SessionEvent) => { if (event.type === 'turn/end') reasons.push(event.data.reason) })
 
     send(agent, 'run rm -rf /')
-    await waitForIdle(ctx, agent)
+    await agent.whenIdle()
 
     expect(adapter.requests).toHaveLength(0)
-    expect(reasons).toEqual([{ kind: 'rejected', reason: 'destructive prompt blocked' }])
+    expect(reasons).toEqual([{ kind: 'blocked' }])
   })
 
   it('HMR-safety: disposing the plugin fiber removes all four listeners', async () => {
@@ -736,7 +807,7 @@ describe('worked example: a native hook plugin is just a cordis plugin on the se
     const agent = ctx.agentLoop.create(SessionId('a3'), { provider: 'mock', model: 'mock' })
     send(agent, 'run rm -rf /')
     await waitForIdle(ctx, agent)
-    // the prompt ran (not rejected) — proving the prompt-submit listener was disposed
+    // the prompt ran (not rejected) — proving the pre-step listener was disposed
     expect(adapter.requests).toHaveLength(1)
     expect(events(agent).some(e => e.type === 'user/message')).toBe(true)
   })

@@ -18,10 +18,22 @@
       "path": "../../../vendor/schemastery"
     },
     {
+      "path": "../../../native/landlock-run/packages/entry"
+    },
+    {
       "path": "../../llm/llm"
     },
     {
       "path": "../sandbox"
+    },
+    {
+      "path": "../sandbox-windows-acl"
+    },
+    {
+      "path": "../../core/session"
+    },
+    {
+      "path": "../../runtime-diagnostics/invariants"
     }
   ]
 }

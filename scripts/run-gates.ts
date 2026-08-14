@@ -1,27 +1,38 @@
 /**
  * Run local and CI quality gates with bounded in-process scheduling.
  *
- * The gate vocabulary stays in package.json; this runner only decides which
- * independent commands can overlap and which commands wait for built artifacts.
+ * Package scripts own public aggregate names; this runner owns their validated
+ * dependency graphs, scheduler environment, and process diagnostics.
+ * @see ../.agents/notes/implemented/process/2026-07-06-parallel-pre-push-gates.md
  */
 import { spawn } from 'node:child_process'
-import { readdir, rm } from 'node:fs/promises'
 import { availableParallelism } from 'node:os'
-import { join, resolve } from 'node:path'
+import { resolve } from 'node:path'
 import { performance } from 'node:perf_hooks'
+import { COVERAGE_EXEMPT_ENV, coverageExemptHeavySuites } from './coverage-exempt.ts'
 
-type Mode =
+/** A named aggregate exposed by the gate runner. */
+export type Mode =
   | 'ci-primary'
+  | 'ci-linux-primary'
   | 'ci-static'
-  | 'ci-lint'
+  | 'ci-lint-contracts-ready'
   | 'ci-coverage'
   | 'ci-snapshot'
   | 'ci-artifacts'
+  | 'ci-consumers'
+  | 'ci-windows-blocking'
+  | 'ci-windows-complete'
+  | 'ci-windows-observational'
   | 'node-compat'
-  | 'pre-push'
-type GateStatus = 'pending' | 'running' | 'passed' | 'failed' | 'skipped'
+  | 'check-all'
+  | 'doc-sync'
 
-interface Gate {
+type GateResultStatus = 'passed' | 'failed' | 'skipped'
+type GateState = 'pending' | 'running' | GateResultStatus
+
+/** A command and its dependency metadata inside one aggregate. */
+export interface Gate {
   id: string
   label: string
   displayCommand: string
@@ -29,18 +40,17 @@ interface Gate {
   args: string[]
   needs?: string[]
   env?: Record<string, string | undefined>
-  input?: string
-  verify?: (result: GateResult) => Promise<void>
+  allowFailure?: boolean
 }
 
-interface GateResult {
+/** The observed outcome of one gate process. */
+export interface GateResult {
   gate: Gate
-  status: GateStatus
+  status: GateResultStatus
   durationMs: number
-  stdout: string
-  stderr: string
   output: GateOutputChunk[]
   exitCode: number | null
+  signalCode: NodeJS.Signals | null
   error?: string
 }
 
@@ -59,50 +69,78 @@ interface ConcurrencyDefault {
   source: string
 }
 
+type GateExecutor = (gate: Gate) => Promise<GateResult>
+type ResultObserver = (result: GateResult) => void
+
 const root = resolve(import.meta.dirname, '..')
-const mode = parseMode(process.argv[2])
-const gates = gatesForMode(mode)
-const concurrencyDefault = defaultConcurrency(mode, gates.length)
-const concurrencyOverride = process.env.DSH_GATE_CONCURRENCY
-const maxConcurrency = concurrencyFromEnv('DSH_GATE_CONCURRENCY', concurrencyDefault.workers)
-const verbose = process.env.DSH_GATE_VERBOSE === '1'
-const startedAt = performance.now()
+if (import.meta.main) {
+  process.exitCode = await main(process.argv.slice(2))
+}
 
-const concurrencySource = concurrencyOverride === undefined || concurrencyOverride === ''
-  ? concurrencyDefault.source
-  : '$DSH_GATE_CONCURRENCY'
-console.log(`run-gates: ${mode} running ${gates.length} gate(s) with ${maxConcurrency} worker(s) from ${concurrencySource}.`)
+async function main(args: string[]): Promise<number> {
+  const mode = parseMode(args[0])
+  const gates = gatesForMode(mode)
+  const concurrencyDefault = defaultConcurrency(mode, gates.length)
+  const concurrencyOverride = process.env.DSH_GATE_CONCURRENCY
+  const maxConcurrency = concurrencyFromEnv('DSH_GATE_CONCURRENCY', concurrencyDefault.workers)
+  const concurrencySource = concurrencyOverride === undefined || concurrencyOverride === ''
+    ? concurrencyDefault.source
+    : '$DSH_GATE_CONCURRENCY'
+  const startedAt = performance.now()
+  console.log(`run-gates: ${mode} running ${gates.length} gate(s) with ${maxConcurrency} worker(s) from ${concurrencySource}.`)
 
-const results = await runGates(gates, maxConcurrency)
-printSummary(results, performance.now() - startedAt)
-
-if (results.some(result => result.status === 'failed' || result.status === 'skipped')) process.exit(1)
+  const results = await runGates(gates, maxConcurrency, runGate, printResult)
+  printSummary(results, performance.now() - startedAt)
+  return results.some(result => result.gate.allowFailure !== true && (result.status === 'failed' || result.status === 'skipped'))
+    ? 1
+    : 0
+}
 
 function parseMode(raw: string | undefined): Mode {
   switch (raw) {
     case 'ci-primary':
+    case 'ci-linux-primary':
     case 'ci-static':
-    case 'ci-lint':
+    case 'ci-lint-contracts-ready':
     case 'ci-coverage':
     case 'ci-snapshot':
     case 'ci-artifacts':
+    case 'ci-consumers':
+    case 'ci-windows-blocking':
+    case 'ci-windows-complete':
+    case 'ci-windows-observational':
     case 'node-compat':
-    case 'pre-push':
+    case 'check-all':
+    case 'doc-sync':
       return raw
     default:
       throw new Error(
-        `run-gates: expected mode ci-primary | ci-static | ci-lint | ci-coverage | ci-snapshot | ci-artifacts | node-compat | pre-push, got ${JSON.stringify(raw)}.`,
+        `run-gates: expected mode ci-primary | ci-linux-primary | ci-static | ci-lint-contracts-ready | ci-coverage | ci-snapshot | ci-artifacts | ci-consumers | ci-windows-blocking | ci-windows-complete | ci-windows-observational | node-compat | check-all | doc-sync, got ${JSON.stringify(raw)}.`,
       )
   }
 }
 
-function defaultConcurrency(selectedMode: Mode, total: number): ConcurrencyDefault {
-  const available = availableParallelism()
-  const modeLimit = selectedMode === 'pre-push' ? Math.min(4, available) : available
+/**
+ * Resolve the default worker count for one aggregate.
+ * @param selectedMode - aggregate whose resource posture applies.
+ * @param total - number of gates in the aggregate.
+ * @param available - host CPU availability for ordinary modes.
+ * @returns the default worker count and its diagnostic source.
+ */
+export function defaultConcurrency(
+  selectedMode: Mode,
+  total: number,
+  available = availableParallelism(),
+): ConcurrencyDefault {
+  if (selectedMode === 'ci-consumers') return { workers: total, source: 'ci-consumers gate count' }
+  // Local modes cap workers: several doc gates each build a full ts.Program,
+  // so an uncapped default on a large host trades wall clock for memory blowups.
+  const localCap = selectedMode === 'check-all' || selectedMode === 'doc-sync'
+  const modeLimit = localCap ? Math.min(4, available) : available
   return {
     workers: Math.min(total, modeLimit),
-    source: selectedMode === 'pre-push'
-      ? `${available} available CPU(s), pre-push cap 4`
+    source: localCap
+      ? `${available} available CPU(s), ${selectedMode} cap 4`
       : `${available} available CPU(s)`,
   }
 }
@@ -146,104 +184,191 @@ function pnpmInvocation(args: string[]): Pick<Gate, 'command' | 'args'> {
   return { command: process.execPath, args: [entrypoint, ...args] }
 }
 
-function nodeOptions(...options: string[]): string {
-  return [process.env.NODE_OPTIONS, ...options].filter(option => option !== undefined && option !== '').join(' ')
-}
-
-function gatesForMode(selected: Mode): Gate[] {
+/**
+ * Construct the complete gate list for a named aggregate.
+ * @param selected - aggregate mode to construct.
+ * @returns the aggregate's gate graph.
+ */
+export function gatesForMode(selected: Mode): Gate[] {
   switch (selected) {
     case 'ci-primary':
       return ciPrimaryGates()
+    case 'ci-linux-primary':
+      return [...ciPrimaryGates(), webSnapshotGate(['built-package-invariants'])]
     case 'ci-static':
-      return ciStaticGates()
-    case 'ci-lint':
+      return ciStaticGates({ ownsBuild: false })
+    case 'ci-lint-contracts-ready':
       return [
         lintGate(),
         pnpmScript('duplication', 'duplication'),
       ]
     case 'ci-coverage':
-      return [
-        pnpmScript('build', 'build'),
-        coverageGate(),
-      ]
+      return coverageGates()
     case 'ci-snapshot':
-      return [
-        pnpmScript('build', 'build'),
-        snapshotGate(),
-      ]
+      return [pnpmScript('build', 'build'), snapshotGate()]
     case 'ci-artifacts':
       return ciArtifactGates()
+    case 'ci-consumers':
+      return ciConsumerGates()
+    case 'ci-windows-blocking':
+      return ciWindowsBlockingGates()
+    case 'ci-windows-complete':
+      return ciWindowsCompleteGates()
+    case 'ci-windows-observational':
+      return ciWindowsObservationalGates()
     case 'node-compat':
-      return [
-        pnpmScript('typecheck', 'typecheck'),
-        pnpmExec('source-worker-smoke', [
-          'vitest',
-          'run',
-          'packages/workflow/workflow-workerthread/tests/source-worker.compat.spec.ts',
-        ], { label: 'source worker smoke' }),
-        pnpmExec('jsonl-zstd-smoke', [
-          'vitest',
-          'run',
-          'packages/session-persistence/session-persistence-jsonl/tests/zstd.compat.spec.ts',
-        ], { label: 'JSONL Zstandard smoke' }),
-      ]
-    case 'pre-push':
+      return nodeCompatGates()
+    case 'check-all':
       return [
         pnpmScript('runtime-closure', 'verify-runtime-closure', { label: 'runtime closure' }),
         pnpmScript('cordis-config', 'verify-cordis-config', { label: 'Cordis config' }),
+        pnpmScript('client-domain-graph', 'verify-client-domain-graph', { label: 'client domain graph' }),
         pnpmScript('test', 'test'),
+        pnpmScript('issue-management', 'test:issue-management', { label: 'Issue management policy' }),
         pnpmScript('duplication', 'duplication'),
         snapshotGate(),
         pnpmScript('build', 'build'),
+        pnpmScript('build:web', 'build:web'),
         ...hygieneLeafGates({ artifactNeeds: ['build'] }),
         ...docSyncLeafGates({
           docTypecheckNeeds: ['build'],
           docTypecheckEnv: { DSH_DOC_TYPECHECK_USE_BUILD_OUTPUT: '1' },
+          docTypecheckScript: 'doc-typecheck:contracts-ready',
         }),
         pnpmScript('module-graph', 'verify-module-graph', { label: 'module graph' }),
       ]
+    case 'doc-sync':
+      return docSyncLeafGates()
   }
+}
+
+function ciSharedStaticGates(): Gate[] {
+  return [
+    pnpmScript('runtime-closure', 'verify-runtime-closure', { label: 'runtime closure' }),
+    pnpmScript('constraints', 'constraints'),
+    pnpmScript('dsh-package-licenses', 'verify-dsh-package-licenses', { label: 'DSH package licenses' }),
+    pnpmScript('package-invariants', 'verify-package-invariants', { label: 'package invariants' }),
+    pnpmScript('cordis-config', 'verify-cordis-config', { label: 'Cordis config' }),
+    pnpmScript('issue-management', 'test:issue-management', { label: 'Issue management policy' }),
+  ]
 }
 
 function ciPrimaryGates(): Gate[] {
   return [
-    pnpmScript('runtime-closure', 'verify-runtime-closure', { label: 'runtime closure' }),
-    pnpmScript('constraints', 'constraints'),
-    pnpmScript('cordis-config', 'verify-cordis-config', { label: 'Cordis config' }),
-    pnpmScript('typecheck', 'typecheck'),
-    lintGate(),
+    ...ciSharedStaticGates(),
+    typertContractsGate(),
+    pnpmScript('typecheck', 'typecheck:contracts-ready', { needs: ['typert-contracts'] }),
+    lintGate({ needs: ['typert-contracts'] }),
     pnpmScript('duplication', 'duplication'),
-    coverageGate(),
+    ...coverageGates(),
+    ...nodeCompatSmokeGates(),
     snapshotGate(),
-    demoSmokeGate({ needs: ['lint'] }),
-    ...docSyncLeafGates(),
+    ...docSyncLeafGates({
+      docTypecheckNeeds: ['typert-contracts'],
+      docTypecheckScript: 'doc-typecheck:contracts-ready',
+    }),
     pnpmScript('module-graph', 'verify-module-graph', { label: 'module graph' }),
     pnpmScript('knip', 'knip'),
-    pnpmScript('build', 'build', { needs: ['typecheck'] }),
+    // The prepared typecheck and build both drive Client tsc, while build also
+    // repeats the Host contract pass. Wait for all three consumers so build
+    // neither races tsbuildinfo nor replaces declarations while they are read.
+    pnpmScript('build', 'build', { needs: ['typecheck', 'lint', 'doc-typecheck'] }),
     pnpmScript('publint', 'publint', { needs: ['build'] }),
     pnpmScript('node-next-types', 'verify-node-next-types', {
       label: 'node-next types',
       needs: ['build'],
     }),
+    builtPackageInvariantsGate(['build']),
     builtBinSmokeGate(),
   ]
 }
 
-function ciStaticGates(): Gate[] {
+function nodeCompatGates(): Gate[] {
+  const typecheck = flagEnabled('DSH_NODE_COMPAT_SKIP_TYPECHECK')
+    ? []
+    : [pnpmScript('typecheck', 'typecheck')]
+  if (runningNodeMajor() !== 22) {
+    return [...typecheck, ...nodeCompatSmokeGates()]
+  }
   return [
-    pnpmScript('runtime-closure', 'verify-runtime-closure', { label: 'runtime closure' }),
-    pnpmScript('constraints', 'constraints'),
-    pnpmScript('cordis-config', 'verify-cordis-config', { label: 'Cordis config' }),
-    ...staticDemoSmokeGates(),
-    ...docSyncLeafGates(),
-    pnpmScript('module-graph', 'verify-module-graph', { label: 'module graph' }),
-    pnpmScript('knip', 'knip'),
+    ...typecheck,
+    pnpmScript('build', 'build', {
+      ...typecheck.length === 0 ? {} : { needs: ['typecheck'] },
+    }),
+    pnpmScript('build:web', 'build:web', {
+      label: 'Web frontend build',
+      needs: ['build'],
+    }),
+    ...nodeCompatSmokeGates({ cliSmoke: true }),
   ]
 }
 
-function staticDemoSmokeGates(): Gate[] {
-  // Native Windows session persistence is outside the gates-only support scope.
-  return process.platform === 'win32' ? [] : [demoSmokeGate()]
+function nodeCompatSmokeGates(options: { cliSmoke?: boolean } = {}): Gate[] {
+  const gates: Gate[] = [
+    pnpmExec('source-worker-smoke', [
+      'vitest',
+      'run',
+      'packages/workflow/workflow-worker-thread/tests/source-worker.compat.spec.ts',
+    ], { label: 'source worker smoke' }),
+    pnpmExec('jsonl-zstd-smoke', [
+      'vitest',
+      'run',
+      'packages/session/session-persistence-jsonl/tests/zstd.compat.spec.ts',
+    ], { label: 'JSONL Zstandard smoke' }),
+    pnpmExec('dsh-source-launch-smoke', [
+      'vitest',
+      'run',
+      'apps/cli/tests/source-launch.compat.spec.ts',
+    ], { label: 'dsh source-launch smoke' }),
+    pnpmExec('vitest-jsdom-smoke', [
+      'vitest',
+      'run',
+      'scripts/vitest-environment.compat.spec.ts',
+    ], { label: 'Vitest jsdom smoke' }),
+  ]
+  if (options.cliSmoke) {
+    gates.push(
+      pnpmExec('cli-lazy-search-startup-smoke', [
+        'vitest',
+        'run',
+        'apps/cli/tests/lazy-search-startup.compat.spec.ts',
+      ], {
+        label: 'CLI lazy-search startup smoke',
+        env: { DSH_REQUIRE_BUILT_CLI_SMOKE: '1' },
+        needs: ['build:web'],
+      }),
+    )
+  }
+  return gates
+}
+
+/** Active Node major used to select version-specific compatibility checks. */
+function runningNodeMajor(): number {
+  const major = Number.parseInt(process.versions.node.split('.')[0] ?? '', 10)
+  if (!Number.isSafeInteger(major)) {
+    throw new Error(`run-gates: cannot parse Node version ${JSON.stringify(process.versions.node)}.`)
+  }
+  return major
+}
+
+function ciStaticGates(options: { ownsBuild: boolean }): Gate[] {
+  return [
+    ...ciSharedStaticGates(),
+    ...options.ownsBuild ? [pnpmScript('build', 'build')] : [],
+    ...docSyncLeafGates({
+      includeDocTypecheck: options.ownsBuild,
+      ...options.ownsBuild
+        ? {
+          docTypecheckNeeds: ['build'],
+          docTypecheckEnv: { DSH_DOC_TYPECHECK_USE_BUILD_OUTPUT: '1' },
+          docTypecheckScript: 'doc-typecheck:contracts-ready',
+        }
+        : {},
+      docsBuildScript: 'docs:build:mpa',
+    }),
+    pnpmScript('module-graph', 'verify-module-graph', { label: 'module graph' }),
+    pnpmScript('knip', 'knip'),
+  ]
 }
 
 function ciArtifactGates(): Gate[] {
@@ -254,50 +379,158 @@ function ciArtifactGates(): Gate[] {
       label: 'node-next types',
       needs: ['build'],
     }),
+    builtPackageInvariantsGate(['build']),
     builtBinSmokeGate(),
   ]
 }
 
-function lintGate(): Gate {
-  if (process.env.DSH_ESLINT_CACHE === '1') {
-    return pnpmExec('lint', [
-      'eslint',
-      '.',
-      '--cache',
-      '--cache-location',
-      '.cache/eslint/',
-      '--cache-strategy',
-      'content',
-    ], {
-      label: 'lint',
-      env: { NODE_OPTIONS: nodeOptions('--max-old-space-size=8192') },
-    })
+function ciConsumerGates(): Gate[] {
+  const builtTree = ['build']
+  const validatedBuild = ['built-package-invariants']
+  return [
+    pnpmScript('build', 'build'),
+    pnpmScript('node-compat', 'check:node-compat', { label: 'Node compatibility' }),
+    pnpmScript('publint', 'publint', { needs: builtTree }),
+    builtPackageInvariantsGate(['publint']),
+    pnpmScript('lint-and-duplication', 'check:ci:lint:contracts-ready', {
+      label: 'lint and duplication',
+      needs: validatedBuild,
+    }),
+    snapshotGate(validatedBuild),
+    webSnapshotGate(validatedBuild),
+    pnpmScript('doc-typecheck', 'doc-typecheck:contracts-ready', {
+      needs: validatedBuild,
+      env: { DSH_DOC_TYPECHECK_USE_BUILD_OUTPUT: '1' },
+    }),
+    pnpmScript('node-next-types', 'verify-node-next-types', {
+      label: 'node-next types',
+      needs: validatedBuild,
+    }),
+    builtBinSmokeGate(validatedBuild),
+  ]
+}
+
+function webSnapshotGate(needs: string[]): Gate {
+  return pnpmScript('web-snapshot', 'test:web:built', {
+    label: 'web browser snapshot',
+    displayCommand: 'DSH_SNAPSHOT=replay pnpm run test:web:built',
+    env: { DSH_SNAPSHOT: 'replay' },
+    needs,
+  })
+}
+
+function ciWindowsBlockingGates(): Gate[] {
+  return [
+    pnpmScript('windows-build', 'build', { label: 'build' }),
+    pnpmScript('windows-site', 'docs:build', { label: 'production site' }),
+  ]
+}
+
+function ciWindowsCompleteGates(): Gate[] {
+  const observational = ciWindowsObservationalGates()
+    // The required production site replaces the observational MPA build; both
+    // VitePress modes write the same output directory and cannot overlap.
+    .filter(gate => gate.id !== 'build' && gate.id !== 'docs-site-build')
+    .map(gate => ({ ...gate, allowFailure: true }))
+  return [
+    pnpmScript('build', 'build'),
+    pnpmScript('windows-site', 'docs:build', { label: 'production site' }),
+    ...coverageGates(),
+    ...observational,
+  ]
+}
+
+function ciWindowsObservationalGates(): Gate[] {
+  return [
+    ...ciStaticGates({ ownsBuild: true }),
+    // Linux owns required lint and snapshots; Windows omits those duplicates.
+    pnpmScript('duplication', 'duplication'),
+    pnpmScript('publint', 'publint', { needs: ['build'] }),
+    pnpmScript('node-next-types', 'verify-node-next-types', {
+      label: 'node-next types',
+      needs: ['build'],
+    }),
+    builtPackageInvariantsGate(['build']),
+    builtBinSmokeGate(),
+  ]
+}
+
+function typertContractsGate(): Gate {
+  return pnpmScript('typert-contracts', 'build:lib:host', { label: 'Typert contracts' })
+}
+
+function lintGate(options: { needs?: string[] } = {}): Gate {
+  const raw = process.env.DSH_OXLINT_THREADS
+  const script = 'lint:contracts-ready'
+  return pnpmScript('lint', script, {
+    ...raw === undefined || raw === ''
+      ? {}
+      : { displayCommand: `DSH_OXLINT_THREADS=${raw} pnpm run ${script}` },
+    ...options.needs === undefined ? {} : { needs: options.needs },
+  })
+}
+
+// The heavy suites run uninstrumented beside the thresholded gate: their
+// compiler- and subprocess-bound fixtures pay a multiple of their runtime
+// under v8 instrumentation while contributing nothing the thresholds need
+// (membership rules in scripts/coverage-exempt.ts).
+//
+// DSH_COVERAGE_MAX_WORKERS is the lane's worker budget, so the two parallel
+// gates split it instead of each claiming it whole (the failover pool's
+// 8 x 6-instance bound assumes one lane never exceeds its value). The exempt
+// gate's wall clock is dominated by its longest single file, so it takes the
+// small share. A budget of 1 gives each gate 1 worker; lanes that need a
+// strict total of one (the serial reference jobs) also set
+// DSH_GATE_CONCURRENCY=1, which keeps the gates from overlapping at all.
+function coverageWorkerArgs(): { instrumented: string[]; exempt: string[] } {
+  const [flag] = positiveIntArg('DSH_COVERAGE_MAX_WORKERS', '--maxWorkers')
+  if (flag === undefined) return { instrumented: [], exempt: [] }
+  const total = Number.parseInt(flag.split('=')[1] ?? '', 10)
+  const exempt = Math.max(1, Math.floor(total / 3))
+  const instrumented = Math.max(1, total - exempt)
+  return {
+    instrumented: [`--maxWorkers=${String(instrumented)}`],
+    exempt: [`--maxWorkers=${String(exempt)}`],
   }
-  return pnpmScript('lint', 'lint', {
-    env: { NODE_OPTIONS: nodeOptions('--max-old-space-size=8192') },
-  })
 }
 
-function coverageGate(): Gate {
-  return pnpmExec('coverage', [
-    'vitest',
-    'run',
-    '--coverage',
-    ...positiveIntArg('DSH_COVERAGE_MAX_WORKERS', '--maxWorkers'),
-  ], {
-    label: 'test:coverage',
-    env: { DSH_EXAMPLE_MODE: 'lib' },
-    needs: ['build'],
-  })
+function coverageGates(): Gate[] {
+  const workers = coverageWorkerArgs()
+  return [
+    pnpmExec('coverage', [
+      'vitest',
+      'run',
+      '--coverage',
+      ...workers.instrumented,
+    ], {
+      label: 'test:coverage',
+      env: { [COVERAGE_EXEMPT_ENV]: '1' },
+    }),
+    pnpmExec('coverage-exempt-heavy', [
+      'vitest',
+      'run',
+      ...coverageExemptHeavySuites.map(suite => suite.filter),
+      ...workers.exempt,
+    ], {
+      label: 'test:coverage-exempt-heavy',
+    }),
+  ]
 }
 
-// The snapshot suite boots the example bins in `lib` mode (built artifact under plain Node,
-// plugins via real exports) — CI and pre-push already build, so they exercise what ships rather
-// than the tsx/source path dev uses. It therefore waits on `build`.
-function snapshotGate(): Gate {
+// Example and package snapshots boot their bins in `lib` mode (built artifacts under plain Node,
+// plugins via real exports); script snapshots execute their real source entry path.
+// Callers wait either on `build` or on a validation gate that transitively owns that build.
+function snapshotGate(needs: string[] = ['build']): Gate {
   return pnpmScript('snapshot', 'test:snapshot', {
     env: { DSH_EXAMPLE_MODE: 'lib' },
-    needs: ['build'],
+    needs,
+  })
+}
+
+function builtPackageInvariantsGate(needs?: string[]): Gate {
+  return pnpmScript('built-package-invariants', 'verify-built-package-invariants', {
+    label: 'built package invariants',
+    ...needs === undefined ? {} : { needs },
   })
 }
 
@@ -311,12 +544,23 @@ function positiveIntArg(envName: string, flag: string): string[] {
   return [`${flag}=${raw}`]
 }
 
+function flagEnabled(envName: string): boolean {
+  const raw = process.env[envName]
+  if (raw === undefined || raw === '') return false
+  if (raw !== '1') throw new Error(`run-gates: ${envName} must be 1 when set, got ${JSON.stringify(raw)}.`)
+  return true
+}
+
 function hygieneLeafGates(options: { artifactNeeds?: string[] } = {}): Gate[] {
   const artifactOptions = options.artifactNeeds === undefined ? {} : { needs: options.artifactNeeds }
   return [
+    pnpmScript('rescope-vendor', 'rescope-vendor:check', { label: 'vendor rescope' }),
     pnpmScript('knip', 'knip'),
     pnpmScript('publint', 'publint', artifactOptions),
     pnpmScript('constraints', 'constraints'),
+    pnpmScript('dsh-package-licenses', 'verify-dsh-package-licenses', { label: 'DSH package licenses' }),
+    pnpmScript('package-invariants', 'verify-package-invariants', { label: 'package invariants' }),
+    builtPackageInvariantsGate(options.artifactNeeds),
     pnpmScript('node-next-types', 'verify-node-next-types', {
       label: 'node-next types',
       ...artifactOptions,
@@ -325,15 +569,21 @@ function hygieneLeafGates(options: { artifactNeeds?: string[] } = {}): Gate[] {
 }
 
 function docSyncLeafGates(options: {
+  includeDocTypecheck?: boolean
   docTypecheckNeeds?: string[]
   docTypecheckEnv?: Record<string, string | undefined>
+  docTypecheckScript?: 'doc-typecheck' | 'doc-typecheck:contracts-ready'
+  docsBuildScript?: 'docs:build' | 'docs:build:mpa'
 } = {}): Gate[] {
   const docTypecheckOptions: Partial<Gate> = {}
   if (options.docTypecheckNeeds !== undefined) docTypecheckOptions.needs = options.docTypecheckNeeds
   if (options.docTypecheckEnv !== undefined) docTypecheckOptions.env = options.docTypecheckEnv
   return [
-    pnpmScript('doc-typecheck', 'doc-typecheck', docTypecheckOptions),
+    ...options.includeDocTypecheck === false
+      ? []
+      : [pnpmScript('doc-typecheck', options.docTypecheckScript ?? 'doc-typecheck', docTypecheckOptions)],
     pnpmScript('cordis-catalog', 'verify-cordis-catalog', { label: 'cordis catalog' }),
+    pnpmScript('client-catalog', 'verify-client-catalog', { label: 'client catalog' }),
     pnpmScript('export-jsdoc', 'verify-export-jsdoc', { label: 'export jsdoc' }),
     pnpmScript('tool-catalog', 'verify-tool-catalog', { label: 'tool catalog' }),
     pnpmScript('config-catalog', 'verify-config-catalog', { label: 'config catalog' }),
@@ -342,113 +592,170 @@ function docSyncLeafGates(options: {
     pnpmScript('scoped-events', 'verify-scoped-events', { label: 'scoped events' }),
     pnpmScript('markdown-wrap', 'verify-md-wrap', { label: 'markdown wrap' }),
     pnpmScript('markdown-links', 'verify-md-links', { label: 'markdown links' }),
+    pnpmScript('public-repository-links', 'verify-public-repository-links', { label: 'public repository links' }),
     pnpmScript('doc-refs', 'verify-doc-refs', { label: 'doc refs' }),
     pnpmScript('package-paths', 'verify-package-paths', { label: 'package paths' }),
+    pnpmScript('config-source-ownership', 'verify-config-source-ownership', { label: 'config source ownership' }),
     pnpmScript('package-readme-model-experience', 'verify-package-readme-model-experience', { label: 'package README model experience' }),
     pnpmScript('mermaid', 'verify-mermaid'),
     pnpmScript('agent-note-classification', 'verify-agent-note-classification', { label: 'agent note classification' }),
     pnpmScript('agent-note-format', 'verify-agent-note-format', { label: 'agent note format' }),
+    pnpmScript('archived-agent-notes', 'verify-archived-agent-notes', { label: 'archived agent notes' }),
     pnpmScript('type-equivalence', 'verify-type-equiv', { label: 'type equivalence' }),
+    pnpmScript('skill-invocation-metadata', 'verify-skill-invocation-metadata', { label: 'skill invocation metadata' }),
     pnpmScript('translation-prompt', 'verify-translation-prompt', { label: 'translation prompt' }),
     pnpmScript('translation-pairing', 'verify-translation-pairing', { label: 'translation pairing' }),
     pnpmScript('doc-budgets', 'verify-doc-budgets', { label: 'doc budgets' }),
-    // Keep the VitePress build in this single gate because projection rewrites website/.generated.
-    pnpmScript('docs-site', 'docs:check', { label: 'documentation site' }),
+    pnpmExec('docs-site-projection', ['vitest', 'run', 'scripts/project-doc-site.spec.ts', 'scripts/verify-doc-site-fragments.spec.ts'], {
+      label: 'documentation site checks',
+    }),
+    // Keep the VitePress build itself in one gate because projection rewrites website/.generated.
+    pnpmScript('docs-site-build', options.docsBuildScript ?? 'docs:build', { label: 'documentation build' }),
     pnpmScript('package-readme-limitations', 'verify-package-readme-limitations', { label: 'package README limitations' }),
   ]
 }
 
-function demoSmokeGate(options: { needs?: string[] } = {}): Gate {
-  const dependencyOptions = options.needs === undefined ? {} : { needs: options.needs }
-  return {
-    id: 'demo-smoke',
-    label: 'demo smoke',
-    displayCommand: 'pnpm run demo:echo',
-    ...pnpmInvocation(['run', 'demo:echo']),
-    input: 'echo ci smoke\n',
-    ...dependencyOptions,
-    verify: async (result) => {
-      const output = result.stdout + result.stderr
-      const sessionsRoot = join(root, '.sessions')
-      try {
-        if (!output.includes('[tool call] echo({"text":"ci smoke"})')) {
-          throw new Error('demo smoke did not show the echo tool call.')
-        }
-        if (!output.includes('[tool result] ECHO: CI SMOKE')) {
-          throw new Error('demo smoke did not show the echo tool result.')
-        }
-        const buckets = await readdir(sessionsRoot, { withFileTypes: true })
-        let found = false
-        for (const bucket of buckets) {
-          if (!bucket.isDirectory() || !bucket.name.startsWith('cwd-')) continue
-          const entries = await readdir(join(sessionsRoot, bucket.name))
-          if (entries.some(entry => /^main-session-.+\.jsonl\.zstd$/.test(entry))) {
-            found = true
-            break
-          }
-        }
-        if (!found) throw new Error('demo smoke did not create a main-session JSONL log in a cwd bucket.')
-      } finally {
-        await rm(sessionsRoot, { recursive: true, force: true })
-      }
-    },
-  }
-}
-
-function builtBinSmokeGate(): Gate {
+function builtBinSmokeGate(needs: string[] = ['build']): Gate {
   return pnpmExec('built-bin-smoke', [
     'vitest',
     'run',
     '--config',
     'vitest.e2e.config.ts',
-    'packages/examples/stdio-demo/tests/built-bin.e2e.ts',
-    'packages/examples/cli-demo/tests/built-bin.e2e.ts',
+    'examples/headless-agent/tests/keyless-smoke.e2e.ts',
+    'apps/cli/tests/built-bin.e2e.ts',
     'packages/examples/acp-demo/tests/built-bin.e2e.ts',
-    'packages/ui/jsonrpc/tests/built-scope-carrier.e2e.ts',
-    // The worker-entry packages' built bundles: the only automated proof
-    // that lib/index.js resolves its sibling lib/worker.cjs under plain node
-    // (the e2e lane runs unbuilt, so these files self-skip there).
-    'packages/workflow/workflow-workerthread/tests/built-worker.e2e.ts',
-    'packages/code-runtime/code-runtime-worker/tests/built-lib.e2e.ts',
+    'packages/host/directory-picker-native/tests/built-worker.e2e.ts',
+    'packages/sdk/server/tests/built-scope-carrier.e2e.ts',
+    'packages/subagent/subagent-codex/tests/loader-composition.e2e.ts',
+    'packages/subagent/subagent-claude-code/tests/loader-composition.e2e.ts',
+    'packages/api/remotes/tests/built-lib.e2e.ts',
+    // Built execution consumers: the only automated proof that package-name
+    // imports reach their lib/ entrypoints under plain Node. The e2e lane runs
+    // unbuilt, so these files self-skip there.
+    'packages/workflow/workflow-worker-thread/tests/built-worker.e2e.ts',
+    'packages/code-runtime/code-runtime-worker-thread/tests/built-lib.e2e.ts',
+    'packages/lsp/lsp-stdio/tests/built-lib.e2e.ts',
   ], {
     label: 'built-bin smoke',
-    needs: ['build'],
+    needs,
+    env: { DSH_EXAMPLE_MODE: 'lib' },
   })
 }
 
-async function runGates(allGates: Gate[], maxActive: number): Promise<GateResult[]> {
-  const states = new Map<string, GateStatus>(allGates.map(gate => [gate.id, 'pending']))
+/**
+ * Reject a gate list whose graph cannot be executed unambiguously.
+ * @param gates - complete aggregate to validate.
+ */
+function validateGateGraph(gates: readonly Gate[]): void {
+  if (gates.length === 0) throw new Error('run-gates: gate graph has no gates.')
+
+  const ids = new Set<string>()
+  for (const gate of gates) {
+    if (ids.has(gate.id)) throw new Error(`run-gates: duplicate gate id ${JSON.stringify(gate.id)}.`)
+    ids.add(gate.id)
+  }
+  for (const gate of gates) {
+    for (const dependency of gate.needs ?? []) {
+      if (!ids.has(dependency)) {
+        throw new Error(`run-gates: gate ${JSON.stringify(gate.id)} depends on unknown gate ${JSON.stringify(dependency)}.`)
+      }
+    }
+  }
+
+  const cycle = findDependencyCycle(gates)
+  if (cycle !== undefined) throw new Error(`run-gates: dependency cycle: ${cycle.join(' -> ')}.`)
+}
+
+function findDependencyCycle(gates: readonly Gate[]): string[] | undefined {
+  const byId = new Map(gates.map(gate => [gate.id, gate]))
+  const complete = new Set<string>()
+  const active = new Map<string, number>()
+  const path: string[] = []
+
+  const visit = (id: string): string[] | undefined => {
+    if (complete.has(id)) return undefined
+    const cycleStart = active.get(id)
+    if (cycleStart !== undefined) return [...path.slice(cycleStart), id]
+    const gate = byId.get(id)
+    if (gate === undefined) return undefined
+
+    active.set(id, path.length)
+    path.push(id)
+    for (const dependency of gate.needs ?? []) {
+      const cycle = visit(dependency)
+      if (cycle !== undefined) return cycle
+    }
+    path.pop()
+    active.delete(id)
+    complete.add(id)
+    return undefined
+  }
+
+  for (const gate of gates) {
+    const cycle = visit(gate.id)
+    if (cycle !== undefined) return cycle
+  }
+  return undefined
+}
+
+/**
+ * Validate and run one aggregate before the injected executor can start a child.
+ * @param gates - complete aggregate to execute.
+ * @param maxActive - maximum concurrent child count.
+ * @param execute - child-process executor.
+ * @param observe - result observer invoked when each gate settles.
+ * @returns results in aggregate order.
+ */
+export async function runGates(
+  gates: Gate[],
+  maxActive: number,
+  execute: GateExecutor,
+  observe: ResultObserver = () => {},
+): Promise<GateResult[]> {
+  validateGateGraph(gates)
+  if (!Number.isSafeInteger(maxActive) || maxActive < 1) {
+    throw new Error(`run-gates: max concurrency must be a positive integer, got ${JSON.stringify(maxActive)}.`)
+  }
+  const states = new Map<string, GateState>(gates.map(gate => [gate.id, 'pending']))
   const results = new Map<string, GateResult>()
   const running: RunningGate[] = []
 
   for (;;) {
     let madeProgress = false
     while (running.length < maxActive) {
-      const ready = allGates.find(gate => states.get(gate.id) === 'pending' && dependenciesPassed(gate, states))
+      const ready = gates.find(gate => states.get(gate.id) === 'pending' && dependenciesPassed(gate, states))
       if (ready === undefined) break
       states.set(ready.id, 'running')
-      running.push({ gate: ready, promise: runGate(ready) })
+      running.push({ gate: ready, promise: execute(ready) })
       console.log(`run-gates: start ${ready.label}`)
       madeProgress = true
     }
 
     if (running.length === 0) {
-      const pending = allGates.filter(gate => states.get(gate.id) === 'pending')
-      for (const gate of pending) {
-        const failedDeps = (gate.needs ?? []).filter(id => states.get(id) !== 'passed')
+      let pending = gates.filter(gate => states.get(gate.id) === 'pending')
+      while (pending.length > 0) {
+        const gate = pending.find(item => (item.needs ?? []).some((id) => {
+          const state = states.get(id)
+          return state === 'failed' || state === 'skipped'
+        }))
+        if (gate === undefined) throw new Error('run-gates: validated graph stalled without a failed dependency.')
+        const failedDeps = (gate.needs ?? []).filter((id) => {
+          const state = states.get(id)
+          return state === 'failed' || state === 'skipped'
+        })
         const result: GateResult = {
           gate,
           status: 'skipped',
           durationMs: 0,
-          stdout: '',
-          stderr: '',
           output: [],
           exitCode: null,
+          signalCode: null,
           error: `dependency failed or skipped: ${failedDeps.join(', ')}`,
         }
         states.set(gate.id, 'skipped')
         results.set(gate.id, result)
-        printResult(result)
+        observe(result)
+        pending = pending.filter(item => item !== gate)
       }
       break
     }
@@ -458,29 +765,35 @@ async function runGates(allGates: Gate[], maxActive: number): Promise<GateResult
       running.splice(running.indexOf(settled.item), 1)
       states.set(settled.item.gate.id, settled.result.status)
       results.set(settled.item.gate.id, settled.result)
-      printResult(settled.result)
+      observe(settled.result)
     }
   }
 
-  return allGates.map((gate) => {
+  return gates.map((gate) => {
     const result = results.get(gate.id)
     if (result === undefined) throw new Error(`run-gates: missing result for ${gate.id}.`)
     return result
   })
 }
 
-function dependenciesPassed(gate: Gate, states: Map<string, GateStatus>): boolean {
+function dependenciesPassed(gate: Gate, states: Map<string, GateState>): boolean {
   return (gate.needs ?? []).every(id => states.get(id) === 'passed')
 }
 
-async function runGate(gate: Gate): Promise<GateResult> {
+/**
+ * Execute one gate through the real shell-free child-process boundary.
+ * @param gate - command and scheduler environment to execute.
+ * @returns the complete process outcome.
+ */
+export async function runGate(gate: Gate): Promise<GateResult> {
   const started = performance.now()
-  let stdout = ''
-  let stderr = ''
   const output: GateOutputChunk[] = []
   let spawnError: string | undefined
 
-  const exitCode = await new Promise<number | null>((resolveExit) => {
+  const outcome = await new Promise<{
+    exitCode: number | null
+    signalCode: NodeJS.Signals | null
+  }>((resolveExit) => {
     const child = spawn(gate.command, gate.args, {
       cwd: root,
       env: { ...process.env, ...gate.env },
@@ -489,47 +802,50 @@ async function runGate(gate: Gate): Promise<GateResult> {
     child.stdout.setEncoding('utf8')
     child.stderr.setEncoding('utf8')
     child.stdout.on('data', (chunk: string) => {
-      stdout += chunk
       output.push({ stream: 'stdout', text: chunk })
     })
     child.stderr.on('data', (chunk: string) => {
-      stderr += chunk
       output.push({ stream: 'stderr', text: chunk })
     })
     child.on('error', (error) => {
       spawnError = `failed to start command: ${error.message}`
-      resolveExit(null)
+      resolveExit({ exitCode: null, signalCode: null })
     })
-    child.on('close', resolveExit)
-    if (gate.input !== undefined) child.stdin.end(gate.input)
-    else child.stdin.end()
+    child.on('close', (exitCode, signalCode) => {
+      resolveExit({ exitCode, signalCode })
+    })
+    child.stdin.end()
   })
+  const { exitCode, signalCode } = outcome
 
-  let status: GateStatus = exitCode === 0 && spawnError === undefined ? 'passed' : 'failed'
-  let error = spawnError
-  if (status === 'passed' && gate.verify !== undefined) {
-    try {
-      await gate.verify({ gate, status, durationMs: performance.now() - started, stdout, stderr, output, exitCode })
-    } catch (verifyError: unknown) {
-      status = 'failed'
-      error = verifyError instanceof Error ? verifyError.message : String(verifyError)
-    }
-  }
-
+  const status: GateResultStatus = exitCode === 0 && signalCode === null && spawnError === undefined ? 'passed' : 'failed'
   const result: GateResult = {
     gate,
     status,
     durationMs: performance.now() - started,
-    stdout,
-    stderr,
     output,
     exitCode,
+    signalCode,
   }
-  if (error !== undefined) result.error = error
+  if (spawnError !== undefined) result.error = spawnError
   return result
 }
 
+/**
+ * Format every independently observed failure fact for the aggregate summary.
+ * @param result - unsuccessful gate result.
+ * @returns error, exit, and signal facts without allowing one to hide another.
+ */
+export function formatGateResultReason(result: GateResult): string {
+  const facts: string[] = []
+  if (result.error !== undefined) facts.push(result.error)
+  if (result.exitCode !== null) facts.push(`exit ${result.exitCode}`)
+  if (result.signalCode !== null) facts.push(`signal ${result.signalCode}`)
+  return facts.length === 0 ? 'no exit code or signal' : facts.join(', ')
+}
+
 function printResult(result: GateResult): void {
+  const verbose = process.env.DSH_GATE_VERBOSE === '1'
   const seconds = (result.durationMs / 1000).toFixed(2)
   if (result.status === 'passed' && !verbose) {
     console.log(`run-gates: PASS ${result.gate.label} (${seconds}s)`)
@@ -539,9 +855,11 @@ function printResult(result: GateResult): void {
   const heading = `${result.status.toUpperCase()} ${result.gate.label} (${seconds}s)`
   const writeHeading = result.status === 'passed' ? console.log : console.error
   writeHeading(`\n== ${heading} ==`)
-  if (result.status !== 'passed') console.error(`command: ${result.gate.displayCommand}`)
+  if (result.status !== 'passed') {
+    console.error(`command: ${result.gate.displayCommand}`)
+    console.error(`outcome: ${formatGateResultReason(result)}`)
+  }
   printOutput(result.output)
-  if (result.error !== undefined) console.error(result.error)
 }
 
 function printSummary(results: GateResult[], durationMs: number): void {
@@ -557,8 +875,9 @@ function printSummary(results: GateResult[], durationMs: number): void {
   console.error('run-gates: unsuccessful gates:')
   for (const result of unsuccessful) {
     const duration = (result.durationMs / 1000).toFixed(2)
-    const reason = result.error ?? (result.exitCode === null ? 'no exit code' : `exit ${result.exitCode}`)
-    console.error(`  - ${result.status.toUpperCase()} ${result.gate.label} (${duration}s, ${reason})`)
+    const reason = formatGateResultReason(result)
+    const disposition = result.gate.allowFailure === true ? 'NON-BLOCKING ' : ''
+    console.error(`  - ${disposition}${result.status.toUpperCase()} ${result.gate.label} (${duration}s, ${reason})`)
     console.error(`    ${result.gate.displayCommand}`)
   }
 }

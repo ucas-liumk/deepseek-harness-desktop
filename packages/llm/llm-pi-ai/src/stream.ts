@@ -8,7 +8,7 @@
  * @module dsh-llm-pi-ai/stream
  */
 
-import { CallId, CONTEXT_WINDOW_EXCEEDED_CODE, isContextWindowExceededError, LlmError } from '@deepseek-ai/dsh-llm'
+import { CallId, CONTEXT_WINDOW_EXCEEDED_CODE, EMPTY_RESPONSE_CODE, isContextWindowExceededError, isQuotaExceededError, LlmError, QUOTA_EXCEEDED_CODE } from '@deepseek-ai/dsh-llm'
 import type { FinishReason, StreamChunk, TokenUsage } from '@deepseek-ai/dsh-llm'
 import { isContextOverflow } from '@earendil-works/pi-ai'
 import type { AssistantMessage, AssistantMessageEvent, Usage as PiUsage } from '@earendil-works/pi-ai'
@@ -28,11 +28,36 @@ export function mapUsage(usage: PiUsage): TokenUsage {
   }
 }
 
+// XXX(pi-ai upstream): pi-ai flattens the caught error to `error.message`
+// (api/anthropic-messages.js: `errorMessage = error instanceof Error ?
+// error.message : JSON.stringify(error)`), discarding the original Error and its
+// `cause` chain before it reaches us. undici carries the actionable transport
+// detail on `cause` (e.g. `SocketError: other side closed`) but hands the fetch
+// wrapper a bare `terminated`, so we are left pattern-matching terse words here.
+// If pi-ai ever forwards the original Error (or a fetch/dispatcher hook that lets
+// us capture the cause ourselves), classify on `code`/`cause` instead of text.
 function classifyPiAiError(message: string): string {
   if (/\b(?:401|403)\b/.test(message)) return 'AUTH'
+  if (isQuotaExceededError(message)) return QUOTA_EXCEEDED_CODE
   if (/\b429\b|rate.?limit/i.test(message)) return 'RATE_LIMIT'
   if (/\b400\b|invalid.?request/i.test(message)) return 'INVALID_REQUEST'
   if (/\b5\d\d\b/.test(message)) return 'SERVER'
+  if (/\btime(?:d)?\s*out\b|timeout/i.test(message)) return 'TIMEOUT'
+  // A stream truncated before the provider's terminal event: each pi-ai provider
+  // throws its own wording when the wire closes mid-response without a terminal
+  // event (`… stream ended before message_stop`, `… before a terminal response
+  // event`, `… ended without a terminal event`, `Stream ended without
+  // finish_reason`). The connection dropped mid-response, so this is a transport
+  // truncation, not a model-level error.
+  if (/stream ended (?:before|without)\b/i.test(message)) return 'TRANSPORT'
+  if (/\b(?:network|connection|socket|fetch)\b|\bECONN[A-Z]+\b/i.test(message)
+    || /\b(?:other side closed|HTTP2 request did not get a response|WebSocket closed unexpectedly)\b/i.test(message)
+    // undici renders a mid-stream socket drop as a bare `terminated` (its
+    // `cause` — the real SocketError — was flattened away upstream); Node's
+    // stream layer says `Premature close`.
+    || /\bterminated\b|premature close/i.test(message)) {
+    return 'TRANSPORT'
+  }
   return 'PI_AI_ERROR'
 }
 
@@ -42,7 +67,8 @@ function classifyPiAiError(message: string): string {
  * @param contextWindow - resolved catalog capacity for usage-based overflow detection.
  * @returns the mapped harness reason. Recognized error text, `stop` usage above
  *   `contextWindow`, and zero-output `length` usage that fills the window map
- *   to `CONTEXT_WINDOW_EXCEEDED`.
+ *   to `CONTEXT_WINDOW_EXCEEDED`; a `stop` with no content blocks maps to an
+ *   `EMPTY_RESPONSE` error.
  */
 export function mapStopReason(message: AssistantMessage, contextWindow?: number): FinishReason {
   const piAiOverflow = isContextOverflow(message, contextWindow)
@@ -52,19 +78,36 @@ export function mapStopReason(message: AssistantMessage, contextWindow?: number)
   if (piAiOverflow || harnessOverflow) {
     return {
       kind: 'error',
-      message: message.errorMessage ?? `pi-ai detected context overflow for model "${message.model}"`,
-      code: CONTEXT_WINDOW_EXCEEDED_CODE,
+      failure: {
+        message: message.errorMessage ?? `pi-ai detected context overflow for model "${message.model}"`,
+        code: CONTEXT_WINDOW_EXCEEDED_CODE,
+      },
     }
   }
 
   switch (message.stopReason) {
-    case 'stop': return { kind: 'stop' }
+    case 'stop':
+      // A terminal stop that produced no content blocks is a degenerate
+      // provider completion, not a successful (empty) assistant message.
+      if (message.content.length === 0) {
+        return {
+          kind: 'error',
+          failure: {
+            message: `model "${message.model}" returned a completed response with no content`,
+            code: EMPTY_RESPONSE_CODE,
+          },
+        }
+      }
+      return { kind: 'stop' }
     case 'length': return { kind: 'max-tokens' }
     case 'toolUse': return { kind: 'tool-calls' }
-    case 'aborted': return { kind: 'aborted' }
+    case 'aborted': return {
+      kind: 'aborted',
+      failure: { message: message.errorMessage ?? 'pi-ai stream aborted', code: 'ABORTED' },
+    }
     case 'error': {
       const text = message.errorMessage ?? 'pi-ai stream error'
-      return { kind: 'error', message: text, code: classifyPiAiError(text) }
+      return { kind: 'error', failure: { message: text, code: classifyPiAiError(text) } }
     }
   }
 }

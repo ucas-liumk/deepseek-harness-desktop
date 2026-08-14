@@ -11,7 +11,8 @@ interface ProjectGraph {
   options: ts.CompilerOptions
 }
 
-const configHost: ts.ParseConfigFileHost = {
+/** TypeScript config host shared by repository scripts. */
+export const repositoryConfigHost: ts.ParseConfigFileHost = {
   useCaseSensitiveFileNames: ts.sys.useCaseSensitiveFileNames,
   readDirectory: (...args) => ts.sys.readDirectory(...args),
   fileExists: fileName => ts.sys.fileExists(fileName),
@@ -22,9 +23,13 @@ const configHost: ts.ParseConfigFileHost = {
   },
 }
 
-/** Parse a root tsconfig and flatten all referenced projects into one semantic graph. */
+/**
+ * Parse the host aggregate tsconfig and flatten all referenced projects into one
+ * semantic graph. Never seed the root solution: flattening host+client into one
+ * program collides the cordis Context merges.
+ */
 function loadProjectGraph(projectRoot: string): ProjectGraph {
-  const rootConfigPath = resolve(projectRoot, 'tsconfig.json')
+  const rootConfigPath = resolve(projectRoot, 'tsconfig.host.json')
   const rootConfig = parseConfig(rootConfigPath)
   const rootNames = new Set<string>()
   const visited = new Set<string>()
@@ -48,7 +53,7 @@ function loadProjectGraph(projectRoot: string): ProjectGraph {
 
 /** Parse one config file and fail loud on any config diagnostic. */
 function parseConfig(configPath: string): ts.ParsedCommandLine {
-  const parsed = ts.getParsedCommandLineOfConfigFile(configPath, {}, configHost)
+  const parsed = ts.getParsedCommandLineOfConfigFile(configPath, {}, repositoryConfigHost)
   if (!parsed) throw new Error(`cannot parse TypeScript config ${configPath}`)
   if (parsed.errors.length > 0) {
     throw new Error(parsed.errors.map(error => ts.flattenDiagnosticMessageText(error.messageText, '\n')).join('\n'))

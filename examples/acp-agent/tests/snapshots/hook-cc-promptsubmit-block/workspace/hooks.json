@@ -2,6 +2,7 @@
   "hooks": {
     "UserPromptSubmit": [
       {
+        "matcher": "[",
         "hooks": [
           { "type": "command", "command": "echo 'blocked by policy hook' >&2; exit 2" }
         ]

@@ -14,7 +14,7 @@ import { canonicalPath, writableRoots } from '@deepseek-ai/dsh-sandbox'
 describe('canonicalPath', () => {
   it('resolves symlinks (an existing path realpaths)', () => {
     const dir = mkdtempSync(join(tmpdir(), 'dsh-roots-'))
-    expect(canonicalPath(dir)).toBe(realpathSync(dir))
+    expect(canonicalPath(dir)).toBe(realpathSync.native(dir))
   })
 
   it('returns the spelling as-is when the path cannot be resolved (conservative — matches nothing until it exists)', () => {
@@ -30,9 +30,9 @@ describe('writableRoots', () => {
   it('workspace-write grants the workspace root plus the platform temp areas, canonical and deduplicated', () => {
     const ws = mkdtempSync(join(tmpdir(), 'dsh-ws-'))
     const roots = writableRoots({ mode: 'workspace-write', workspaceRoot: ws })
-    expect(roots).toContain(realpathSync(ws))
+    expect(roots).toContain(realpathSync.native(ws))
     expect(roots).toContain(canonicalPath('/tmp'))
-    expect(roots).toContain(realpathSync(tmpdir()))
+    expect(roots).toContain(realpathSync.native(tmpdir()))
     // Deduplicated after canonicalization (/tmp and os.tmpdir() may coincide).
     expect(new Set(roots).size).toBe(roots.length)
   })

@@ -151,7 +151,7 @@ try {
     cwd: root,
     stdio: 'pipe',
   })
-  console.log(`verify-node-next-types: ${packages.length} workspace package declaration surface(s) compile under NodeNext.`)
+  console.log(`verify-node-next-types: ${packages.length} workspace package declaration API(s) compile under NodeNext.`)
 } catch (error: unknown) {
   failed = true
   const output = error as { stdout?: Buffer; stderr?: Buffer }

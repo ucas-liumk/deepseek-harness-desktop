@@ -1,65 +1,38 @@
 /**
- * Decode an SSE byte stream into event `data` payloads. Network reads may split UTF-8 or lines;
- * CRLF, comments, non-data fields, and multi-data events are handled per SSE rules. The literal
- * `[DONE]` is yielded so the caller owns final flushing, and EOF before it raises {@link LlmError}.
+ * Decode an SSE byte stream into event `data` payloads. Framing — chunk
+ * reassembly, UTF-8/CRLF/BOM handling, comment and non-data field skipping,
+ * multi-`data:` joining — is `eventsource-parser`'s. Comments are reported
+ * only through an optional transport-activity callback. This module keeps the
+ * DeepSeek protocol: the literal `[DONE]` is yielded so the caller owns final
+ * flushing, and EOF before it raises {@link LlmError}. Framing is spec-strict:
+ * an event dispatches only on its blank-line terminator, so an unterminated
+ * tail at EOF is truncation, not a flushable payload.
  *
- * Minimal SSE (text/event-stream) parser for the chat-completions stream.
  * @module dsh-llm-deepseek/sse
  */
 
+import { EventSourceParserStream } from 'eventsource-parser/stream'
 import { LlmError } from '@deepseek-ai/dsh-llm'
 
 /** The terminal payload DeepSeek (and OpenAI) send after the last chunk. */
 export const DONE = '[DONE]'
 
-/** Extract the joined data payload from one raw SSE event block. */
-function eventData(block: string): string | undefined {
-  const data: string[] = []
-  for (const rawLine of block.split('\n')) {
-    const line = rawLine.endsWith('\r') ? rawLine.slice(0, -1) : rawLine
-    if (line.startsWith('data:')) {
-      // The spec strips ONE leading space after the colon.
-      data.push(line.startsWith('data: ') ? line.slice(6) : line.slice(5))
-    }
-    // Comments (':…') and other fields (event:, id:, retry:) are ignored.
-  }
-  if (data.length === 0) return undefined
-  return data.join('\n')
-}
-
 /**
- * Parse a byte stream into SSE data payloads. Yields `[DONE]` as the final
+ * Parse an SSE byte stream into data payloads. Yields `[DONE]` as the final
  * value and returns; throws `LlmError('STREAM_CLOSED')` when the stream ends
  * without it (truncated response — the model call cannot be trusted).
  * @param stream - raw SSE bytes; reads may split anywhere, including mid-UTF-8 sequence.
+ * @param onComment - optional transport-activity callback; comments never enter the yielded payload stream.
  * @returns each event's data payload in arrival order, the `[DONE]` sentinel last.
  */
-export async function* parseSse(stream: AsyncIterable<Uint8Array>): AsyncGenerator<string> {
-  const decoder = new TextDecoder()
-  let buffer = ''
-
-  for await (const bytes of stream) {
-    buffer += decoder.decode(bytes, { stream: true })
-    // Events are separated by a blank line (\n\n; tolerate \r\n\r\n via the
-    // per-line \r strip in eventData and a normalized split here).
-    let boundary: number
-    while ((boundary = buffer.search(/\r?\n\r?\n/)) !== -1) {
-      const matched = /\r?\n\r?\n/.exec(buffer.slice(boundary))
-      const block = buffer.slice(0, boundary)
-      // matched cannot be null: search() just found the same pattern at 0.
-      buffer = buffer.slice(boundary + (matched as RegExpExecArray)[0].length)
-      const data = eventData(block)
-      if (data === undefined) continue
-      yield data
-      if (data === DONE) return
-    }
-  }
-
-  // Flush any final un-terminated event (servers usually end with \n\n, but
-  // a trailing block without one is still parseable).
-  buffer += decoder.decode()
-  const data = eventData(buffer)
-  if (data !== undefined) {
+export async function* parseSse(
+  stream: ReadableStream<BufferSource>,
+  onComment?: (comment: string) => void,
+): AsyncGenerator<string> {
+  const events = stream
+    .pipeThrough(new TextDecoderStream())
+    .pipeThrough(new EventSourceParserStream({ onComment }))
+  for await (const { data } of events) {
     yield data
     if (data === DONE) return
   }

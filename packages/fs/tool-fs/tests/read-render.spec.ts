@@ -6,7 +6,7 @@
  */
 
 import { describe, expect, it } from 'vitest'
-import { buildWindow, READ_MAX_BYTES, READ_MAX_LINE_LENGTH } from '../src/read-render.ts'
+import { buildWindow, langFromPath, readMetaFromMeta, READ_MAX_BYTES, READ_MAX_LINE_LENGTH } from '../src/read-render.ts'
 import type { ReadWindow } from '../src/read-render.ts'
 
 const DEFAULT_CAPS = { maxLineLength: READ_MAX_LINE_LENGTH, maxBytes: READ_MAX_BYTES }
@@ -86,6 +86,7 @@ describe('buildWindow', () => {
     it('caps output at a custom maxBytes', async () => {
       const result = await buildWindow(whole('aaaa\nbbbb\ncccc'), { offset: 1, limit: 10, maxLineLength: 2000, maxBytes: 9 }, 'f')
       expect(result.lines.map(l => l.text)).toEqual(['aaaa', 'bbbb'])
+      expect(result.totalLines).toBe(3)
       expect(result.truncatedByBytes).toBe(true)
     })
   })
@@ -105,6 +106,7 @@ describe('buildWindow', () => {
     it('caps output bytes mid-stream', async () => {
       const big = Array.from({ length: 2000 }, () => 'y'.repeat(100)).join('\n')
       const result = await buildWindow(chunked(big, 512), READ_ALL, 'f')
+      expect(result.totalLines).toBe(2000)
       expect(result.truncatedByBytes).toBe(true)
     })
 
@@ -112,5 +114,105 @@ describe('buildWindow', () => {
       const result = await buildWindow(chunked('one\ntwo\n', 3), READ_ALL, 'f')
       expect(result.lines.map(l => l.text)).toEqual(['one', 'two'])
     })
+  })
+})
+
+describe('langFromPath', () => {
+  it('maps a known extension to its language hint, case-insensitively', () => {
+    expect(langFromPath('src/a.ts')).toBe('ts')
+    expect(langFromPath('src/a.TSX')).toBe('tsx')
+    expect(langFromPath('/abs/module.mjs')).toBe('js')
+    expect(langFromPath('conf.yml')).toBe('yaml')
+    expect(langFromPath('README.md')).toBe('md')
+  })
+
+  it('reads the extension after the last path segment and last dot', () => {
+    expect(langFromPath('a.py.bak')).toBeUndefined()
+    expect(langFromPath('archive.tar.gz')).toBeUndefined()
+    expect(langFromPath('/dir.py/plain')).toBeUndefined()
+    expect(langFromPath('C:\\src\\main.rs')).toBe('rs')
+  })
+
+  it('returns undefined for a dotfile, an extensionless name, and an unknown extension', () => {
+    expect(langFromPath('.gitignore')).toBeUndefined()
+    expect(langFromPath('/etc/hosts')).toBeUndefined()
+    expect(langFromPath('data.unknownext')).toBeUndefined()
+    expect(langFromPath('trailingdot.')).toBeUndefined()
+  })
+
+  it('returns undefined for a filename whose extension is an Object.prototype key', () => {
+    // Own-property lookup only: these must not resolve to the inherited member
+    // (a function/object), which would fail the tool-output JSON validation.
+    expect(langFromPath('foo.constructor')).toBeUndefined()
+    expect(langFromPath('foo.__proto__')).toBeUndefined()
+    expect(langFromPath('foo.toString')).toBeUndefined()
+    expect(langFromPath('foo.hasOwnProperty')).toBeUndefined()
+  })
+})
+
+describe('readMetaFromMeta', () => {
+  const good = { path: '/abs/a.ts', offset: 1, lines: [{ number: 1, text: 'x' }], totalLines: 1, lang: 'ts' }
+
+  it('narrows a well-formed read meta, with and without a lang hint', () => {
+    expect(readMetaFromMeta(good)).toEqual(good)
+    const noLang = { path: '/abs/a', offset: 1, lines: [], totalLines: 0 }
+    expect(readMetaFromMeta(noLang)).toEqual(noLang)
+  })
+
+  it('narrows an empty window at a positive offset (byte cap below the first selected line)', () => {
+    const empty = { path: '/abs/a', offset: 5, lines: [], totalLines: 9 }
+    expect(readMetaFromMeta(empty)).toEqual(empty)
+  })
+
+  it('returns undefined for absent, non-object, or array meta', () => {
+    expect(readMetaFromMeta(undefined)).toBeUndefined()
+    expect(readMetaFromMeta(null)).toBeUndefined()
+    expect(readMetaFromMeta('nope')).toBeUndefined()
+    expect(readMetaFromMeta([good])).toBeUndefined()
+  })
+
+  it('returns undefined when a field is missing or the wrong type (defensive narrowing)', () => {
+    expect(readMetaFromMeta({ ...good, path: 5 })).toBeUndefined()
+    expect(readMetaFromMeta({ ...good, offset: '1' })).toBeUndefined()
+    expect(readMetaFromMeta({ ...good, totalLines: '1' })).toBeUndefined()
+    expect(readMetaFromMeta({ ...good, lines: 'nope' })).toBeUndefined()
+    expect(readMetaFromMeta({ ...good, lines: [{ number: '1', text: 'x' }] })).toBeUndefined()
+    expect(readMetaFromMeta({ ...good, lines: [{ number: 1 }] })).toBeUndefined()
+    expect(readMetaFromMeta({ ...good, lines: [null] })).toBeUndefined()
+    expect(readMetaFromMeta({ ...good, lang: 5 })).toBeUndefined()
+  })
+
+  it('rejects an offset that is not a 1-based integer', () => {
+    expect(readMetaFromMeta({ ...good, offset: 0 })).toBeUndefined()
+    expect(readMetaFromMeta({ ...good, offset: 1.5 })).toBeUndefined()
+    expect(readMetaFromMeta({ ...good, offset: NaN })).toBeUndefined()
+    expect(readMetaFromMeta({ ...good, offset: Infinity })).toBeUndefined()
+  })
+
+  it('rejects a first line number below offset', () => {
+    expect(readMetaFromMeta({ ...good, offset: 2, lines: [{ number: 1, text: 'x' }], totalLines: 2 })).toBeUndefined()
+  })
+
+  it('rejects a line number that is not a 1-based integer', () => {
+    expect(readMetaFromMeta({ ...good, lines: [{ number: 0, text: 'x' }], totalLines: 1 })).toBeUndefined()
+    expect(readMetaFromMeta({ ...good, lines: [{ number: 1.5, text: 'x' }], totalLines: 2 })).toBeUndefined()
+    expect(readMetaFromMeta({ ...good, lines: [{ number: NaN, text: 'x' }], totalLines: 1 })).toBeUndefined()
+    expect(readMetaFromMeta({ ...good, lines: [{ number: Infinity, text: 'x' }], totalLines: 1 })).toBeUndefined()
+  })
+
+  it('rejects a totalLines that is not a non-negative integer', () => {
+    expect(readMetaFromMeta({ ...good, totalLines: -1 })).toBeUndefined()
+    expect(readMetaFromMeta({ ...good, totalLines: 1.5 })).toBeUndefined()
+    expect(readMetaFromMeta({ ...good, totalLines: NaN })).toBeUndefined()
+  })
+
+  it('rejects lines that do not strictly increase or exceed totalLines', () => {
+    const twoLines = { path: '/abs/a', offset: 1, lang: 'ts' }
+    // Duplicate line numbers.
+    expect(readMetaFromMeta({ ...twoLines, lines: [{ number: 1, text: 'a' }, { number: 1, text: 'b' }], totalLines: 2 })).toBeUndefined()
+    // Out-of-order line numbers.
+    expect(readMetaFromMeta({ ...twoLines, lines: [{ number: 2, text: 'b' }, { number: 1, text: 'a' }], totalLines: 2 })).toBeUndefined()
+    // A line number past totalLines.
+    expect(readMetaFromMeta({ ...twoLines, lines: [{ number: 3, text: 'c' }], totalLines: 2 })).toBeUndefined()
   })
 })

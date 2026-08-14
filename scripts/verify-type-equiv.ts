@@ -4,12 +4,16 @@
  * declaration; `public-api` entries preserve a class's body-stripped public
  * declaration. Blocks and entries have a one-to-one relationship; comparison
  * ignores whitespace and non-JSDoc comments but preserves declaration
- * structure and every original JSDoc comment.
+ * structure and every original JSDoc comment. Byte-identical `.zh.md` blocks
+ * reuse the manifest-backed check of their unsuffixed sibling.
  */
 
 import { globSync, readFileSync, existsSync } from 'node:fs'
 import { resolve, sep } from 'node:path'
 import ts from 'typescript'
+import { markdownFences } from './markdown.ts'
+import { partitionPairedMarkdownDerivatives } from './paired-markdown-derivatives.ts'
+import { isArchivedAgentNotePath } from './repo-files.ts'
 
 const root = resolve(import.meta.dirname, '..')
 
@@ -78,42 +82,27 @@ function blockSymbol(code: string): string | null {
 
 /** Extract every source-equivalence block from one Markdown file. */
 function extractEquivBlocks(docRel: string): EquivBlock[] {
-  const text = readFileSync(resolve(root, docRel), 'utf8')
-  const lines = text.split('\n')
   const blocks: EquivBlock[] = []
-  let open: { line: number; body: string[]; projection?: 'public-api' } | null = null
-
-  for (let i = 0; i < lines.length; i++) {
-    const raw = lines[i] ?? ''
-    const fence = /^```(\s*)(\S.*)?$/.exec(raw)
-    if (!fence) {
-      if (open) open.body.push(raw)
-      continue
+  for (const fence of markdownFences(readFileSync(resolve(root, docRel), 'utf8'))) {
+    if (fence.info === 'ts type-equiv public-api') {
+      throw new Error(`verify-type-equiv: ${docRel}:${fence.line} — use the concise \`ts public-api\` fence`)
     }
-    if (open) {
-      const code = open.body.join('\n')
-      const symbol = blockSymbol(code)
-      if (!symbol) {
-        throw new Error(`verify-type-equiv: ${docRel}:${open.line} — type-equiv block has no parseable interface/type/class declaration`)
-      }
-      blocks.push({
-        doc: docRel,
-        line: open.line,
-        symbol,
-        code,
-        ...(open.projection === undefined ? {} : { projection: open.projection }),
-      })
-      open = null
-      continue
+    if (fence.info !== 'ts type-equiv' && fence.info !== 'ts public-api') continue
+    if (!fence.closed) {
+      throw new Error(`verify-type-equiv: ${docRel}:${fence.line} — unterminated type-equivalence fence (missing closing \`\`\`)`)
     }
-    const info = (fence[2] ?? '').trim()
-    if (info === 'ts type-equiv public-api') {
-      throw new Error(`verify-type-equiv: ${docRel}:${i + 1} — use the concise \`ts public-api\` fence`)
+    const symbol = blockSymbol(fence.code)
+    if (symbol === null) {
+      throw new Error(`verify-type-equiv: ${docRel}:${fence.line} — type-equiv block has no parseable interface/type/class declaration`)
     }
-    if (info === 'ts type-equiv') open = { line: i + 1, body: [] }
-    if (info === 'ts public-api') open = { line: i + 1, body: [], projection: 'public-api' }
+    blocks.push({
+      doc: docRel,
+      line: fence.line,
+      symbol,
+      code: fence.code,
+      ...(fence.info === 'ts public-api' ? { projection: 'public-api' as const } : {}),
+    })
   }
-  if (open) throw new Error(`verify-type-equiv: ${docRel}:${open.line} — unterminated type-equiv block`)
   return blocks
 }
 
@@ -221,9 +210,17 @@ const keyOf = (x: { doc: string; symbol: string; projection?: 'public-api' }): s
 // as an orphan rather than silently skipped.
 const docSet = new Set<string>()
 for (const pattern of MARKDOWN_GLOBS) {
-  for (const match of globSync(pattern, { cwd: root })) docSet.add(match.split(sep).join('/'))
+  for (const match of globSync(pattern, { cwd: root })) {
+    const normalized = match.split(sep).join('/')
+    if (!isArchivedAgentNotePath(normalized)) docSet.add(normalized)
+  }
 }
-const blocks: EquivBlock[] = [...docSet].sort().flatMap(extractEquivBlocks)
+const extractedBlocks: EquivBlock[] = [...docSet].sort().flatMap(extractEquivBlocks)
+const { primary: blocks, derivatives } = partitionPairedMarkdownDerivatives(
+  extractedBlocks,
+  block => block.doc,
+  block => `${block.projection ?? 'declaration'}\0${block.code}`,
+)
 
 const errors: string[] = []
 // A manifest entry naming a doc that does not exist (or is outside the scanned
@@ -299,11 +296,11 @@ for (const e of entries) {
 }
 
 if (errors.length === 0) {
-  console.log(`verify-type-equiv: ${verified} type-equiv block(s) match source structure and JSDoc (1:1 with manifest).`)
+  console.log(`verify-type-equiv: ${verified} type-equiv block(s) match source structure and JSDoc (1:1 with manifest); ${derivatives.length} paired derivative(s).`)
   process.exit(0)
 }
 
 console.error('verify-type-equiv: type-equiv verification failed:')
 for (const e of errors) console.error(`  ${e}`)
-console.error(`\n(checked ${blocks.length} block(s) across ${new Set(blocks.map(b => b.doc)).size} doc(s); manifest at scripts/type-equiv.manifest.json)`)
+console.error(`\n(checked ${blocks.length} primary block(s) across ${new Set(blocks.map(b => b.doc)).size} doc(s), ${derivatives.length} paired derivative(s); manifest at scripts/type-equiv.manifest.json)`)
 process.exit(1)

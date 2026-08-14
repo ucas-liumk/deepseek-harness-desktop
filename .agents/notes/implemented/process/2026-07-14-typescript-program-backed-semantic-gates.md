@@ -30,6 +30,8 @@ The wrapper owns config diagnostics, semantic compiler options, repository-relat
 
 Context and agent-dispatch calls contribute only finite string-literal event sets. Direct `EventsService.dispatch()` calls recover the event slot through array literals, constant aliases, conditional branches, and resolved call sites of non-exported local helpers. Generic forwarding parameters are not concrete producers: attribution stays with the call sites that supply a closed event value.
 
+Semantic queries run only where a branch can consume them: calls are prefiltered by the closed event-API method-name set before receiver classification, and helper call sites are indexed on demand instead of eagerly resolving every call in every package source. The demand-driven index proves locality per helper — a helper that is non-exported, sits in a real ES module, and whose every same-file reference is a direct callee has all of its calls in that file by module scoping, so only that file is indexed. Any unproven premise (an export modifier, a global script file, an aliasing or otherwise unclassifiable reference) falls back to the original full package-source index, which is the unchanged original semantics; the proof affects cost, never results. A lazy single global index was rejected because the helper-parameter path is reached on the current tree, so it would still pay nearly the whole `getResolvedSignature` sweep.
+
 Every declared harness event must have a discovered producer. A missing producer fails generation as dead vocabulary or an unsupported semantic dispatch shape; listener-free extension points remain valid. `internal/dispatch` instrumentation is not treated as a subscription to every event it observes, so the matrix contains direct product listeners rather than manually asserted indirect relationships.
 
 ### B. Scoped-event routing generates one typed resolver map
@@ -38,9 +40,9 @@ Every declared harness event must have a discovered producer. A missing producer
 
 Exactly one match generates a resolver. Multiple matches are ambiguous and fail. Zero matches require `@dshScopeScan unsupported`, which is reserved for events whose routing key intentionally stays outside the payload, such as owner-keyed session events and parent-keyed subagent lifecycle events. The annotation records an unsupported scan; it does not encode an event name, parameter index, property path, or replacement type.
 
-The committed [`scoped-events.generated.ts`](../../../../packages/support/invariants/src/scoped-events.generated.ts) imports every scoped-event owner for its type-side `Events` contributions. Each generated lambda accepts `Parameters<Events[K]>`, and the complete object satisfies a `Record` over the derived `ScopedEventName` union. Ordinary TypeScript compilation therefore checks event existence, parameter position, property access, and scoped-event completeness. The only cast adapts Cordis's runtime `unknown[]` dispatch boundary to the already type-checked resolver.
+The committed [`scoped-events.generated.ts`](../../../../packages/core/scope/src/scoped-events.generated.ts) is a runtime-only map in the package that owns scoped dispatch and imports no event-owner package. Semantic completeness lives in the generator: its root Program enumerates every scoped `Events` declaration and real `scopeTarget` contract, resolves the unique payload path with the checker, and refuses missing, stale, or ambiguous entries before rendering the `unknown[]` runtime boundary.
 
-The invariants plugin consumes this generated runtime map instead of maintaining its own table. Additional event-owner packages are dev dependencies and project references of `dsh-invariants`, not peer dependencies, so the compile-time aggregation does not expand the plugin's runtime closure.
+The `dsh-scope/invariant` companion consumes this map instead of maintaining a handwritten table. Because Program analysis happens in the repository gate rather than through generated type imports, neither `dsh-scope` nor `dsh-invariants` acquires dependencies on every event owner.
 
 ### Semantic gaps fail explicitly
 
@@ -48,7 +50,7 @@ The generators reject missing declarations, config diagnostics, widened or gener
 
 ## Verification
 
-`verify-doc-graphs` freshness-checks semantic producer/listener discovery, and `verify-scoped-events` freshness-checks the generated resolver map. The root TypeScript build compiles the resolver against merged `Events`; workspace constraints and runtime-closure checks ensure its type-only aggregation does not become a deployment dependency.
+`verify-doc-graphs` freshness-checks semantic producer/listener discovery, and `verify-scoped-events` reruns the Program analysis while freshness-checking the generated resolver map. The root TypeScript build compiles its runtime adapter; workspace constraints and runtime-closure checks keep event-owner aggregation out of deployment dependencies.
 
 ## Alternatives considered
 
@@ -58,6 +60,6 @@ The generators reject missing declarations, config diagnostics, widened or gener
 
 - Event relation generation follows semantic receiver identity and closed event values instead of local naming conventions.
 - Scoped-event membership, subject extraction, and runtime invariant coverage come from event declarations and real dispatch contracts rather than handwritten tables.
-- Refactors that change event names, parameter positions, subject properties, or routing-key types fail generation or compilation at the owning contract.
+- Refactors that change event names, parameter positions, subject properties, or routing-key types fail generation at the owning contract.
 - Building a flattened Program costs more startup time and memory than parsing isolated files, and semantic gates depend on a valid root project graph.
 - Generated TypeScript remains committed source: changes to event owners or dispatch shapes must regenerate it and the affected documentation.

@@ -2,14 +2,22 @@
 
 English | [中文](index.zh.md)
 
-This guide creates a minimal Harness plugin and loads it into an agent.
+This tutorial creates a minimal Harness plugin and loads it into the Web UI. Start from a repository checkout that has completed the [run-from-source path](../../../../README.md#run-from-source).
+
+## Create a local project
+
+From the repository root, create a scratch project for the tutorial:
+
+```sh
+mkdir -p scratch-plugin/src
+```
 
 ## What is a plugin?
 
 In Harness, a plugin is a TypeScript module that exports an `apply` function. The framework calls `apply` when loading the plugin and passes a `ctx` context object through which the plugin registers capabilities:
 
 ```ts
-import type { Context } from 'cordis'
+import type { Context } from '@deepseek-ai/cordis'
 
 export const name = 'my-plugin'
 
@@ -18,14 +26,14 @@ export function apply(ctx: Context) {
 }
 ```
 
-That is the complete shape.
+That is the complete configuration.
 
 ## Create the plugin file
 
-Create `src/my-plugin.ts` in your project:
+Create `scratch-plugin/src/my-plugin.ts`:
 
 ```ts
-import type { Context } from 'cordis'
+import type { Context } from '@deepseek-ai/cordis'
 
 export const name = 'hello-plugin'
 
@@ -37,14 +45,23 @@ export function apply(ctx: Context) {
 
 ## Register it in cordis.yml
 
-Add an entry to `cordis.yml`:
+Run `pwd` from the repository root, then create `scratch-plugin/cordis.yml` as a Web overlay that inserts the local plugin. Replace `/absolute/path/to/deepseek-harness` below with the printed path:
 
 ```yaml
-- id: hello
-  name: './src/my-plugin.ts'
+- insert:
+    - id: hello
+      name: '/absolute/path/to/deepseek-harness/scratch-plugin/src/my-plugin.ts'
 ```
 
-After startup, the console prints `[hello-plugin] plugin loaded!`.
+The plugin path must be absolute. A patch file contributes configuration but does not change the profile directory from which the loader resolves module paths.
+
+Start the Web UI with that overlay:
+
+```sh
+pnpm dsh web --patch ./scratch-plugin/cordis.yml
+```
+
+Open `http://127.0.0.1:3080`. The terminal prints `[hello-plugin] plugin loaded!` during startup.
 
 ## Automatic cleanup
 
@@ -53,7 +70,7 @@ Anything registered through `ctx`—event listeners, tools, or timers—is clean
 For a resource that needs explicit cleanup, such as a network connection, use `ctx.effect()` to provide its disposer:
 
 ```ts
-import type { Context } from 'cordis'
+import type { Context } from '@deepseek-ai/cordis'
 
 export function apply(ctx: Context) {
   ctx.effect(() => {
@@ -72,7 +89,7 @@ export function apply(ctx: Context) {
 If the plugin consumes another service such as `tools` or `llm`, declare it in `inject`:
 
 ```ts ignore-check
-import type { Context } from 'cordis'
+import type { Context } from '@deepseek-ai/cordis'
 
 export const name = 'my-tool-plugin'
 export const inject = ['tools']
@@ -92,7 +109,7 @@ In addition to a function module, a plugin can use object or class form.
 ### Object form
 
 ```ts
-import type { Context } from 'cordis'
+import type { Context } from '@deepseek-ai/cordis'
 
 export default {
   name: 'my-plugin',
@@ -106,7 +123,7 @@ export default {
 ### Class form
 
 ```ts
-import { Service, type Context } from 'cordis'
+import { Service, type Context } from '@deepseek-ai/cordis'
 
 export default class MyService extends Service {
   static inject = ['tools']
@@ -120,32 +137,8 @@ export default class MyService extends Service {
 
 Function form is sufficient in most cases. Use class form when the plugin provides a service to other plugins; see [services and dependencies](../framework/service.md).
 
-## Complete example
-
-`examples/echo-agent/src/echo-tool.ts` is a plugin that registers a tool:
-
-```ts
-import type { Context } from 'cordis'
-import { defineTool } from '@deepseek-ai/dsh-tools'
-
-export const name = 'echo-tool'
-export const inject = ['tools']
-
-export function apply(ctx: Context) {
-  ctx.tools.register(defineTool({
-    name: 'echo',
-    description: 'Echo the given text back, uppercased.',
-    parameters: {
-      text: { type: 'string', required: true },
-    },
-    async execute(args) {
-      return [{ type: 'text', text: `ECHO: ${args.text.toUpperCase()}` }]
-    },
-  }))
-}
-```
-
 ## Next steps
 
 - [Build a tool](./tool.md) — learn the tool definition DSL
 - [Plugin configuration](./config.md) — accept user configuration
+- [Cordis tutorial](../../../cordis-tutorial/index.md) — the plugin framework underneath, built from a scratch directory with no API key

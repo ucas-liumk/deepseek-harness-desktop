@@ -8,7 +8,9 @@
 
 import { CallId } from './brand.ts'
 import { assertNever } from './never.ts'
-import type { ContentBlock, FinishReason, Message, StreamChunk, TokenUsage } from './types.ts'
+import { createMessage } from './message.ts'
+import type { Message, MessageSource } from './message.ts'
+import type { ContentBlock, FinishReason, StreamChunk, TokenUsage } from './types.ts'
 
 interface PartialBlock {
   blockType: string
@@ -125,11 +127,15 @@ export class BlockAssembler {
 
   /**
    * Assemble all blocks seen so far, in stream order.
-   * @returns one block per seen index; an open block assembles from its
-   *   accumulated deltas (an unknown block type never closed by `block-end` throws).
+   * @returns one block per seen index, except that max-token truncation drops
+   *   tool calls that cannot be executed safely; an open block assembles from
+   *   its accumulated deltas (an unknown block type never closed by `block-end` throws).
    */
   blocks(): ContentBlock[] {
-    return this.order.map(index => this.assemble(this.mustGet(index), index))
+    const blocks = this.order.map(index => this.assemble(this.mustGet(index), index))
+    return this.finish.kind === 'max-tokens'
+      ? blocks.filter(block => block.type !== 'tool-call')
+      : blocks
   }
 
   /** Usage from the `usage` chunk; undefined until one arrives. */
@@ -149,9 +155,10 @@ export class BlockAssembler {
 
   /**
    * The assembled assistant message.
-   * @returns an assistant-role message over `blocks()` (same open-block assembly rules).
+   * @param source - producer attribution for the assembled message.
+   * @returns a frozen assistant-role message over `blocks()` (same open-block assembly rules).
    */
-  message(): Message {
-    return { role: 'assistant', content: this.blocks() }
+  message(source: MessageSource = { kind: 'plugin', plugin: 'dsh-llm/assembler' }): Message {
+    return createMessage({ role: 'assistant', content: this.blocks(), source })
   }
 }

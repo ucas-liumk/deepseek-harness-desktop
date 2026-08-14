@@ -24,6 +24,29 @@ export class HarnessError extends Error {
 /** Canonical provider-neutral code for a model request rejected because its context window was exceeded. */
 export const CONTEXT_WINDOW_EXCEEDED_CODE = 'CONTEXT_WINDOW_EXCEEDED'
 
+/** Canonical provider-neutral code for an exhausted account quota or balance. */
+export const QUOTA_EXCEEDED_CODE = 'QUOTA'
+
+/**
+ * Canonical provider-neutral code for a response that completed normally but
+ * carried no content blocks at all. Providers occasionally emit a degenerate
+ * completion (a terminal stop with zero output); adapters classify it as this
+ * failure instead of yielding an empty assistant message, because an empty
+ * message silently ends the turn with nothing for the user or the loop to act
+ * on. The attempt produced nothing durable, so retry policy treats it as safe
+ * to repeat.
+ */
+export const EMPTY_RESPONSE_CODE = 'EMPTY_RESPONSE'
+
+/**
+ * Canonical provider-neutral code for a credential that was supplied but
+ * cannot be used — malformed rather than absent. Distinct from
+ * `MISSING_CREDENTIAL` because the fix differs: correct the stored value
+ * rather than supply one. Deliberately outside the default retryable set —
+ * a malformed credential fails identically on every attempt.
+ */
+export const INVALID_CREDENTIAL_CODE = 'INVALID_CREDENTIAL'
+
 /** Structured codes and plain phrases that explicitly name a context bound being exceeded. */
 const STRUCTURED_CONTEXT_OVERFLOW = new RegExp(
   String.raw`(?:^|[^a-z0-9])context[\s_-](?:length|window)[\s_-]`
@@ -63,9 +86,24 @@ export function isContextWindowExceededError(detail: string): boolean {
 }
 
 /**
+ * Recognize provider wording that identifies an exhausted account quota rather
+ * than a transient request-rate limit.
+ * @param detail - provider error code/type/message text joined into one string.
+ * @returns true only for terminal quota, balance, credit, budget, or usage-limit wording.
+ */
+export function isQuotaExceededError(detail: string): boolean {
+  return /\binsufficient[\s_-]+(?:quota|balance|credits?)\b/i.test(detail)
+    || /\b(?:quota|usage[\s_-]+limit)[\s_-]+(?:exceeded|exhausted|reached)\b/i.test(detail)
+    || /\bexceed(?:ed|s)?[\s_-]+(?:(?:your|the)[\s_-]+)?(?:current[\s_-]+)?quota\b/i.test(detail)
+    || /\b(?:balance|credits?)[\s_-]+(?:exhausted|depleted)\b/i.test(detail)
+    || /\bout[\s_-]+of[\s_-]+(?:credits?|budget)\b/i.test(detail)
+}
+
+/**
  * Render a thrown value with its full `cause` chain and AggregateError
  * members, so transport wrappers like undici's `TypeError: fetch failed`
- * surface the underlying failure instead of masking it. Diagnostic-surface
+ * surface the underlying failure instead of masking it. Plain structured
+ * failures render their own data-backed `message`. Diagnostic-surface
  * rendering only (messages, notices, logs) — never parse the result; route on
  * {@link HarnessError.code}.
  * @param value - the caught value (`unknown` in catch clauses).
@@ -81,7 +119,15 @@ export function errorChain(value: unknown): string {
     if (path.has(current)) return '<circular cause>'
     path.add(current)
     try {
-      if (!(current instanceof Error)) return String(current)
+      if (!(current instanceof Error)) {
+        if (typeof current === 'object' && current !== null) {
+          const descriptor = Object.getOwnPropertyDescriptor(current, 'message')
+          if (descriptor !== undefined && 'value' in descriptor && typeof descriptor.value === 'string') {
+            return descriptor.value
+          }
+        }
+        return String(current)
+      }
       const message = current.message === '' ? current.name : current.message
       const members = current instanceof AggregateError && current.errors.length > 0
         ? ` [${current.errors.map(render).join('; ')}]`
@@ -108,7 +154,7 @@ export function errorChain(value: unknown): string {
 }
 
 /**
- * Narrow an arbitrary thrown value to a HarnessError (for `instanceof` at seams).
+ * Narrow an arbitrary thrown value to a HarnessError (for `instanceof` at runtime boundaries).
  * @param value - the caught value (`unknown` in catch clauses).
  * @returns true only for real instances; duck-typed or cross-realm errors do not narrow.
  */

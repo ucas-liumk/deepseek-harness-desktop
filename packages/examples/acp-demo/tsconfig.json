@@ -18,28 +18,34 @@
       "path": "../../../vendor/loader"
     },
     {
-      "path": "../../ui/app-boot"
+      "path": "../../boot/app-boot"
     },
     {
-      "path": "../../ui/acp"
+      "path": "../../acp/acp"
     },
     {
       "path": "../../core/agent"
     },
     {
+      "path": "../../session-query/session-query"
+    },
+    {
+      "path": "../../session-query/session-query-sqlite"
+    },
+    {
       "path": "../agent-spine-demo"
     },
     {
-      "path": "../../context/workspace-context"
+      "path": "../../context/agent-instructions"
     },
     {
-      "path": "../../ui/user-interaction"
+      "path": "../../session/session-checkpoint-policy"
     },
     {
-      "path": "../../ui/tool-ask-user"
+      "path": "../../session/session-persistence-jsonl"
     },
     {
-      "path": "../../session-persistence/session-persistence-jsonl"
+      "path": "../../runtime-diagnostics/invariants"
     }
   ]
 }

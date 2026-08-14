@@ -3,12 +3,13 @@
 Two runtime carriers coexist under ``runtime/``, both injected by the repo's
 ``scripts/build-exe-for-python-sdk.ts`` build (neither is checked into git):
 
-- **exe (production)**: single-file executables named
+- **exe (production)**: single-file Node executables named
   ``dsh-jsonrpc-agent-pkg-<platform>-<arch>`` (platform in {linux, macos}, arch in
-  {x64, arm64}); the target machine needs no Node installation.
+  {x64, arm64}); macOS also uses a sibling ``-spawn-helper``. The target machine
+  needs no Node installation.
 - **node (dev-only)**: the full deploy closure under ``runtime/node/``
   (``package.json`` + ``node_modules/``), executed as ``node
-  runtime/node/node_modules/@deepseek-ai/dsh-jsonrpc-demo/lib/bin.js`` on a
+  runtime/node/node_modules/@deepseek-ai/dsh-sdk-jsonrpc-demo/lib/packaged-bin.js`` on a
   system Node >= 22.19. It is the current checkout's source build, never
   selected automatically, and excluded from wheel/sdist distributions.
 
@@ -69,11 +70,11 @@ def bundled_default_config_path() -> Path:
 def bundled_runtime_path() -> Path:
     """Absolute path of the bundled single-file runtime executable for the current platform.
 
-    Raises FileNotFoundError when the platform is unsupported or the executable
-    has not been placed into this package; the message names the acquisition
-    routes (acquisition strategy is deliberately separate from this lookup
-    interface, so an on-demand download can replace it without touching
-    callers).
+    Raises FileNotFoundError when the platform is unsupported, the executable
+    has not been placed into this package, or the required macOS spawn helper is
+    missing; the message names the acquisition routes (acquisition strategy is
+    deliberately separate from this lookup interface, so an on-demand download
+    can replace it without touching callers).
     """
     tag = _current_platform_tag()
     path = bundled_package_dir() / "runtime" / f"dsh-jsonrpc-agent-pkg-{tag}"
@@ -82,6 +83,13 @@ def bundled_runtime_path() -> Path:
             f"deepseek-harness-runtime-bin is missing the runtime executable at {path}. "
             + _EXE_ACQUISITION_HINT
         )
+    if tag.startswith("macos-"):
+        helper = Path(f"{path}-spawn-helper")
+        if not helper.is_file():
+            raise FileNotFoundError(
+                f"deepseek-harness-runtime-bin is missing the node-pty spawn helper at {helper}. "
+                + _EXE_ACQUISITION_HINT
+            )
     return path
 
 
@@ -123,7 +131,12 @@ def _current_platform_tag() -> str:
 def _node_launch_args() -> tuple[str, str]:
     node_root = bundled_package_dir() / "runtime" / "node"
     bin_js = (
-        node_root / "node_modules" / "@deepseek-ai" / "dsh-jsonrpc-demo" / "lib" / "bin.js"
+        node_root
+        / "node_modules"
+        / "@deepseek-ai"
+        / "dsh-sdk-jsonrpc-demo"
+        / "lib"
+        / "packaged-bin.js"
     )
     if not bin_js.is_file():
         raise FileNotFoundError(

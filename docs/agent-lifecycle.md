@@ -3,7 +3,7 @@
 
 # Agent Turn And Step Lifecycle
 
-This sequence is the visual companion to [architecture.md](architecture.md#loop-lifecycle-session--turn--step). It keeps durable replay facts on `session/event` and live control/status on `agent/*`.
+This sequence is the visual companion to [architecture.md](architecture.md#turn-flow). It keeps durable replay facts on `session/event` and live control/status on `agent/*`.
 
 ```mermaid
 sequenceDiagram
@@ -15,19 +15,24 @@ sequenceDiagram
   participant LLM as ctx.llm
   participant Tools as ctx.tools
   participant Session
-  participant Persistence
   participant SDK as UI or SDK listener
-  User->>Agent: send(content)
-  Agent-->>SDK: <code>agent/queued</code>
+  User->>Agent: followup(content)
+  Agent-->>SDK: <code>agent/inbox/spliced</code>
+  Agent-->>SDK: <code>agent/inbox/inserted</code> { message }
   Agent->>Driver: queued work wakes driver
   Driver-->>SDK: <code>agent/status</code> running
   Driver->>Session: <code>turn/start</code>
-  Driver->>Hooks: <code>agent/prompt-submit</code> waterfall
-  Hooks-->>Driver: allow, block, or add context
-  Driver->>Session: <code>user/message</code> or rejected <code>turn/end</code>
-  Driver->>Prompt: <code>system-prompt/assemble</code> waterfall
-  Driver-->>Driver: <code>agent/pre-step</code> serial checkpoint
+  Note over Agent,Driver: claim pending next-step input plus one queued prompt
+  Driver-->>SDK: <code>agent/inbox/spliced</code> pure deletion
+  Driver-->>SDK: <code>agent/inbox/claimed</code> { message, turn } per message
+  Driver->>Hooks: <code>agent/pre-step</code> waterfall
+  Hooks-->>Driver: authoritative reject or enter(messages)
+  alt proposed step rejected or pre-step failed
+    Driver-->>Driver: claimed batch stays removed, the open turn spends no step
+  else enter proposed step
   Driver->>Session: <code>step/start</code>
+  Driver->>Session: <code>user/message</code> per entered message
+  Driver->>Prompt: <code>system-prompt/assemble</code> waterfall
   Driver->>LLM: <code>agent/request</code> waterfall, then <code>llm/stream</code> waterfall
   LLM-->>Driver: StreamChunk*
   Driver->>Session: <code>assistant/chunk</code>*
@@ -35,9 +40,8 @@ sequenceDiagram
   alt final adapter or terminal in-band request failure
     Driver->>Session: <code>step/end</code>
     Driver->>Hooks: <code>agent/request-error</code> waterfall
-    Hooks-->>Driver: retry in a new step or preserve the original error
+    Hooks-->>Driver: return retry action or preserve the original error
   else model request succeeded
-  Driver->>Hooks: <code>agent/step-result</code> waterfall
   Driver->>Session: <code>assistant/message</code>
   Driver->>Tools: classify pending call by executionMode
   loop barriers and bounded rolling pool, reclassify before start
@@ -51,21 +55,28 @@ sequenceDiagram
       Driver->>Session: <code>tool/result</code>
     end
   end
-  Driver->>Session: post-tool context and steering
-  Driver->>Hooks: <code>agent/post-step</code> serial checkpoint
   Driver->>Session: <code>step/end</code>
-  Driver->>Hooks: <code>agent/turn-continuation</code> waterfall
-  Driver->>Hooks: <code>agent/turn-stop</code> serial terminal checkpoint
+  opt natural stop and next-step inbox empty
+    Driver->>Hooks: <code>agent/turn-stopping</code> serial terminal checkpoint
+  end
+  opt next-step input is pending
+    Driver-->>Driver: claim pending next-step input
+    Driver-->>SDK: <code>agent/inbox/claimed</code> { message, turn } per message
+    Driver->>Hooks: <code>agent/pre-step</code> waterfall
+    Hooks-->>Driver: authoritative reject or enter(messages)
+  end
+  end
   end
   Driver->>Session: <code>turn/end</code>
-  Driver->>Persistence: <code>session/flush</code> parallel checkpoint
   Driver-->>SDK: <code>agent/status</code> idle
 ```
 
-The `assistant/message` edge records every successful provider call, including content-less and `max-tokens` finishes. Empty content stays out of derived history while the durable anchor retains usage and exact chunk provenance, including an explicit empty source set.
+The `assistant/message` event records every successful provider call, including content-less and `max-tokens` finishes. Empty content stays out of derived history, while the durable event keeps usage and `sourceEventSeqs` listing the exact `assistant/chunk` events, including an explicit empty list.
 
-`dsh-compact-basic` uses `agent/post-step` for pressure after those durable facts and `agent/request-error` only for canonical context overflow. Once either trigger qualifies, optional tool-result pruning runs before summary selection. Recovery works between the closed failed step and a fresh retry step, and returns retry only when pruning or summarization advances the surface replacement generation; otherwise the original request error remains authoritative.
+`dsh-compaction-basic` uses `agent/pre-step` for pressure before request derivation and `agent/request-error` only for canonical context overflow. Once either trigger qualifies, optional tool-result pruning runs before summary selection. Recovery works between the closed failed step and failed turn close, and opens a fresh retry turn only when pruning or summarization advances the surface replacement generation; otherwise the original request error remains authoritative.
 
-SDK users that need replayable transcript data should consume `session/event`; `agent/*` is the live coordination surface for queue/status, prompt interception, request shaping, steering, continuation, and errors.
+The returned `agent/pre-step` decision is authoritative; listeners wrapping `next()` preserve downstream messages unless replacement is intentional. Steering and injected context pass through the same waterfall after a later claim operation takes their next-step batch.
+
+SDK users that need replayable transcript data should consume `session/event`; `agent/*` is the live coordination API for queue/status, prompt interception, request construction, steering, continuation, and errors.
 
 Maintenance mode: curated Mermaid sequence; exact event signatures live in the generated Cordis catalog.

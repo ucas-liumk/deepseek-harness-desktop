@@ -1,21 +1,23 @@
-# node-addon-landlock-run
+# @deepseek-ai/node-addon-landlock-run
+
+English | [中文](README.zh.md)
 
 A [Landlock](https://landlock.io/) self-restrict-then-exec launcher for confining subprocesses on Linux, distributed as prebuilt per-platform npm packages plus a thin JS entry package that resolves the binary and speaks its CLI contract. Built for agent harnesses and other hosts that need to run untrusted commands under a filesystem allow-list without confining themselves.
 
-The first tool is **`landlock-run`** — a self-restrict-then-exec [Landlock](https://landlock.io/) launcher (~300 lines of C11 over the raw kernel UAPI, statically linked against musl). It installs a Landlock ruleset on itself and `exec`s the wrapped command; the ruleset is inherited across `execve`, so the command and every process it spawns run confined while the invoking process stays unrestricted. Fail-closed: if the kernel cannot enforce, it exits without running the command.
+The tool is **`landlock-run`** — a self-restrict-then-exec [Landlock](https://landlock.io/) launcher (~300 lines of C11 over the raw kernel UAPI, statically linked against musl). It installs a Landlock ruleset on itself and `exec`s the wrapped command; the ruleset is inherited across `execve`, so the command and every process it spawns run confined while the invoking process stays unrestricted. Fail-closed: if the kernel cannot enforce, it exits without running the command.
 
 ## Install
 
 ```sh
-npm install node-addon-landlock-run
+npm install @deepseek-ai/node-addon-landlock-run
 ```
 
 Published packages use an entry package plus platform optional packages:
 
 ```text
-node-addon-landlock-run
-node-addon-landlock-run-linux-x64
-node-addon-landlock-run-linux-arm64
+@deepseek-ai/node-addon-landlock-run
+@deepseek-ai/node-addon-landlock-run-linux-x64
+@deepseek-ai/node-addon-landlock-run-linux-arm64
 ```
 
 npm's `os`/`cpu` fields make installers fetch only the matching platform package. There is no install-time build fallback on purpose: on a host without a platform package the resolved path never exists, the probe reports `unusable`, and the consumer falls closed.
@@ -23,7 +25,7 @@ npm's `os`/`cpu` fields make installers fetch only the matching platform package
 ## Usage
 
 ```js
-import { grantArgs, launcherPath, probe } from 'node-addon-landlock-run';
+import { grantArgs, launcherPath, probe } from '@deepseek-ai/node-addon-landlock-run';
 
 const launcher = launcherPath();
 if (probe(launcher) !== 'unusable') {
@@ -37,7 +39,7 @@ The public API is intentionally small:
 - `launcherPath()`: absolute path of this host's launcher (existence deliberately unchecked — the probe is the availability signal).
 - `probe(launcher?, { timeoutMs? })`: functional enforcement probe — `'full' | 'partial' | 'unusable'`.
 - `grantArgs({ readOnly?, readWrite? })`: the launcher's grant argv; everything not granted is denied.
-- `LAUNCHER_BIN`, `LAUNCHER_FAILURE_EXIT` (125): contract constants.
+- `LAUNCHER_BIN` and `LAUNCHER_FAILURE_EXIT` (125): contract constants. A successfully exec'd child may also return 125, so consumers need the fatal diagnostic as well as the status to attribute launcher failure.
 
 The full binary contract (argv grammar, exit codes, report lines) is pinned in [docs/cli-contract.md](docs/cli-contract.md).
 

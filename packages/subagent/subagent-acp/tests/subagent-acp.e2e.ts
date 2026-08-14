@@ -3,14 +3,15 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { afterEach, describe, expect, it } from 'vitest'
-import { Context } from 'cordis'
+import { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
-import SubagentService from '@deepseek-ai/dsh-subagent'
+import SubagentRuntime from '@deepseek-ai/dsh-subagent'
+import LocalSubprocessRuntime from '@deepseek-ai/dsh-subprocess-local'
 import { resolveExampleLaunch } from '@deepseek-ai/dsh-loader-smoke'
 import * as acp from '../src/index.ts'
 
 /**
- * With-key cross-process seam proof: the backend spawns the real acp-agent example, speaks ACP over
+ * With-key cross-process boundary proof: the backend spawns the real acp-agent example, speaks ACP over
  * stdio, and returns its real model answer. This is the out-of-process counterpart to in-process
  * spawn coverage and self-skips without `DEEPSEEK_API_KEY`.
  */
@@ -21,7 +22,7 @@ const exampleConfig = fileURLToPath(new URL('../../../../examples/acp-agent/cord
 const repoTsconfig = fileURLToPath(new URL('../../../../tsconfig.json', import.meta.url))
 
 // How to launch the child acp-agent (src via tsx / lib via plain node, per DSH_EXAMPLE_MODE).
-// buildChildEnv scrubs ambient creds but keeps these extras, so the model key is
+// The subprocess seam scrubs ambient creds while spec.env merges after it, so the model key is
 // forwarded explicitly; TSX_TSCONFIG_PATH is added by the resolver in src mode only.
 const childLaunch = resolveExampleLaunch({
   srcBin: binScript,
@@ -51,7 +52,8 @@ describe.skipIf(!process.env.DEEPSEEK_API_KEY)('ACP backend with-key e2e (drive 
   it('drives the real acp-agent example process to answer a prompt', async () => {
     workdir = await mkdtemp(join(tmpdir(), 'dsh-subagent-acp-e2e-'))
     ctx = new Context()
-    await ctx.plugin(SubagentService)
+    await ctx.plugin(SubagentRuntime)
+    await ctx.plugin(LocalSubprocessRuntime)
     await ctx.plugin(acp, {
       providerName: 'acp',
       command: childLaunch.command,
@@ -80,7 +82,8 @@ describe.skipIf(!process.env.DEEPSEEK_API_KEY)('ACP backend with-key e2e (drive 
   it('drives the child to do real file work via its own bash tool', async () => {
     workdir = await mkdtemp(join(tmpdir(), 'dsh-subagent-acp-e2e-'))
     ctx = new Context()
-    await ctx.plugin(SubagentService)
+    await ctx.plugin(SubagentRuntime)
+    await ctx.plugin(LocalSubprocessRuntime)
     await ctx.plugin(acp, {
       providerName: 'acp',
       command: childLaunch.command,
@@ -102,7 +105,7 @@ describe.skipIf(!process.env.DEEPSEEK_API_KEY)('ACP backend with-key e2e (drive 
     await run.dispose()
 
     expect(result.stopReason).toBe('completed')
-    // Verify the WORLD: the child process actually wrote the file in its cwd.
+    // Assert the filesystem effect independently of the model response.
     const proof = await readFile(join(workdir, 'proof.txt'), 'utf8')
     expect(proof).toContain('ACP_CHILD_WAS_HERE')
   }, 180_000)

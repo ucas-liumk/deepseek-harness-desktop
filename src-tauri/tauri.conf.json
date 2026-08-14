@@ -1,0 +1,52 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Unofficial DeepSeek Harness Desktop",
+  "version": "0.1.0-rc.8",
+  "identifier": "io.github.ucas-liumk.deepseek-harness-desktop",
+  "build": {
+    "frontendDist": "../desktop"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "create": false,
+        "title": "Unofficial DeepSeek Harness Desktop",
+        "url": "index.html",
+        "width": 1280,
+        "height": 800,
+        "minWidth": 800,
+        "minHeight": 600,
+        "center": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; connect-src 'none'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": [],
+    "externalBin": [
+      "binaries/dsh-backend"
+    ],
+    "resources": {
+      "../LICENSE": "LICENSE",
+      "../THIRD_PARTY_NOTICES.md": "THIRD_PARTY_NOTICES.md",
+      "../desktop/DISTRIBUTION_BOUNDARY.md": "DISTRIBUTION_BOUNDARY.md",
+      "../.artifacts/desktop-licenses/THIRD_PARTY_LICENSES": "THIRD_PARTY_LICENSES"
+    },
+    "icon": [
+      "icons-unofficial/32x32.png",
+      "icons-unofficial/128x128.png",
+      "icons-unofficial/128x128@2x.png",
+      "icons-unofficial/icon.icns",
+      "icons-unofficial/icon.ico"
+    ],
+    "windows": {
+      "nsis": {
+        "compression": "zlib"
+      }
+    }
+  }
+}

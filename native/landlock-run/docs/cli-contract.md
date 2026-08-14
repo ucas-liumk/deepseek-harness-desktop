@@ -1,6 +1,6 @@
 # CLI contract: landlock-run
 
-This file pins the launcher's externally observable behavior — the cross-repo compatibility surface between the binaries and every consumer. Consumers interact with it only through the entry package (`launcherPath`/`probe`/`grantArgs`); changing anything below requires a version bump for the whole package family and a note in the release notes.
+This file pins the launcher's externally observable behavior — the cross-repo compatibility surface between the binaries and every consumer. Consumers interact with it through the entry package (`launcherPath`/`probe`/`grantArgs`) and the launcher protocol; changing anything below requires a version bump for the whole package family and a note in the release notes.
 
 ## Invocation grammar
 
@@ -19,8 +19,8 @@ landlock-run --probe
 
 ## Exit codes
 
-- `125` (`LAUNCHER_FAILURE_EXIT`): every launcher-level failure — usage error, kernel that cannot enforce Landlock, unopenable grant root, failed `exec`. The wrapped command was NOT run (fail-closed; the one exception is `exec` itself failing after restriction, which by definition never ran the command either).
-- Any other status: the wrapped command's own exit status, passed through unchanged.
+- `125` (`LAUNCHER_FAILURE_EXIT`): every launcher-level failure — usage error, kernel that cannot enforce Landlock, unopenable grant root, failed `exec`. The wrapped command was NOT run.
+- After a successful `exec`, every child status is passed through unchanged, including 125. Consumers therefore require both status 125 and a `landlock-run: ` fatal line to attribute launcher failure.
 - `--probe`: `0` when the kernel enforces (fully or partially), `125` otherwise.
 
 ## Report lines

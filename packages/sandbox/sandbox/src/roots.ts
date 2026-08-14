@@ -15,7 +15,7 @@
 
 import { realpathSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import type { SandboxPolicy } from './index.ts'
+import type { SandboxExecutionPolicy } from './index.ts'
 
 /**
  * Resolve a granted root to the path the enforcement layer actually compares:
@@ -29,9 +29,13 @@ import type { SandboxPolicy } from './index.ts'
  */
 export function canonicalPath(path: string): string {
   try {
-    return realpathSync(path)
+    // Node's JavaScript realpath implementation lexically collapses `..`
+    // before resolving a preceding symlink on some platforms. The native
+    // implementation follows the filesystem's component-by-component lookup,
+    // matching chdir/spawn and the enforcement layers this identity feeds.
+    return realpathSync.native(path)
   } catch {
-    // realpathSync failed: the path (or a prefix) is missing or unreadable.
+    // realpathSync.native failed: the path (or a prefix) is missing or unreadable.
     return path
   }
 }
@@ -45,7 +49,7 @@ export function canonicalPath(path: string): string {
  * @param policy - the file-effect policy to derive the allow-list from.
  * @returns the canonical writable roots; empty exactly under `read-only`.
  */
-export function writableRoots(policy: SandboxPolicy): string[] {
+export function writableRoots(policy: SandboxExecutionPolicy): string[] {
   if (policy.mode !== 'workspace-write') return []
   return [...new Set([policy.workspaceRoot, '/tmp', tmpdir()].map(canonicalPath))]
 }

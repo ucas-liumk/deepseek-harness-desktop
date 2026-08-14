@@ -13,18 +13,20 @@ import { mkdtemp, rm, writeFile, readFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { afterAll, beforeAll, describe, expect, it } from 'vitest'
-import { Context } from 'cordis'
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
+import { Context } from '@deepseek-ai/cordis'
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js'
 import { z } from 'zod'
 import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
-import ToolRegistry from '@deepseek-ai/dsh-tools'
+import ToolRuntime from '@deepseek-ai/dsh-tools'
 import { CallId } from '@deepseek-ai/dsh-llm'
 import { apply } from '@deepseek-ai/dsh-mcp-client/src/index.ts'
 import { publicToolName } from '@deepseek-ai/dsh-mcp-client/src/tools.ts'
 import type { Config } from '@deepseek-ai/dsh-mcp-client'
+
+const testToolSignal = new AbortController().signal
 
 const fixtureServerPath = fileURLToPath(new URL('./fixture-server.ts', import.meta.url))
 
@@ -37,23 +39,8 @@ const localBin = join(packageDir, 'node_modules', '.bin')
 async function mountRegistry(): Promise<Context> {
   const ctx = new Context()
   await ctx.plugin(SystemPrompt)
-  await ctx.plugin(ToolRegistry)
+  await ctx.plugin(ToolRuntime)
   return ctx
-}
-
-/** Apply the MCP client plugin and wait for tools to be registered. */
-async function applyAndWait(ctx: Context, config: Config, timeoutMs = 20_000): Promise<void> {
-  // Annotated bindings (not withResolvers<void>()): the tests lint layer runs
-  // no-invalid-void-type with default options, which rejects the explicit
-  // type argument in call position but accepts the inferred form.
-  const gate: PromiseWithResolvers<void> = Promise.withResolvers()
-  const timer = setTimeout(
-    () => { gate.reject(new Error(`applyAndWait timed out after ${timeoutMs}ms — no tools/change event`)) },
-    timeoutMs,
-  )
-  ctx.on('tools/change', () => { clearTimeout(timer); gate.resolve() })
-  apply(ctx, config)
-  await gate.promise
 }
 
 function sleep(ms: number): Promise<void> {
@@ -88,11 +75,12 @@ describe('fixture server — controlled scenarios', () => {
     env: {},
     cwd: packageDir,
     toolCallTimeoutMs: 15_000,
+    failOnStartupError: false,
   }
 
   beforeAll(async () => {
     ctx = await mountRegistry()
-    await applyAndWait(ctx, fixtureConfig)
+    await apply(ctx, fixtureConfig)
   }, 30_000)
 
   afterAll(async () => {
@@ -119,6 +107,7 @@ describe('fixture server — controlled scenarios', () => {
 
   it('executes the dotted tool via its normalized public name', async () => {
     const result = await ctx.tools.execute({
+      signal: testToolSignal,
       callId: nextCallId(), name: publicToolName('fixture', 'admin.reset'), arguments: {},
     })
     expect(result.isError).toBe(false)
@@ -127,6 +116,7 @@ describe('fixture server — controlled scenarios', () => {
 
   it('executes add(2, 3) → "5"', async () => {
     const result = await ctx.tools.execute({
+      signal: testToolSignal,
       callId: nextCallId(), name: 'mcp__fixture__add', arguments: { a: 2, b: 3 },
     })
     expect(result.isError).toBe(false)
@@ -135,6 +125,7 @@ describe('fixture server — controlled scenarios', () => {
 
   it('executes greet("World") → "Hello, World!"', async () => {
     const result = await ctx.tools.execute({
+      signal: testToolSignal,
       callId: nextCallId(), name: 'mcp__fixture__greet', arguments: { name: 'World' },
     })
     expect(result.isError).toBe(false)
@@ -143,6 +134,7 @@ describe('fixture server — controlled scenarios', () => {
 
   it('executes fail() → isError result', async () => {
     const result = await ctx.tools.execute({
+      signal: testToolSignal,
       callId: nextCallId(), name: 'mcp__fixture__fail', arguments: {},
     })
     expect(result.isError).toBe(true)
@@ -151,6 +143,7 @@ describe('fixture server — controlled scenarios', () => {
 
   it('executes image() → image placeholder', async () => {
     const result = await ctx.tools.execute({
+      signal: testToolSignal,
       callId: nextCallId(), name: 'mcp__fixture__image', arguments: {},
     })
     expect(result.isError).toBe(false)
@@ -172,10 +165,11 @@ describe('fixture server — duplicate serverName', () => {
       env: {},
       cwd: packageDir,
       toolCallTimeoutMs: 15_000,
+      failOnStartupError: false,
     }
-    await applyAndWait(ctx, config)
+    await apply(ctx, config)
 
-    expect(() => { apply(ctx, config) }).toThrow(/serverName "dup" is already in use/)
+    await expect(apply(ctx, config)).rejects.toThrow(/serverName "dup" is already in use/)
 
     await ctx.fiber.dispose()
     await sleep(200)
@@ -185,7 +179,7 @@ describe('fixture server — duplicate serverName', () => {
 describe('fixture server — disposal', () => {
   it('disposes cleanly without error', async () => {
     const ctx = await mountRegistry()
-    await applyAndWait(ctx, {
+    await apply(ctx, {
       transport: 'stdio',
       serverName: 'fixture',
       command: process.execPath,
@@ -193,6 +187,7 @@ describe('fixture server — disposal', () => {
       env: {},
       cwd: packageDir,
       toolCallTimeoutMs: 15_000,
+      failOnStartupError: false,
     })
 
     // Tools are registered before dispose.
@@ -202,6 +197,87 @@ describe('fixture server — disposal', () => {
     // Dispose should complete without throwing.
     await ctx.fiber.dispose()
     await sleep(200)
+  }, 30_000)
+})
+
+describe('fixture server — crash recovery', () => {
+  function crashConfig(serverName: string, reconnect: NonNullable<Config['reconnect']>): Config {
+    return {
+      transport: 'stdio',
+      serverName,
+      command: process.execPath,
+      args: [fixtureServerPath],
+      env: {},
+      cwd: packageDir,
+      toolCallTimeoutMs: 15_000,
+      failOnStartupError: false,
+      reconnect,
+    }
+  }
+
+  it('auto-reconnects after a stdio crash and serves tool calls again', async () => {
+    const ctx = await mountRegistry()
+    await apply(ctx, crashConfig('crashy', { initialDelayMs: 50, maxDelayMs: 500, maxAttempts: 40 }))
+
+    const before = await ctx.tools.execute({
+      signal: testToolSignal,
+      callId: nextCallId(), name: 'mcp__crashy__add', arguments: { a: 2, b: 3 },
+    })
+    expect(textOf(before.content[0])).toBe('5')
+
+    // The crash tool replies, then kills the real child process.
+    const crash = await ctx.tools.execute({
+      signal: testToolSignal,
+      callId: nextCallId(), name: 'mcp__crashy__crash', arguments: {},
+    })
+    expect(crash.isError).toBe(false)
+
+    // Recovery is proven by the world: a post-crash call round-trips through
+    // the respawned server process.
+    await vi.waitFor(async () => {
+      const after = await ctx.tools.execute({
+        signal: testToolSignal,
+        callId: nextCallId(), name: 'mcp__crashy__add', arguments: { a: 20, b: 22 },
+      })
+      expect(after.isError).toBe(false)
+      expect(textOf(after.content[0])).toBe('42')
+    }, { timeout: 15_000, interval: 250 })
+
+    // The recovered generation replaced the dead one: no duplicates, no leak.
+    const addEntries = ctx.tools.schemas().map(s => s.name).filter(name => name === 'mcp__crashy__add')
+    expect(addEntries).toHaveLength(1)
+
+    await ctx.fiber.dispose()
+    await sleep(200)
+  }, 30_000)
+
+  it('plugin unload during an outage stops reconnection and unregisters tools', async () => {
+    const ctx = await mountRegistry()
+    const fiber = ctx.plugin(
+      { name: 'mcp-client', inject: ['tools'], apply },
+      crashConfig('ephemeral', { initialDelayMs: 8_000, maxDelayMs: 8_000, maxAttempts: 5 }),
+    )
+    // Cordis awaits async apply() as startup work; wait for it.
+    await vi.waitFor(() => { expect(ctx.tools.get('mcp__ephemeral__add')).toBeDefined() }, { timeout: 20_000 })
+
+    const crash = await ctx.tools.execute({
+      signal: testToolSignal,
+      callId: nextCallId(), name: 'mcp__ephemeral__crash', arguments: {},
+    })
+    expect(crash.isError).toBe(false)
+
+    // Give the transport close a moment to land the supervisor in its 8s
+    // backoff wait, then unload: disposal must not sit out the backoff.
+    await sleep(300)
+    const started = Date.now()
+    await fiber.dispose()
+    expect(Date.now() - started).toBeLessThan(4_000)
+
+    expect(ctx.tools.get('mcp__ephemeral__add')).toBeUndefined()
+    await sleep(200)
+    expect(ctx.tools.get('mcp__ephemeral__add')).toBeUndefined()
+
+    await ctx.fiber.dispose()
   }, 30_000)
 })
 
@@ -218,11 +294,12 @@ describe('server-everything — official test server', () => {
     env: {},
     cwd: '',
     toolCallTimeoutMs: 30_000,
+    failOnStartupError: false,
   }
 
   beforeAll(async () => {
     ctx = await mountRegistry()
-    await applyAndWait(ctx, config)
+    await apply(ctx, config)
   }, 60_000)
 
   afterAll(async () => {
@@ -241,6 +318,7 @@ describe('server-everything — official test server', () => {
 
   it('executes echo({ message: "hello" }) → "Echo: hello"', async () => {
     const result = await ctx.tools.execute({
+      signal: testToolSignal,
       callId: nextCallId(), name: 'mcp__everything__echo', arguments: { message: 'hello' },
     })
     expect(result.isError).toBe(false)
@@ -249,6 +327,7 @@ describe('server-everything — official test server', () => {
 
   it('executes get-sum({ a: 3, b: 7 }) → contains "10"', async () => {
     const result = await ctx.tools.execute({
+      signal: testToolSignal,
       callId: nextCallId(), name: 'mcp__everything__get-sum', arguments: { a: 3, b: 7 },
     })
     expect(result.isError).toBe(false)
@@ -257,6 +336,7 @@ describe('server-everything — official test server', () => {
 
   it('executes get-tiny-image → image placeholder', async () => {
     const result = await ctx.tools.execute({
+      signal: testToolSignal,
       callId: nextCallId(), name: 'mcp__everything__get-tiny-image', arguments: {},
     })
     expect(result.isError).toBe(false)
@@ -282,8 +362,9 @@ describe('server-filesystem — real filesystem operations', () => {
       env: {},
       cwd: '',
       toolCallTimeoutMs: 30_000,
+      failOnStartupError: false,
     }
-    await applyAndWait(ctx, config)
+    await apply(ctx, config)
   }, 60_000)
 
   afterAll(async () => {
@@ -304,18 +385,18 @@ describe('server-filesystem — real filesystem operations', () => {
     const filePath = join(tempDir, 'test.txt')
     const content = 'Hello from MCP e2e test!'
 
-    // Write via MCP tool
     const writeResult = await ctx.tools.execute({
+      signal: testToolSignal,
       callId: nextCallId(), name: 'mcp__filesystem__write_file', arguments: { path: filePath, content },
     })
     expect(writeResult.isError).toBe(false)
 
-    // Verify file was actually written (world verification)
+    // Assert the filesystem effect independently of the tool result.
     const onDisk = await readFile(filePath, 'utf8')
     expect(onDisk).toBe(content)
 
-    // Read back via MCP tool
     const readResult = await ctx.tools.execute({
+      signal: testToolSignal,
       callId: nextCallId(), name: 'mcp__filesystem__read_file', arguments: { path: filePath },
     })
     expect(readResult.isError).toBe(false)
@@ -323,10 +404,10 @@ describe('server-filesystem — real filesystem operations', () => {
   })
 
   it('list_directory shows written file', async () => {
-    // Ensure a file exists
     await writeFile(join(tempDir, 'listed.txt'), 'listed')
 
     const result = await ctx.tools.execute({
+      signal: testToolSignal,
       callId: nextCallId(), name: 'mcp__filesystem__list_directory', arguments: { path: tempDir },
     })
     expect(result.isError).toBe(false)
@@ -398,8 +479,9 @@ describe('streamable-http — in-process MCP server', () => {
       url: baseUrl,
       headers: { Authorization: 'Bearer e2e-test-token' },
       toolCallTimeoutMs: 15_000,
+      failOnStartupError: false,
     }
-    await applyAndWait(ctx, config)
+    await apply(ctx, config)
   }, 30_000)
 
   afterAll(async () => {
@@ -418,6 +500,7 @@ describe('streamable-http — in-process MCP server', () => {
 
   it('executes ping() → "pong" over HTTP', async () => {
     const result = await ctx.tools.execute({
+      signal: testToolSignal,
       callId: nextCallId(), name: 'mcp__web__ping', arguments: {},
     })
     expect(result.isError).toBe(false)
@@ -426,6 +509,7 @@ describe('streamable-http — in-process MCP server', () => {
 
   it('executes shout({ message }) with args over HTTP', async () => {
     const result = await ctx.tools.execute({
+      signal: testToolSignal,
       callId: nextCallId(), name: 'mcp__web__shout', arguments: { message: 'quiet' },
     })
     expect(result.isError).toBe(false)

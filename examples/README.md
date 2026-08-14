@@ -1,52 +1,29 @@
 # Examples
 
-Runnable demos (not workspaces) that showcase how the harness is wired. Each example is a **thin leaf**: a `cordis.yml` that picks the swappable backends (an LLM adapter, a bash executor), loads one app package, and may add optional product tools or demo-only mocks. The composition — the spine, the front-door cluster, and the boot glue — lives in the app packages ([`@deepseek-ai/dsh-stdio-demo`](../packages/examples/stdio-demo), [`@deepseek-ai/dsh-cli-demo`](../packages/examples/cli-demo), [`@deepseek-ai/dsh-acp-demo`](../packages/examples/acp-demo)) and the [`@deepseek-ai/dsh-agent-spine-demo`](../packages/examples/agent-spine-demo) bundle they share. There is no `start.ts`; the `demo:*` scripts invoke each app package's `bin`.
+English | [中文](README.zh.md)
 
-## echo-agent
+Runnable demonstrations of the main DeepSeek Harness interfaces and extension points. Each child directory owns its configuration, prerequisites, commands, and detailed behavior.
 
-A mock model + echo tool on the stdio chat app — the all-mock skeleton. The leaf swaps `dsh-stdio-demo`'s LLM backend to a local `mock-echo` adapter and adds a local `echo` tool. Demonstrates:
+## mcp-memory
 
-- A thin leaf `cordis.yml` loading the `@deepseek-ai/dsh-stdio-demo` app
-- Registering a mock `LlmAdapter` (streaming scripted responses)
-- Registering a tool via `ctx.tools.register()`
-- "Swap the backend, keep the app" — the only difference from `repl-agent` is the adapter
-
-Run with: `pnpm run demo:echo`. When prompted, type "echo <something>" to trigger a tool call round-trip.
-
-## repl-agent
-
-A coding agent with DeepSeek V4, the `read`/`write`/`edit` filesystem tools, the bash tool suite, `subagent` delegation, and the `todo_write` task tracker on the `@deepseek-ai/dsh-stdio-demo` app's readline front door.
-
-Run with: `pnpm run demo:repl` (needs `DEEPSEEK_API_KEY` in the environment or a gitignored repo-root `.env`). See [repl-agent/README.md](repl-agent/README.md) for details.
-
-Run the Code Mode overlay with `pnpm run demo:code-mode`, or pass `acp` for the ACP example. See the [Code Mode example](repl-agent/README.md#code-mode) for its composition and a sample task.
+Optional overlays that connect supported third-party memory servers through the generic MCP client. See the [memory example reference](mcp-memory/README.md).
 
 ## headless-agent
 
-A non-interactive agent demo that accepts one positional task, runs one complete model/tool turn on the `@deepseek-ai/dsh-cli-demo` app, persists a fresh session, prints `text`, `json`, or `stream-json`, and exits.
-
-Run with: `pnpm run demo:headless -- "task"` (needs `DEEPSEEK_API_KEY`). See [headless-agent/README.md](headless-agent/README.md) for the output contract, safety boundaries, and snapshot suite.
-
-## tui-agent
-
-The full-screen terminal sibling of `repl-agent`: it reuses the same coding backends and tools while forcing the shared terminal app to `dsh-tui`. It is the home of TUI PTY and snapshot scenarios.
-
-Run with: `pnpm run demo:tui` (needs `DEEPSEEK_API_KEY`). See [tui-agent/README.md](tui-agent/README.md) for controls and composition.
+A non-interactive agent that accepts one task, runs it, and emits a selected machine-readable or human-readable output format. See the [headless example reference](headless-agent/README.md).
 
 ## jsonrpc-agent
 
-An unattended coding agent driven through the Python SDK: JSON-RPC stdio, foreground-only `bash`, `read` / `write` / `edit`, one foreground `subagent`, `todo_write`, JSONL persistence, and compaction. It excludes terminal UI, stdout logging, approvals, skills, and background task controls. See [jsonrpc-agent/README.md](jsonrpc-agent/README.md).
+An unattended coding agent driven through the Python SDK and JSON-RPC. See the [JSON-RPC example reference](jsonrpc-agent/README.md).
 
-## cordis-agent
+## web-cordis
 
-The **self-referential** demo: the coding spine plus [`@deepseek-ai/dsh-tool-cordis`](../packages/cordis/tool-cordis), whose three tools (`cordis_inspect` / `cordis_mount` / `cordis_unmount`) let the agent inspect the live cordis runtime it runs inside, mount model-written plugins into it (an event listener, a brand-new tool for itself, or a service another mount injects), and dispose them again — all dynamic mounts grouped under one `cordis-dynamic` fiber subtree. The `ctx.fs`/`ctx.web` services ride along provider-only, as the capabilities those plugins build on.
+A self-referential agent that can inspect and change its in-memory Cordis plugin tree. See the [web-cordis example reference](web-cordis/README.md).
 
-Run with: `pnpm run demo:cordis` (needs `DEEPSEEK_API_KEY`). See [cordis-agent/README.md](cordis-agent/README.md) for the staged demo script and [the toolset Agent Note](../.agents/notes/implemented/feature/2026-07-08-self-referential-cordis-toolset.md) for the design and sandbox caveats.
+## web-schedule
+
+An opt-in Web overlay for durable, Session-local reminders. It supports positive whole-second `after_seconds` delays and absolute `at` targets through `schedule_create`, `schedule_list`, and `schedule_delete`; active reminders persist in the original Session, resume when that Session becomes live again, and do not run while it is cold. Run `dsh web --patch examples/web-schedule/cordis.yml`; see [web-schedule/README.md](web-schedule/README.md) for absolute-time authority, delivery, and recovery boundaries.
 
 ## acp-agent
 
-An agent demo exposed as an **Agent Client Protocol (ACP)** server over JSON-RPC stdio, via the [`@deepseek-ai/dsh-acp-demo`](../packages/examples/acp-demo) app — drive it from Zed or any other ACP client. It owns the ACP keyless snapshot suite.
-
-Run with: `pnpm run demo:acp` (needs `DEEPSEEK_API_KEY`); `pnpm run demo:code-mode acp` boots the same server in Code Mode via the `code-mode.cordis.yml` overlay. See [acp-agent/README.md](acp-agent/README.md) for the Zed setup and the snapshot-test design.
-
-The default `cordis.yml` composes [`@deepseek-ai/dsh-sandbox-local`](../packages/sandbox/sandbox-local), [`@deepseek-ai/dsh-bash-sandbox`](../packages/bash/bash-sandbox), [`@deepseek-ai/dsh-user-approval`](../packages/ui/user-approval), and [`@deepseek-ai/dsh-permission`](../packages/ui/permission). A capable client gets one `Permissions` select: `workspace-write` confines bash to the configured workspace and asks before a wider retry, while `danger-full-access` removes file confinement and disables approval prompts. A denied command can therefore surface a one-shot `session/request_permission` prompt in the editor; "Allow once" runs exactly that retry under the requested wider mode.
+An Agent Client Protocol automation server for programmatic clients, with session, permission, and cancellation support. See the [ACP example reference](acp-agent/README.md).

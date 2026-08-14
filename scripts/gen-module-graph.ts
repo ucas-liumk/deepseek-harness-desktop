@@ -21,6 +21,7 @@ const GROUP_ORDER = [
   'util',
   'llm',
   'core',
+  'goal',
   'bash',
   'fs',
   'skill',
@@ -30,11 +31,14 @@ const GROUP_ORDER = [
   'spill',
   'timeout',
   'todo',
+  'plan',
   'cordis',
   'hooks',
   'session-persistence',
   'session-query',
+  'session-title',
   'support',
+  'acp',
   'ui',
 ]
 

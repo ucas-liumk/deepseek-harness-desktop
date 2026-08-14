@@ -22,8 +22,10 @@ import {
   grantArgs,
   launcherPath,
   probe,
-} from 'node-addon-landlock-run';
+} from '@deepseek-ai/node-addon-landlock-run';
 
+const FATAL_PREFIX = 'landlock-run: ';
+const PARTIAL_NOTICE = 'landlock-run: partial enforcement (older Landlock ABI)';
 const requireLandlock = process.env.NALR_REQUIRE_LANDLOCK === '1';
 
 if (process.platform !== 'linux') {
@@ -43,6 +45,7 @@ const run = (args, options = {}) => spawnSync(launcher, args, { encoding: 'utf8'
 {
   const noCommand = run([]);
   assert.equal(noCommand.status, LAUNCHER_FAILURE_EXIT);
+  assert.ok(noCommand.stderr.startsWith(FATAL_PREFIX));
   assert.match(noCommand.stderr, /usage error: missing `-- <argv>\.\.\.` command/);
 
   const unknownFlag = run(['--bogus', '--', 'true']);
@@ -75,6 +78,7 @@ if (enforcement === 'unusable') {
   console.log('launcher.test: SKIP enforcement half — kernel does not enforce Landlock');
   process.exit(0);
 }
+const expectedNotice = enforcement === 'partial' ? `${PARTIAL_NOTICE}\n` : '';
 {
   const probeRun = run(['--probe']);
   assert.equal(probeRun.status, 0);
@@ -86,9 +90,14 @@ if (enforcement === 'unusable') {
   const echo = run([...grantArgs({ readOnly: ['/'] }), '--', '/bin/sh', '-c', 'echo confined-ok']);
   assert.equal(echo.status, 0, echo.stderr);
   assert.equal(echo.stdout, 'confined-ok\n');
+  assert.equal(echo.stderr, expectedNotice);
 
   const exitCode = run([...grantArgs({ readOnly: ['/'] }), '--', '/bin/sh', '-c', 'exit 7']);
   assert.equal(exitCode.status, 7, 'the wrapped command exit code must pass through unchanged');
+
+  const child125 = run([...grantArgs({ readOnly: ['/'] }), '--', '/bin/sh', '-c', `exit ${LAUNCHER_FAILURE_EXIT}`]);
+  assert.equal(child125.status, LAUNCHER_FAILURE_EXIT, 'a wrapped child may itself return the launcher failure status');
+  assert.equal(child125.stderr, expectedNotice);
 }
 
 // --- world-proofs: denied writes stay off disk, grants land, inheritance crosses exec ---
@@ -120,6 +129,7 @@ if (enforcement === 'unusable') {
   const marker = path.join(os.tmpdir(), `nalr-should-not-exist-${process.pid}`);
   const badGrant = run(['--ro', '/no/such/grant/root', '--', '/bin/sh', '-c', `echo x > ${marker}`]);
   assert.equal(badGrant.status, LAUNCHER_FAILURE_EXIT);
+  assert.ok(badGrant.stderr.startsWith(FATAL_PREFIX));
   assert.match(badGrant.stderr, /cannot open rule path/);
   assert.ok(!fs.existsSync(marker), 'the command must never run when the launcher fails');
 }

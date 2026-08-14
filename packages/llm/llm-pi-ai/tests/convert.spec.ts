@@ -1,5 +1,7 @@
-import { describe, expect, it } from 'vitest'
-import { CallId, CONTEXT_WINDOW_EXCEEDED_CODE, LlmError } from '@deepseek-ai/dsh-llm'
+import { describe, expect, it, vi } from 'vitest'
+import { AttachmentId } from '@deepseek-ai/dsh-attachment'
+import type { AttachmentStore } from '@deepseek-ai/dsh-attachment'
+import { createUserMessage, CallId, CONTEXT_WINDOW_EXCEEDED_CODE, EMPTY_RESPONSE_CODE, LlmError, createMessage } from '@deepseek-ai/dsh-llm'
 import type { ContentBlock, StreamChunk } from '@deepseek-ai/dsh-llm'
 import type { AssistantMessage, AssistantMessageEvent, Usage } from '@earendil-works/pi-ai'
 import { toPiContext } from '../src/context.ts'
@@ -47,7 +49,10 @@ describe('toPiContext', () => {
       provider: 'deepseek',
       model: 'deepseek-v4-flash',
       system: 'be helpful',
-      messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+      messages: [createUserMessage({
+        content: [{ type: 'text', text: 'hi' }],
+        source: { kind: 'plugin', plugin: 'test' },
+      })],
       tools: [{ name: 'f', description: 'F', parameters: { type: 'object', properties: {} } }],
     })
     expect(context.systemPrompt).toBe('be helpful')
@@ -63,18 +68,113 @@ describe('toPiContext', () => {
     expect(context.tools).toBeUndefined()
   })
 
+  it('resolves durable image references into native pi-ai image content', async () => {
+    const attachment = {
+      attachmentId: AttachmentId(`sha256:${'a'.repeat(64)}`),
+      mediaType: 'image/png' as const,
+      bytes: 3,
+      width: 1,
+      height: 1,
+    }
+    const readImage = vi.fn().mockResolvedValue({ ref: attachment, data: Uint8Array.of(1, 2, 3) })
+    const context = await toPiContext({
+      provider: 'openai',
+      model: 'gpt-4.1',
+      messages: [createUserMessage({
+        content: [{ type: 'text', text: 'describe' }, { type: 'image', attachment }],
+        source: { kind: 'plugin', plugin: 'test' },
+      })],
+    }, { readImage } as unknown as AttachmentStore)
+
+    expect(readImage).toHaveBeenCalledWith(attachment)
+    expect(context.messages[0]).toEqual({
+      role: 'user',
+      content: [
+        { type: 'text', text: 'describe' },
+        { type: 'image', data: 'AQID', mimeType: 'image/png' },
+      ],
+      timestamp: 0,
+    })
+  })
+
+  it('flattens nested tool-result images into the enclosing result', async () => {
+    const attachment = {
+      attachmentId: AttachmentId(`sha256:${'c'.repeat(64)}`),
+      mediaType: 'image/png' as const,
+      bytes: 3,
+      width: 1,
+      height: 1,
+    }
+    const readImage = vi.fn().mockResolvedValue({ ref: attachment, data: Uint8Array.of(1, 2, 3) })
+    const context = await toPiContext({
+      provider: 'openai',
+      model: 'gpt-4.1',
+      messages: [createUserMessage({
+        content: [{
+          type: 'tool-result',
+          toolCallId: CallId('outer'),
+          content: [
+            { type: 'tool-result', toolCallId: CallId('empty'), content: [] },
+            { type: 'text', text: 'before' },
+            { type: 'tool-result', toolCallId: CallId('text'), content: [{ type: 'text', text: 'middle' }] },
+            {
+              type: 'tool-result',
+              toolCallId: CallId('inner'),
+              content: [
+                { type: 'image', attachment },
+                { type: 'text', text: 'after' },
+              ],
+            },
+          ],
+        }],
+        source: { kind: 'plugin', plugin: 'test' },
+      })],
+    }, { readImage } as unknown as AttachmentStore)
+
+    expect(context.messages).toEqual([{
+      role: 'toolResult',
+      toolCallId: 'outer',
+      toolName: 'unknown',
+      content: [
+        { type: 'text', text: 'before' },
+        { type: 'text', text: 'middle' },
+        { type: 'image', data: 'AQID', mimeType: 'image/png' },
+        { type: 'text', text: 'after' },
+      ],
+      isError: false,
+      timestamp: 0,
+    }])
+  })
+
+  it('rejects structured image history when no durable resolver is supplied', () => {
+    expect(() => toPiContext({
+      provider: 'openai', model: 'gpt-4.1',
+      messages: [createUserMessage({
+        content: [{
+          type: 'image',
+          attachment: {
+            attachmentId: AttachmentId(`sha256:${'b'.repeat(64)}`),
+            mediaType: 'image/png', bytes: 1, width: 1, height: 1,
+          },
+        }],
+        source: { kind: 'plugin', plugin: 'test' },
+      })],
+    })).toThrow(expect.objectContaining({ code: 'UNSUPPORTED_CONTENT' }))
+  })
+
   it('maps assistant text/reasoning/tool-call blocks', () => {
     const context = toPiContext({
       provider: 'deepseek',
       model: 'm',
-      messages: [{
+      messages: [createMessage({
         role: 'assistant',
         content: [
           { type: 'reasoning', text: 'hmm' },
           { type: 'text', text: 'calling' },
           { type: 'tool-call', id: CallId('c1'), name: 'f', arguments: '{"a":1}' },
         ],
-      }],
+        source: { kind: 'plugin', plugin: 'test' },
+      })],
     })
     const message = context.messages[0] as AssistantMessage
     expect(message.role).toBe('assistant')
@@ -90,19 +190,41 @@ describe('toPiContext', () => {
     const context = toPiContext({
       provider: 'deepseek',
       model: 'm',
-      messages: [{ role: 'assistant', content: [{ type: 'text', text: 'done' }] }],
+      messages: [createMessage({
+        role: 'assistant', content: [{ type: 'text', text: 'done' }],
+        source: { kind: 'plugin', plugin: 'test' },
+      })],
     })
     expect((context.messages[0] as AssistantMessage).stopReason).toBe('stop')
+  })
+
+  it('preserves provider and model for foreign assistant messages without replay state', () => {
+    const context = toPiContext({
+      provider: 'openai',
+      model: 'new-model',
+      messages: [createMessage({
+        role: 'assistant',
+        content: [{ type: 'text', text: 'done' }],
+        source: { kind: 'model', provider: 'deepseek', model: 'old-model' },
+      })],
+    })
+    expect(context.messages[0]).toMatchObject({
+      role: 'assistant',
+      api: 'dsh-foreign',
+      provider: 'deepseek',
+      model: 'old-model',
+    })
   })
 
   it('parses malformed tool-call arguments to {}', () => {
     const context = toPiContext({
       provider: 'deepseek',
       model: 'm',
-      messages: [{
+      messages: [createMessage({
         role: 'assistant',
         content: [{ type: 'tool-call', id: CallId('c1'), name: 'f', arguments: '{broken' }],
-      }],
+        source: { kind: 'plugin', plugin: 'test' },
+      })],
     })
     const message = context.messages[0] as AssistantMessage
     expect(message.content[0]).toEqual({ type: 'toolCall', id: 'c1', name: 'f', arguments: {} })
@@ -112,10 +234,11 @@ describe('toPiContext', () => {
     const context = toPiContext({
       provider: 'deepseek',
       model: 'm',
-      messages: [{
+      messages: [createMessage({
         role: 'assistant',
         content: [{ type: 'tool-call', id: CallId('c1'), name: 'f', arguments: '[1,2]' }],
-      }],
+        source: { kind: 'plugin', plugin: 'test' },
+      })],
     })
     expect((context.messages[0] as AssistantMessage).content[0]).toMatchObject({ arguments: {} })
   })
@@ -125,21 +248,30 @@ describe('toPiContext', () => {
       provider: 'deepseek',
       model: 'm',
       messages: [
-        {
+        createMessage({
           role: 'assistant',
           content: [{ type: 'tool-call', id: CallId('c1'), name: 'get_weather', arguments: '{}' }],
-        },
-        {
-          role: 'user',
-          content: [{ type: 'tool-result', toolCallId: CallId('c1'), content: [{ type: 'text', text: 'Sunny' }] }],
-        },
+          source: { kind: 'plugin', plugin: 'test' },
+        }),
+        createUserMessage({
+          content: [{
+            type: 'tool-result',
+            toolCallId: CallId('c1'),
+            content: [
+              { type: 'text', text: 'Sunny' },
+              { type: 'tool-result', toolCallId: CallId('nested'), content: [{ type: 'text', text: '!' }] },
+              { type: 'chart', data: 'ignored' } as unknown as ContentBlock,
+            ],
+          }],
+          source: { kind: 'plugin', plugin: 'test' },
+        }),
       ],
     })
     expect(context.messages[1]).toEqual({
       role: 'toolResult',
       toolCallId: 'c1',
       toolName: 'get_weather',
-      content: [{ type: 'text', text: 'Sunny' }],
+      content: [{ type: 'text', text: 'Sunny!' }],
       isError: false,
       timestamp: 0,
     })
@@ -149,10 +281,10 @@ describe('toPiContext', () => {
     const context = toPiContext({
       provider: 'deepseek',
       model: 'm',
-      messages: [{
-        role: 'user',
+      messages: [createUserMessage({
         content: [{ type: 'tool-result', toolCallId: CallId('zz'), content: [], isError: true }],
-      }],
+        source: { kind: 'plugin', plugin: 'test' },
+      })],
     })
     expect(context.messages[0]).toMatchObject({
       role: 'toolResult',
@@ -167,14 +299,17 @@ describe('toPiContext', () => {
       provider: 'deepseek',
       model: 'm',
       messages: [
-        { role: 'system', content: [{ type: 'text', text: 'rule' }] },
-        {
-          role: 'user',
+        createMessage({
+          role: 'system', content: [{ type: 'text', text: 'rule' }],
+          source: { kind: 'plugin', plugin: 'test' },
+        }),
+        createUserMessage({
           content: [
             { type: 'text', text: 'note' },
             { type: 'tool-result', toolCallId: CallId('c1'), content: [{ type: 'text', text: 'ok' }] },
           ],
-        },
+          source: { kind: 'plugin', plugin: 'test' },
+        }),
       ],
     })
     expect(context.messages.map(message => message.role)).toEqual(['user', 'user', 'toolResult'])
@@ -184,13 +319,14 @@ describe('toPiContext', () => {
     const context = toPiContext({
       provider: 'deepseek',
       model: 'm',
-      messages: [{
+      messages: [createMessage({
         role: 'assistant',
         content: [
           { type: 'chart', data: 'x' } as unknown as ContentBlock,
           { type: 'text', text: 'visible' },
         ],
-      }],
+        source: { kind: 'plugin', plugin: 'test' },
+      })],
     })
     expect((context.messages[0] as AssistantMessage).content).toEqual([{ type: 'text', text: 'visible' }])
   })
@@ -212,15 +348,18 @@ describe('toPiContext', () => {
     const context = toPiContext({
       provider: 'anthropic',
       model: 'claude-next',
-      messages: [{
+      messages: [createMessage({
         role: 'assistant',
         content: [
           { type: 'reasoning', text: 'private reasoning' },
           { type: 'text', text: 'calling' },
           { type: 'tool-call', id: CallId('c1'), name: 'f', arguments: '{"a":1}' },
         ],
-        provenance: { provider: 'openai', model: 'gpt-5', replayState: state },
-      }],
+        source: {
+          kind: 'model',
+          ...{ provider: 'openai', model: 'gpt-5', replayState: state },
+        },
+      })],
     })
 
     expect(context.messages[0]).toMatchObject({
@@ -250,15 +389,18 @@ describe('toPiContext', () => {
     const context = toPiContext({
       provider: 'deepseek',
       model: 'new-model',
-      messages: [{
+      messages: [createMessage({
         role: 'assistant',
         content: [
           { type: 'reasoning', text: 'private reasoning' },
           { type: 'text', text: 'calling' },
           { type: 'tool-call', id: CallId('c1'), name: 'f', arguments: '{"a":1}' },
         ],
-        provenance: { provider: 'deepseek', model: 'deepseek-v4-flash', replayState: state },
-      }],
+        source: {
+          kind: 'model',
+          ...{ provider: 'deepseek', model: 'deepseek-v4-flash', replayState: state },
+        },
+      })],
     })
 
     expect(context.messages[0]).toMatchObject({
@@ -278,15 +420,18 @@ describe('toPiContext', () => {
       toPiContext({
         provider: 'deepseek',
         model: 'm',
-        messages: [{
+        messages: [createMessage({
           role: 'assistant',
           content: [{ type: 'text', text: 'done' }],
-          provenance: {
-            provider: 'deepseek',
-            model: 'old',
-            replayState: { kind: 'pi-ai', version: 2 },
+          source: {
+            kind: 'model',
+            ...{
+              provider: 'deepseek',
+              model: 'old',
+              replayState: { kind: 'pi-ai', version: 2 },
+            },
           },
-        }],
+        })],
       })
       expect.fail('expected invalid replay state')
     } catch (error: unknown) {
@@ -301,11 +446,14 @@ describe('toPiContext', () => {
     expect(() => toPiContext({
       provider: 'deepseek',
       model: 'm',
-      messages: [{
+      messages: [createMessage({
         role: 'assistant',
         content: [{ type: 'reasoning', text: 'done' }],
-        provenance: { provider: 'deepseek', model: 'deepseek-v4-flash', replayState: state },
-      }],
+        source: {
+          kind: 'model',
+          ...{ provider: 'deepseek', model: 'deepseek-v4-flash', replayState: state },
+        },
+      })],
     })).toThrow(/block 0 does not match assistant content/)
   })
 
@@ -314,11 +462,14 @@ describe('toPiContext', () => {
     expect(() => toPiContext({
       provider: 'deepseek',
       model: 'm',
-      messages: [{
+      messages: [createMessage({
         role: 'assistant',
         content: [{ type: 'text', text: 'done' }],
-        provenance: { provider: 'deepseek', model: 'deepseek-v4-flash', replayState: state },
-      }],
+        source: {
+          kind: 'model',
+          ...{ provider: 'deepseek', model: 'deepseek-v4-flash', replayState: state },
+        },
+      })],
     })).toThrow(/block count does not match assistant content/)
   })
 
@@ -335,22 +486,25 @@ describe('toPiContext', () => {
   it.each([
     ['provider', { ...validReplay, provider: 'openai' }],
     ['model', { ...validReplay, model: 'deepseek-v4-pro' }],
-  ])('rejects replay metadata whose %s differs from assistant provenance', (field, replayState) => {
+  ])('rejects replay metadata whose %s differs from assistant source', (field, replayState) => {
     try {
       toPiContext({
         provider: 'deepseek',
         model: 'next-model',
-        messages: [{
+        messages: [createMessage({
           role: 'assistant',
           content: [{ type: 'text', text: 'done' }],
-          provenance: { provider: 'deepseek', model: 'deepseek-v4-flash', replayState },
-        }],
+          source: {
+            kind: 'model',
+            ...{ provider: 'deepseek', model: 'deepseek-v4-flash', replayState },
+          },
+        })],
       })
       expect.fail('expected invalid replay state')
     } catch (error: unknown) {
       expect(error).toBeInstanceOf(LlmError)
       expect((error as LlmError).code).toBe('INVALID_REPLAY_STATE')
-      expect((error as Error).message).toContain(`${field} does not match assistant provenance`)
+      expect((error as Error).message).toContain(`${field} does not match assistant source`)
     }
   })
 
@@ -376,11 +530,14 @@ describe('toPiContext', () => {
     expect(() => toPiContext({
       provider: 'deepseek',
       model: 'm',
-      messages: [{
+      messages: [createMessage({
         role: 'assistant',
         content: [{ type: 'text', text: 'done' }],
-        provenance: { provider: 'deepseek', model: 'deepseek-v4-flash', replayState },
-      }],
+        source: {
+          kind: 'model',
+          ...{ provider: 'deepseek', model: 'deepseek-v4-flash', replayState },
+        },
+      })],
     })).toThrow(message)
   })
 })
@@ -485,19 +642,31 @@ describe('toStreamChunks', () => {
     )))
     expect(chunks).toEqual([
       { type: 'usage', usage: { inputTokens: 1, outputTokens: 0 } },
-      { type: 'finish', reason: { kind: 'error', message: 'boom', code: 'PI_AI_ERROR' } },
+      { type: 'finish', reason: { kind: 'error', failure: { message: 'boom', code: 'PI_AI_ERROR' } } },
     ])
   })
 
   it('maps aborted error events to aborted finish', async () => {
     const error = assistant({ stopReason: 'aborted' })
     const chunks = await collect(toStreamChunks(feed({ type: 'error', reason: 'aborted', error })))
-    expect(chunks.at(-1)).toEqual({ type: 'finish', reason: { kind: 'aborted' } })
+    expect(chunks.at(-1)).toEqual({
+      type: 'finish',
+      reason: { kind: 'aborted', failure: { message: 'pi-ai stream aborted', code: 'ABORTED' } },
+    })
   })
 
   it('rejects a stream that ends without done or error', async () => {
     await expect(collect(toStreamChunks(feed({ type: 'start', partial: assistant() }))))
       .rejects.toThrow(/without done\/error/)
+  })
+
+  it('preserves an unknown SDK iterator Error exactly', async () => {
+    const original = Object.assign(new Error('SDK transport exploded'), { code: 'ECONNRESET' })
+    async function* failedSdkStream(): AsyncGenerator<AssistantMessageEvent> {
+      throw original
+    }
+
+    await expect(collect(toStreamChunks(failedSdkStream()))).rejects.toBe(original)
   })
 })
 
@@ -506,62 +675,109 @@ describe('mapStopReason / mapUsage', () => {
     ['stop', { kind: 'stop' }],
     ['length', { kind: 'max-tokens' }],
     ['toolUse', { kind: 'tool-calls' }],
-    ['aborted', { kind: 'aborted' }],
+    ['aborted', { kind: 'aborted', failure: { message: 'pi-ai stream aborted', code: 'ABORTED' } }],
   ] as const)('maps %s', (stopReason, expected) => {
-    expect(mapStopReason(assistant({ stopReason }))).toEqual(expected)
+    expect(mapStopReason(assistant({ stopReason, content: [{ type: 'text', text: 'ok' }] }))).toEqual(expected)
+  })
+
+  it('classifies a completed stop with no content as an EMPTY_RESPONSE error', () => {
+    expect(mapStopReason(assistant({ stopReason: 'stop' }))).toEqual({
+      kind: 'error',
+      failure: {
+        message: 'model "deepseek-v4-flash" returned a completed response with no content',
+        code: EMPTY_RESPONSE_CODE,
+      },
+    })
+  })
+
+  it('keeps a thinking-only stop successful (any block counts as content)', () => {
+    expect(mapStopReason(assistant({ stopReason: 'stop', content: [{ type: 'thinking', thinking: 'mull' }] })))
+      .toEqual({ kind: 'stop' })
   })
 
   it('defaults the error message when pi-ai omits it', () => {
     expect(mapStopReason(assistant({ stopReason: 'error' })))
-      .toEqual({ kind: 'error', message: 'pi-ai stream error', code: 'PI_AI_ERROR' })
+      .toEqual({ kind: 'error', failure: { message: 'pi-ai stream error', code: 'PI_AI_ERROR' } })
   })
 
   it('maps routable HTTP-ish error messages to stable codes', () => {
     expect(mapStopReason(assistant({ stopReason: 'error', errorMessage: 'HTTP 401: bad key' })))
-      .toMatchObject({ kind: 'error', code: 'AUTH' })
+      .toMatchObject({ kind: 'error', failure: { code: 'AUTH' } })
     expect(mapStopReason(assistant({ stopReason: 'error', errorMessage: 'HTTP 429: rate limit' })))
-      .toMatchObject({ kind: 'error', code: 'RATE_LIMIT' })
+      .toMatchObject({ kind: 'error', failure: { code: 'RATE_LIMIT' } })
+    expect(mapStopReason(assistant({ stopReason: 'error', errorMessage: 'HTTP 429: insufficient_quota' })))
+      .toMatchObject({ kind: 'error', failure: { code: 'QUOTA' } })
+    expect(mapStopReason(assistant({
+      stopReason: 'error',
+      errorMessage: 'OpenAI API error (429): You exceeded your current quota, please check your plan and billing details.',
+    }))).toMatchObject({ kind: 'error', failure: { code: 'QUOTA' } })
     expect(mapStopReason(assistant({ stopReason: 'error', errorMessage: 'HTTP 500: backend down' })))
-      .toMatchObject({ kind: 'error', code: 'SERVER' })
+      .toMatchObject({ kind: 'error', failure: { code: 'SERVER' } })
+    expect(mapStopReason(assistant({ stopReason: 'error', errorMessage: 'provider timed out' })))
+      .toMatchObject({ kind: 'error', failure: { code: 'TIMEOUT' } })
+    expect(mapStopReason(assistant({ stopReason: 'error', errorMessage: 'ECONNRESET socket closed' })))
+      .toMatchObject({ kind: 'error', failure: { code: 'TRANSPORT' } })
     expect(mapStopReason(assistant({
       stopReason: 'error',
       errorMessage: 'HTTP 400: input exceeds the model context window limit',
-    }))).toMatchObject({ kind: 'error', code: CONTEXT_WINDOW_EXCEEDED_CODE })
+    }))).toMatchObject({ kind: 'error', failure: { code: CONTEXT_WINDOW_EXCEEDED_CODE } })
     expect(mapStopReason(assistant({
       stopReason: 'error',
       errorMessage: 'HTTP 400: request too large for model context',
-    }))).toMatchObject({ kind: 'error', code: CONTEXT_WINDOW_EXCEEDED_CODE })
+    }))).toMatchObject({ kind: 'error', failure: { code: CONTEXT_WINDOW_EXCEEDED_CODE } })
     expect(mapStopReason(assistant({
       stopReason: 'error',
       errorMessage: 'HTTP 400: invalid input: temperature exceeds maximum allowed value',
-    }))).toMatchObject({ kind: 'error', code: 'INVALID_REQUEST' })
+    }))).toMatchObject({ kind: 'error', failure: { code: 'INVALID_REQUEST' } })
+  })
+
+  it.each([
+    'other side closed',
+    'HTTP2 request did not get a response',
+    'WebSocket closed unexpectedly',
+    // undici flattens a mid-stream socket drop to this bare word (its SocketError
+    // cause is discarded upstream before it reaches us).
+    'terminated',
+    'Premature close',
+    // pi-ai's per-provider throws when the wire closes before the terminal event.
+    'Anthropic stream ended before message_stop',
+    'OpenAI Responses stream ended before a terminal response event',
+    'openrouter stream ended without a terminal event',
+    'Stream ended without finish_reason',
+  ])('maps pi-ai transport wording %j', (errorMessage) => {
+    expect(mapStopReason(assistant({ stopReason: 'error', errorMessage })))
+      .toMatchObject({ kind: 'error', failure: { code: 'TRANSPORT' } })
   })
 
   it('uses pi-ai provider-specific overflow classification without losing rate-limit exclusions', () => {
     expect(mapStopReason(assistant({
       stopReason: 'error',
       errorMessage: 'prompt is too long: 213462 tokens > 200000 maximum',
-    }))).toMatchObject({ kind: 'error', code: CONTEXT_WINDOW_EXCEEDED_CODE })
+    }))).toMatchObject({ kind: 'error', failure: { code: CONTEXT_WINDOW_EXCEEDED_CODE } })
     expect(mapStopReason(assistant({
       stopReason: 'error',
       errorMessage: 'ThrottlingException: Too many tokens, rate limit reached',
-    }))).toMatchObject({ kind: 'error', code: 'RATE_LIMIT' })
+    }))).toMatchObject({ kind: 'error', failure: { code: 'RATE_LIMIT' } })
   })
 
   it('uses the resolved context window for silent and length-stop overflows', () => {
-    const silent = assistant({ stopReason: 'stop', usage: usage(101, 0) })
+    // Non-empty content keeps the no-window branch on the successful stop path
+    // (an empty stop is EMPTY_RESPONSE, covered above); overflow wins over both.
+    const silent = assistant({ stopReason: 'stop', usage: usage(101, 0), content: [{ type: 'text', text: 'x' }] })
     expect(mapStopReason(silent)).toEqual({ kind: 'stop' })
     expect(mapStopReason(silent, 100)).toEqual({
       kind: 'error',
-      message: 'pi-ai detected context overflow for model "deepseek-v4-flash"',
-      code: CONTEXT_WINDOW_EXCEEDED_CODE,
+      failure: {
+        message: 'pi-ai detected context overflow for model "deepseek-v4-flash"',
+        code: CONTEXT_WINDOW_EXCEEDED_CODE,
+      },
     })
 
     const truncated = assistant({ stopReason: 'length', usage: usage(80, 0, 19) })
     expect(mapStopReason(truncated)).toEqual({ kind: 'max-tokens' })
     expect(mapStopReason(truncated, 100)).toMatchObject({
       kind: 'error',
-      code: CONTEXT_WINDOW_EXCEEDED_CODE,
+      failure: { code: CONTEXT_WINDOW_EXCEEDED_CODE },
     })
   })
 

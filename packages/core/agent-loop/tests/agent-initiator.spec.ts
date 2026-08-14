@@ -1,13 +1,15 @@
 import { describe, expect, it } from 'vitest'
-import { Context, type Fiber } from 'cordis'
+import { Context, type Fiber } from '@deepseek-ai/cordis'
 import AgentRegistry, { type Agent } from '@deepseek-ai/dsh-agent'
 import AgentLoop from '@deepseek-ai/dsh-agent-loop'
-import LlmService, { CallId, LlmAdapter } from '@deepseek-ai/dsh-llm'
+import LlmRuntime, { createUserMessage, CallId, LlmAdapter  } from '@deepseek-ai/dsh-llm'
 import type { GenerateOptions, StreamChunk } from '@deepseek-ai/dsh-llm'
 import SessionStore, { SessionId } from '@deepseek-ai/dsh-session'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
-import ToolRegistry, { defineTool } from '@deepseek-ai/dsh-tools'
+import ToolRuntime, { defineContentToolFixture } from '@deepseek-ai/dsh-tools'
 import { MockAdapter, textResponse, toolCallResponse } from './mock-adapter.ts'
+
+const testToolSignal = new AbortController().signal
 
 interface Harness {
   ctx: Context
@@ -17,10 +19,10 @@ interface Harness {
 
 async function harness(adapter: LlmAdapter): Promise<Harness> {
   const ctx = new Context()
-  await ctx.plugin(LlmService)
+  await ctx.plugin(LlmRuntime)
   await ctx.plugin(SessionStore)
   await ctx.plugin(SystemPrompt)
-  await ctx.plugin(ToolRegistry)
+  await ctx.plugin(ToolRuntime)
   const agentsFiber = await ctx.plugin(AgentRegistry)
   const loopFiber = await ctx.plugin(AgentLoop, { agents: [] })
   ctx.llm.registerAdapter(['mock'], adapter)
@@ -29,7 +31,7 @@ async function harness(adapter: LlmAdapter): Promise<Harness> {
 
 function waitForIdle(ctx: Context, agent: Agent): Promise<void> {
   return new Promise((resolve) => {
-    const dispose = ctx.on('agent/status', (subject, status) => {
+    const dispose = ctx.on('agent/status', ({ agent: subject, status }) => {
       if (subject === agent && status === 'idle') {
         dispose()
         resolve()
@@ -39,7 +41,7 @@ function waitForIdle(ctx: Context, agent: Agent): Promise<void> {
 }
 
 function send(agent: Agent, text: string): void {
-  agent.send([{ type: 'text', text }])
+  agent.followup(createUserMessage({ content: [{ type: 'text', text }], source: { kind: 'user' } }))
 }
 
 /** Adapter that holds both drivers at the same awaited continuation. */
@@ -117,10 +119,10 @@ describe('AgentLoop initiator scope', () => {
   it('keeps overlapping driver continuations bound to their exact Agents', async () => {
     const ctx = new Context()
     const adapter = new OverlapAdapter(ctx)
-    await ctx.plugin(LlmService)
+    await ctx.plugin(LlmRuntime)
     await ctx.plugin(SessionStore)
     await ctx.plugin(SystemPrompt)
-    await ctx.plugin(ToolRegistry)
+    await ctx.plugin(ToolRuntime)
     await ctx.plugin(AgentRegistry)
     await ctx.plugin(AgentLoop, { agents: [] })
     ctx.llm.registerAdapter(['mock'], adapter)
@@ -142,6 +144,74 @@ describe('AgentLoop initiator scope', () => {
     await ctx.fiber.dispose()
   })
 
+  it('keeps initiator identity minimal while one explicit signal spans each turn seam', async () => {
+    const adapter = new MockAdapter([
+      toolCallResponse('observe-call', 'observe', {}),
+      textResponse('first done'),
+      textResponse('second done'),
+    ])
+    const { ctx } = await harness(adapter)
+    const agent = ctx.agentLoop.create(SessionId('signal-owner'), { provider: 'mock', model: 'mock' })
+    let signals: AbortSignal[] = []
+    let preStepSignals: AbortSignal[] = []
+    const capture = (signal: AbortSignal | undefined): void => {
+      if (signal === undefined) throw new Error('turn seam omitted its explicit signal')
+      expect(ctx.agents.requireInitiator()).toBe(agent)
+      signals.push(signal)
+    }
+
+    ctx.on('system-prompt/assemble', async (_assembly, context, next) => {
+      if (context.agent === agent) capture(context.signal)
+      return next()
+    })
+    ctx.on('agent/pre-step', async ({ agent: subject, signal }, next) => {
+      if (subject === agent) {
+        expect(ctx.agents.requireInitiator()).toBe(agent)
+        preStepSignals.push(signal)
+      }
+      return next()
+    })
+    ctx.on('agent/request', async ({ agent: subject, signal }, next) => {
+      if (subject === agent) capture(signal)
+      return next()
+    })
+    ctx.on('agent/turn-stopping', ({ agent: subject, signal }) => {
+      if (subject === agent) capture(signal)
+    })
+    ctx.tools.register(defineContentToolFixture({
+      name: 'observe',
+      description: 'observe explicit turn state',
+      parameters: {},
+      execute: async (_args, exec) => {
+        capture(exec.signal)
+        return [{ type: 'text', text: 'observed' }]
+      },
+    }))
+
+    const firstIdle = waitForIdle(ctx, agent)
+    send(agent, 'first')
+    await firstIdle
+    const firstSignal = signals[0]
+    expect(firstSignal).toBeDefined()
+    expect(new Set([...signals, ...adapter.requests.slice(0, 2).map(request => request.signal!)])).toEqual(new Set([firstSignal]))
+    expect(preStepSignals).toHaveLength(2)
+    expect(new Set(preStepSignals)).toEqual(new Set([firstSignal]))
+
+    signals = []
+    preStepSignals = []
+    const secondIdle = waitForIdle(ctx, agent)
+    send(agent, 'second')
+    await secondIdle
+    const secondSignal = signals[0]
+    expect(secondSignal).toBeDefined()
+    expect(new Set([...signals, adapter.requests[2]!.signal!])).toEqual(new Set([secondSignal]))
+    expect(preStepSignals).toHaveLength(1)
+    expect(preStepSignals[0]).toBe(secondSignal)
+    expect(secondSignal).not.toBe(firstSignal)
+    expect(ctx.agents.currentInitiator()).toBeUndefined()
+    await ctx.fiber.dispose()
+  })
+
   it('keeps child setup under the parent boundary and restores the parent while the child driver remains active', async () => {
     const adapter = new MockAdapter([
       toolCallResponse('spawn', 'spawn-child', {}),
@@ -156,7 +226,7 @@ describe('AgentLoop initiator scope', () => {
     let parentWhileChildDriverActive: Agent | undefined
     let child: Agent | undefined
 
-    ctx.tools.register(defineTool({
+    ctx.tools.register(defineContentToolFixture({
       name: 'spawn-child',
       description: 'create one child agent',
       parameters: {},
@@ -168,7 +238,7 @@ describe('AgentLoop initiator scope', () => {
           setup: (agentCtx) => {
             parentDuringSetup = ctx.agents.requireInitiator()
             explicitChild = agentCtx.agent
-            agentCtx.tools.register(defineTool({
+            agentCtx.tools.register(defineContentToolFixture({
               name: 'observe-child',
               description: 'observe child execution identity',
               parameters: {},
@@ -216,7 +286,7 @@ describe('AgentLoop initiator scope', () => {
     let directAmbient: Agent | undefined
     let captured: Agent | undefined
 
-    ctx.tools.register(defineTool({
+    ctx.tools.register(defineContentToolFixture({
       name: 'agentless-probe',
       description: 'observe an agentless call',
       parameters: {},
@@ -226,7 +296,7 @@ describe('AgentLoop initiator scope', () => {
         return [{ type: 'text', text: 'ok' }]
       },
     }))
-    ctx.tools.register(defineTool({
+    ctx.tools.register(defineContentToolFixture({
       name: 'capability-request',
       description: 'call the test capability transport',
       parameters: { path: { type: 'string' } },
@@ -239,6 +309,7 @@ describe('AgentLoop initiator scope', () => {
     }))
 
     const direct = await ctx.tools.execute({
+      signal: testToolSignal,
       callId: CallId('direct'),
       name: 'agentless-probe',
       arguments: {},
@@ -266,7 +337,6 @@ describe('AgentLoop initiator scope', () => {
     expect(captured).toBe(handle.agent)
 
     await handle.dispose()
-    expect(captured?.status).toBe('disposed')
     expect(ctx.agents.currentInitiator()).toBeUndefined()
     await ctx.fiber.dispose()
   })
@@ -288,7 +358,6 @@ describe('AgentLoop initiator scope', () => {
     await loopFiber.await()
     expect(adapter.firstAgentDuringAbort?.id).toBe(oldAgent.id)
     expect(adapter.firstAgentDuringAbort?.session).toBe(oldAgent.session)
-    expect(oldAgent.status).toBe('disposed')
     expect(() => oldService.currentInitiator()).toThrow('agent initiator scope is disposed')
     expect(ctx.agents).not.toBe(oldService)
     adapter.agents = ctx.agents
@@ -309,10 +378,10 @@ describe('AgentLoop initiator scope', () => {
   it('keeps ALS readable while root disposal drains sibling AgentLoop fibers', async () => {
     const ctx = new Context()
     const adapter = new ReloadAdapter()
-    await ctx.plugin(LlmService)
+    await ctx.plugin(LlmRuntime)
     await ctx.plugin(SessionStore)
     await ctx.plugin(SystemPrompt)
-    await ctx.plugin(ToolRegistry)
+    await ctx.plugin(ToolRuntime)
     await ctx.plugin(AgentRegistry)
     await ctx.plugin(AgentLoop, { agents: [] })
     ctx.llm.registerAdapter(['mock'], adapter)
@@ -329,7 +398,6 @@ describe('AgentLoop initiator scope', () => {
     await ctx.fiber.dispose()
     expect(adapter.firstAgentDuringAbort?.id).toBe(agent.id)
     expect(adapter.firstAgentDuringAbort?.session).toBe(agent.session)
-    expect(agent.status).toBe('disposed')
     expect(() => service.currentInitiator()).toThrow('agent initiator scope is disposed')
   })
 })

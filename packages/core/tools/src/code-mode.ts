@@ -1,45 +1,133 @@
 /**
  * Code Mode `run_code` transport. Programs call the registry's agent-visible
- * tools through nested, sequential executions; each sub-dispatch is logged for
- * reconstruction, while only the outer curated result enters model history.
+ * tools through nested executions scheduled under the native concurrency
+ * contract; each sub-dispatch is logged for reconstruction, while only the
+ * outer curated result enters model history.
  * @module @deepseek-ai/dsh-tools/src/code-mode
  */
 
-import { parse } from 'node:path'
-import { inspect } from 'node:util'
 import { CallId, HarnessError } from '@deepseek-ai/dsh-llm'
 import type { ContentBlock } from '@deepseek-ai/dsh-llm'
 import type { CodeBindingFunction, CodeRunResult, CodeRuntime } from '@deepseek-ai/dsh-code-runtime'
-import type {} from '@deepseek-ai/dsh-session'
-import { defineTool } from './schema.ts'
-import type { ToolDefinition, ToolRegistry } from './index.ts'
-
-declare module '@deepseek-ai/dsh-session' {
-  interface SessionEventMap {
-    /**
-     * One bridged sub-dispatch from a `run_code` program: the parent
-     * `run_code` call id, the deterministic sub-call id
-     * (`<parent>:code:<n>`), the tool `name` with its JSON-normalized
-     * `arguments` — the exact value dispatched, normalized BEFORE dispatch,
-     * so this append can never fail on payload shape — whether the sub-call
-     * errored, and a bounded `resultSummary` of its model-facing text. Before
-     * bounding, occurrences of a non-root session workspace path are
-     * normalized to `.` so host-specific absolute path lengths cannot change
-     * the summary.
-     * Log-only: `deriveMessages()` ignores it, so sub-calls never re-enter
-     * model context; persistence and UIs get every call. Appended inside the
-     * parent `run_code`'s execution (the bridge drains its queue before
-     * returning), so the turn-enclosure invariant holds by construction.
-     */
-    'tool/code-dispatch': { parentCallId: CallId; subCallId: CallId; name: string; arguments: unknown; isError: boolean; resultSummary: string }
-  }
-}
+import { snapshotJsonValue } from '@deepseek-ai/dsh-session'
+import type { JsonValue } from '@deepseek-ai/dsh-session'
+import { defineTool, parameterSchemaSpecToJsonSchema } from './schema.ts'
+import { TOOL_RUNTIME_SCHEDULER } from './index.ts'
+import type { CodeDispatchLog, ToolDefinition, ToolExecutionResult, ToolRuntime, ToolRunContext } from './index.ts'
+import type {} from './types.ts'
 
 /** The model-facing name of the Code Mode tool. */
 export const RUN_CODE_NAME = 'run_code'
 
 /** The `tools:sdk` section order: inside the 100–199 tool-guidance band, after per-tool guidance sections. */
 export const SDK_SECTION_ORDER = 150
+
+/**
+ * The language-specific `run_code` schema text: the tool `description` and its
+ * `code` parameter description, kept together so a language's two model-facing
+ * strings share one source of truth. Keyed by `CodeRuntime.language`, mirroring
+ * `SDK_RENDERERS` in {@link ./index.ts}. The emitted flavor MUST match the
+ * semantics the same language's SDK instructions promise, so the model never
+ * receives a TypeScript schema beside a Python SDK (or vice versa).
+ */
+interface RunCodeFlavor {
+  /** The tool `description` the model sees for this language. */
+  readonly description: string
+  /** The `code` parameter's description for this language. */
+  readonly codeDescription: string
+}
+
+/**
+ * The TypeScript flavor: the fallback for a schema read with no runtime
+ * mounted ({@link resolveFlavor} owns which readers reach that). A real
+ * assembly always resolves a runtime first, so the model never sees this
+ * fallback outside its own language.
+ */
+const TYPESCRIPT_FLAVOR: RunCodeFlavor = {
+  description:
+    'Execute a TypeScript program against the available tools. Takes two required '
+    + 'arguments: `code`, the BODY of an async function (erasable syntax only; top-level '
+    + '`await` and `return` work), and `description`, a short summary of what the program '
+    + 'does. Call tools as `await tools.name(args)` per the declarations in the system '
+    + 'prompt. Only what you print or return comes back — curate it.',
+  codeDescription: 'The program: the body of an async TypeScript function.',
+}
+
+/**
+ * The Python flavor: the body of an async function, top-level `await` and
+ * `return`, answer via `print` and/or the returned value, matching
+ * {@link ./py-types.ts}'s SDK instructions.
+ */
+const PYTHON_FLAVOR: RunCodeFlavor = {
+  description:
+    'Execute a Python program against the available tools. Takes two required '
+    + 'arguments: `code`, the BODY of an async function (top-level `await` and `return` '
+    + 'work), and `description`, a short summary of what the program does. Call tools as '
+    + '`await tools.name(args)` per the declarations in the system prompt. Answer '
+    + 'with `print(...)` and/or `return <value>` — only that comes back, so curate it.',
+  codeDescription: 'The program: the body of an async Python function.',
+}
+
+/**
+ * The languages Code Mode ships a presentation for. Both per-language tables —
+ * {@link RUN_CODE_FLAVORS} here and `SDK_RENDERERS` in {@link ./index.ts} — are
+ * checked against this union with `satisfies`, so a language added to one and
+ * not the other fails `typecheck` instead of waiting for a runtime that reports
+ * it. The tables stay declared `Record<string, …>` because `CodeRuntime.language`
+ * is an unconstrained `string`: this union pins what the harness ships, while the
+ * `Object.hasOwn` guards reject what a mounted runtime may report.
+ */
+export type CodeSdkLanguage = 'typescript' | 'python'
+
+/** Per-language `run_code` schema flavors (see {@link RunCodeFlavor}); one entry per {@link CodeSdkLanguage}. */
+const RUN_CODE_FLAVORS: Record<string, RunCodeFlavor> = {
+  typescript: TYPESCRIPT_FLAVOR,
+  python: PYTHON_FLAVOR,
+} satisfies Record<CodeSdkLanguage, RunCodeFlavor>
+
+/**
+ * The `description` parameter's model-facing description: language-independent
+ * (the UI label contract is the same for every runtime), shared between the
+ * static spec and the language-aware `parameters` getter so the two emissions
+ * can never drift.
+ */
+const RUN_CODE_DESCRIPTION_PARAM_DESCRIPTION
+  = 'Clear, concise description of what this program does in active voice, '
+    + '5-10 words (shown in the UI). Examples: "Count TODO markers across packages"; '
+    + '"Read failing test and its fixture"; "Rename config key in every cordis.yml".'
+
+/**
+ * Resolve the {@link RunCodeFlavor} for the loaded runtime's language, read at
+ * schema-emission time so the model-visible `run_code` schema always matches
+ * the SDK section's language. `peekRuntime` returns `undefined` only when no
+ * runtime is mounted, which reaches this function through definition readers
+ * and `schemas()` — the doc-catalog harvest is the only shipped one, and none
+ * of them feeds a model, because `wireSchemas` calls `requireCodeRuntime`
+ * before projecting — so that path degrades to {@link TYPESCRIPT_FLAVOR}. A
+ * mounted runtime whose language has no flavor entry fails loud, exactly as
+ * `requireCodeRuntime` rejects it at assembly. Keeping this table in step with
+ * `SDK_RENDERERS` is the compiler's job ({@link CodeSdkLanguage}); what this
+ * guard owns is the runtime-supplied language neither table knows, which never
+ * yields a wrong-language schema for a real runtime.
+ */
+function resolveFlavor(peekRuntime: () => CodeRuntime | undefined): RunCodeFlavor {
+  const runtime = peekRuntime()
+  if (runtime === undefined) {
+    // No runtime mounted: reached by definition readers and `schemas()`, of
+    // which the doc-catalog harvest is the only shipped one. None feeds a
+    // model — `wireSchemas` calls `requireCodeRuntime` before projecting, so
+    // the assembly path never arrives here. Degrade to the TS default.
+    return TYPESCRIPT_FLAVOR
+  }
+  // Own-property read: a language like `toString`/`constructor` would otherwise
+  // resolve an inherited Object.prototype member as a flavor.
+  const flavor = RUN_CODE_FLAVORS[runtime.language]
+  if (!Object.hasOwn(RUN_CODE_FLAVORS, runtime.language) || flavor === undefined) {
+    const known = Object.keys(RUN_CODE_FLAVORS).map(name => JSON.stringify(name)).join(', ')
+    throw new Error(`dsh-tools: no run_code schema flavor registered for runtime language ${JSON.stringify(runtime.language)} (known: ${known})`)
+  }
+  return flavor
+}
 
 /**
  * Thrown by `run_code` when the program run itself failed — a program
@@ -56,103 +144,191 @@ export class CodeRunFailedError extends HarnessError {
 }
 
 /**
- * Cap for a `tool/code-dispatch` event's `resultSummary`. A log-ergonomics
- * constant, not config: the full result already flows to the program; the
- * summary exists so log readers see what a sub-call returned at a glance.
- */
-const SUMMARY_MAX_CHARS = 200
-
-/** Bounded inspect for rendering a program's completion value into the model-facing text. */
-const INSPECT_OPTIONS = { depth: 4, maxArrayLength: 100, maxStringLength: 10_000 } as const
-
-/** Join a result's text blocks; a non-text block becomes a placeholder (an MVP limitation, stated in the SDK instructions). */
-function textOf(content: ContentBlock[]): string {
-  return content
-    .map((block) => {
-      switch (block.type) {
-        case 'text': return block.text
-        // ContentBlockMap is merge-extensible — future block kinds land here
-        // deliberately (no assertNever on merge-extensible unions).
-        default: return `[${block.type} content]`
-      }
-    })
-    .join('\n')
-}
-
-/** Normalize workspace paths, then bound a sub-call's model-facing text for its durable log summary. */
-function summarize(text: string, cwd: string | undefined): string {
-  const stableText = cwd === undefined || cwd === parse(cwd).root
-    ? text
-    : text.replaceAll(cwd, '.')
-  return stableText.length > SUMMARY_MAX_CHARS ? `${stableText.slice(0, SUMMARY_MAX_CHARS)}…` : stableText
-}
-
-/**
- * JSON-normalize one binding call's argument into TWO independent parses of the same canonical
- * text: `dispatched` goes to the tool, `logged` to the `tool/code-dispatch` event — identical
- * by construction (the runtime's structured-clone boundary is wider than JSON; the session log
- * accepts only JSON), and separate objects, so a tool mutating its args can neither desync the
- * log from what was dispatched nor re-poison the append.
+ * Snapshot one binding call's argument as lossless JSON, then snapshot that
+ * detached value again so dispatch and logging stay independent without
+ * reintroducing structured-clone's platform-specific nesting limit.
  */
 function jsonNormalizeArgs(value: unknown): { dispatched: unknown; logged: unknown } {
-  if (value === undefined) {
-    throw new Error('tool arguments must be JSON-serializable (call the tool with an arguments object, e.g. `{}`)')
-  }
-  let text: string | undefined
+  let snapshot: JsonValue | undefined
   try {
-    text = JSON.stringify(value)
+    snapshot = snapshotJsonValue(value) as JsonValue | undefined
   } catch (error: unknown) {
-    throw new Error(`tool arguments must be JSON-serializable: ${error instanceof Error ? error.message : String(error)}`)
+    throw new Error(`tool arguments must be lossless JSON: ${error instanceof Error ? error.message : String(error)}`)
   }
-  // JSON.stringify's lib type claims `string`, but a bare function or symbol
-  // root really yields `undefined` at runtime — the guard is live.
-  // eslint-disable-next-line @typescript-eslint/no-unnecessary-condition
-  if (text === undefined) throw new Error('tool arguments must be JSON-serializable (got a value JSON cannot represent)')
-  return { dispatched: JSON.parse(text) as unknown, logged: JSON.parse(text) as unknown }
+  if (snapshot === undefined) {
+    throw new Error('tool arguments must be lossless JSON (call the tool with an arguments object, e.g. `{}`)')
+  }
+  const logged = snapshotJsonValue(snapshot)
+  /* v8 ignore next -- snapshot is already a detached lossless JSON value. */
+  if (logged === undefined) {
+    throw new Error('tool arguments could not be detached for durable logging')
+  }
+  return { dispatched: snapshot, logged }
 }
 
-/** Render the program's completion value for the model-facing result text (`''` when the program returned nothing). */
-function renderValue(value: unknown): string {
-  if (value === undefined) return ''
-  return typeof value === 'string' ? value : inspect(value, INSPECT_OPTIONS)
+/** Two-space JSON presentation, matching the existing shallow `run_code` text contract. */
+const JSON_INDENT = '  '
+
+/**
+ * ECMAScript caps `JSON.stringify`'s `space` string at ten characters. The
+ * renderer also caps TOTAL indentation there, compacting deeper subtrees, so
+ * formatted output remains linear in the canonical JSON size.
+ */
+const MAX_JSON_INDENT_CHARS = 10
+
+/** A pending fragment in the iterative JSON presentation traversal. */
+type JsonRenderTask =
+  | { kind: 'text'; text: string }
+  | { kind: 'value'; value: JsonValue; depth: number; compact: boolean }
+
+/** Render one non-string JSON root without recursive traversal or unbounded indentation growth. */
+function renderJsonValue(value: Exclude<JsonValue, string>): string {
+  const chunks: string[] = []
+  const tasks: JsonRenderTask[] = [{ kind: 'value', value, depth: 0, compact: false }]
+  for (let task = tasks.pop(); task !== undefined; task = tasks.pop()) {
+    if (task.kind === 'text') {
+      chunks.push(task.text)
+      continue
+    }
+
+    const current = task.value
+    if (current === null || typeof current === 'boolean' || typeof current === 'number') {
+      chunks.push(String(current))
+      continue
+    }
+    if (typeof current === 'string') {
+      chunks.push(JSON.stringify(current))
+      continue
+    }
+
+    const compact = task.compact || (task.depth + 1) * JSON_INDENT.length > MAX_JSON_INDENT_CHARS
+    const childDepth = task.depth + 1
+    if (Array.isArray(current)) {
+      chunks.push('[')
+      if (current.length === 0) {
+        chunks.push(']')
+        continue
+      }
+      tasks.push({ kind: 'text', text: compact ? ']' : `\n${JSON_INDENT.repeat(task.depth)}]` })
+      for (let index = current.length - 1; index >= 0; index--) {
+        const item = current[index]
+        /* v8 ignore next -- canonical JsonValue arrays are dense. */
+        if (item === undefined) throw new Error('cannot render a sparse JSON array')
+        tasks.push({ kind: 'value', value: item, depth: childDepth, compact })
+        tasks.push({
+          kind: 'text',
+          text: compact
+            ? index === 0 ? '' : ','
+            : `${index === 0 ? '\n' : ',\n'}${JSON_INDENT.repeat(childDepth)}`,
+        })
+      }
+      continue
+    }
+
+    const keys = Object.keys(current)
+    chunks.push('{')
+    if (keys.length === 0) {
+      chunks.push('}')
+      continue
+    }
+    tasks.push({ kind: 'text', text: compact ? '}' : `\n${JSON_INDENT.repeat(task.depth)}}` })
+    for (let index = keys.length - 1; index >= 0; index--) {
+      const key = keys[index]
+      /* v8 ignore next -- the loop is bounded by the captured key count. */
+      if (key === undefined) throw new Error('cannot render a missing JSON object key')
+      const item = current[key]
+      /* v8 ignore next -- canonical JsonValue records contain no undefined properties. */
+      if (item === undefined) throw new Error('cannot render an undefined JSON object property')
+      tasks.push({ kind: 'value', value: item, depth: childDepth, compact })
+      tasks.push({
+        kind: 'text',
+        text: compact
+          ? `${index === 0 ? '' : ','}${JSON.stringify(key)}:`
+          : `${index === 0 ? '\n' : ',\n'}${JSON_INDENT.repeat(childDepth)}${JSON.stringify(key)}: `,
+      })
+    }
+  }
+  return chunks.join('')
 }
 
-/** The run_code result's `meta` payload (JSON-serializable; `presentResult` narrows it back). */
-interface RunCodeMeta {
-  logs: CodeRunResult['logs']
+/** Render one present program completion value for the model-facing result text. */
+function renderValue(value: JsonValue): string {
+  return typeof value === 'string' ? value : renderJsonValue(value)
 }
 
-/** Soft-narrow a result `meta` back to {@link RunCodeMeta} (replay may carry older shapes; presentation must not throw). */
-function asRunCodeMeta(meta: unknown): RunCodeMeta | undefined {
-  if (typeof meta !== 'object' || meta === null) return undefined
-  const m = meta as Record<string, unknown>
-  if (!Array.isArray(m.logs) || !m.logs.every(log => typeof log === 'string')) return undefined
-  return m as unknown as RunCodeMeta
+/** Canonical value returned by the outer Code Mode transport. */
+type RunCodeOutput = { logs: string[]; result?: JsonValue }
+
+/**
+ * Registry-private capabilities the bridge receives at construction — the
+ * `requireRuntime` idiom: operations only the owning registry can mint stay
+ * off its public service API and flow here as closures instead.
+ */
+export interface RunCodeBridgeOptions {
+  /** Resolves `ctx.codeRuntime` or throws the loud misconfiguration error (shared with the registry's assembly-time checks). */
+  requireRuntime: () => CodeRuntime
+  /**
+   * Reads `ctx.codeRuntime` without throwing: `undefined` when none is mounted.
+   * Lets schema emission tell "no runtime" (degrade to TS; the readers that
+   * reach it are {@link resolveFlavor}'s) apart from "unknown language" (fail
+   * loud).
+   */
+  peekRuntime: () => CodeRuntime | undefined
+  /** The run's overlap cap for parallel-classified sub-calls (the registry passes its validated `maxParallelSubCalls`). */
+  maxParallel: number
+  /** Runs the contained `tools/code-dispatch-log` waterfall over one settled sub-dispatch (the registry's private invoker). */
+  shapeDispatchLog: (dispatch: CodeDispatchLog) => Promise<ContentBlock[]>
 }
 
 /**
- * Build the `run_code` {@link ToolDefinition}: one required `code` parameter,
- * executed through the dispatch bridge described above. The
+ * Build the `run_code` {@link ToolDefinition}: required `code` and
+ * `description` parameters, executed through the dispatch bridge described
+ * above. The
  * registry reserves it as presentation infrastructure under non-native modes,
  * outside the filterable global/scoped capability layers.
  * @param registry - the owning registry (sub-calls go through its `execute`,
  *   bindings cover its registered tools).
- * @param requireRuntime - resolves `ctx.codeRuntime` or throws the loud
- *   misconfiguration error (shared with the registry's assembly-time checks).
+ * @param options - the registry-private capabilities described above.
  * @returns the registry-ready definition.
  */
-export function createRunCodeTool(registry: ToolRegistry, requireRuntime: () => CodeRuntime): ToolDefinition {
-  return defineTool({
+export function createRunCodeTool(registry: ToolRuntime, options: RunCodeBridgeOptions): ToolDefinition {
+  const { requireRuntime, peekRuntime, maxParallel, shapeDispatchLog } = options
+  const definition = defineTool({
     name: RUN_CODE_NAME,
-    description:
-      'Execute a TypeScript program against the available tools. Write the BODY of an '
-      + 'async function (erasable syntax only; top-level `await` and `return` work) and '
-      + 'call tools as `await tools.name(args)` per the declarations in the system prompt. '
-      + 'Only what you print or return comes back — curate it.',
+    // The description and `code` parameter description are placeholders here:
+    // the language-aware getters installed below replace both, resolving the
+    // loaded runtime's flavor at schema-emission time so the schema the MODEL
+    // sees matches the SDK section's language. Argument VALIDATION still keys
+    // off this static spec (defineTool closes over it), which is language-
+    // independent (one required string `code`).
+    description: TYPESCRIPT_FLAVOR.description,
     parameters: {
-      code: { type: 'string', required: true, description: 'The program: the body of an async TypeScript function.' },
+      code: { type: 'string', required: true, description: TYPESCRIPT_FLAVOR.codeDescription },
+      description: {
+        type: 'string',
+        required: true,
+        description: RUN_CODE_DESCRIPTION_PARAM_DESCRIPTION,
+      },
     },
-    async execute(args, exec) {
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          logs: { type: 'array', required: true, items: { type: 'string' } },
+          result: { type: 'json' },
+        },
+      },
+      render: (_args, value) => {
+        const rendered = value.result === undefined ? '' : renderValue(value.result)
+        const parts = [value.logs.join('\n'), rendered].filter(part => part.length > 0)
+        return [{ type: 'text', text: parts.length > 0 ? parts.join('\n') : '(run_code completed with no output)' }]
+      },
+    },
+    async execute(args, exec): Promise<RunCodeOutput> {
+      if (args.description.trim().length === 0) {
+        throw new Error('invalid description: expected a non-empty string')
+      }
       const runtime = requireRuntime()
 
       // The run-scoped abort: follows the outer signal in, and fires when the
@@ -160,24 +336,124 @@ export function createRunCodeTool(registry: ToolRegistry, requireRuntime: () => 
       // (its executor kills on this signal) instead of orphaned, and
       // queued-unstarted dispatches are abandoned.
       const runController = new AbortController()
-      const onOuterAbort = (): void => { runController.abort(exec.signal?.reason) }
-      if (exec.signal?.aborted) onOuterAbort()
-      exec.signal?.addEventListener('abort', onOuterAbort, { once: true })
+      const onOuterAbort = (): void => { runController.abort(exec.signal.reason) }
+      exec.signal.addEventListener('abort', onOuterAbort, { once: true })
 
       let dispatches = 0
-      // The per-run serialization queue: every binding call chains onto the tail, so even
-      // `Promise.all` executes the underlying tool calls one at a time in submission order (the
-      // tool contract carries no concurrency-safety metadata yet).
-      let queue: Promise<void> = Promise.resolve()
-      const enqueue = <T>(task: () => Promise<T>): Promise<T> => {
-        const turn = queue.then(() => {
-          if (runController.signal.aborted) {
-            throw new Error(`run_code run is over (${String(runController.signal.reason)}); tool call abandoned`)
+      // The per-run scheduler uses the registry's staged interface and follows
+      // the same concurrency rules as the native loop. It also follows the
+      // native loop's SEQUENCING: every ordered stage (the dispatch-start
+      // append, prepare = pre-execute/guards, finalize/finish = post-execute,
+      // context deferral, the settle append) runs inside ONE driver lane, so
+      // ordered policy stages never overlap each other and only the
+      // around-dispatch/body stage runs concurrently. Starts are strictly
+      // submission-ordered; results commit in submission order through the
+      // head-of-line cursor. Consecutive parallel-classified calls overlap up
+      // to maxParallel; an exclusive call waits for the pool to drain, runs
+      // alone, and holds its barrier until its COMMIT (post-execute included)
+      // completes, exactly like a native exclusive group. Classification is
+      // re-read via executionMode() immediately before each start (a registry
+      // mutation while queued can flip a call exclusive), matching the native
+      // scheduler's lazy reclassification.
+      interface PendingDispatch {
+        /** Ordered stage: append the start event, await prepare (pre-execute/guards), launch the body into `flight`. */
+        start(): Promise<void>
+        classify(): 'parallel' | 'exclusive'
+        abandon(): void
+        /** Ordered stage: post-execute + context deferral + settle event, in submission order. */
+        commit(): Promise<void>
+        /** The launched around-dispatch/body stage; resolved until start() replaces it. */
+        flight: Promise<void>
+        /** True once the dispatch stage parked its outcome; the commit cursor waits on it. */
+        settled: boolean
+        /** The classification this entry started under; an exclusive holds its barrier through commit(). */
+        mode?: 'parallel' | 'exclusive'
+      }
+      const pendingQueue: PendingDispatch[] = []
+      const inFlight = new Set<Promise<void>>()
+      /** Tracked settle-event side work (log-content listener + append), drained at run settlement. */
+      const logWork = new Set<Promise<void>>()
+      const commitQueue: PendingDispatch[] = []
+      let exclusiveActive = false
+      let driving = false
+      let driverRun: Promise<void> = Promise.resolve()
+      let wake: (() => void) | undefined
+      const wakeup = (): void => {
+        const release = wake
+        wake = undefined
+        release?.()
+      }
+      /**
+       * The single ordered lane. Each pass commits the head-of-line settled
+       * dispatch (ordered post-execute), then starts the next queued entry if
+       * its slot is free (ordered pre-execute), and otherwise sleeps until a
+       * body settles or a new submission arrives. One run reaching the
+       * empty-queues/empty-pool state is quiescence.
+       */
+      const drive = (): Promise<void> => {
+        if (driving) return driverRun
+        driving = true
+        driverRun = (async () => {
+          try {
+            for (;;) {
+              // Create the wakeup promise before inspecting state so a settle or submission arriving
+              // between the checks and the await below cannot be lost.
+              const signal = new Promise<void>((resolve) => { wake = resolve })
+              const commitHead = commitQueue[0]
+              if (commitHead !== undefined && commitHead.settled) {
+                commitQueue.shift()
+                await commitHead.commit()
+                // The barrier covers post-execute: later starts wait for the
+                // exclusive call's full pipeline, as under the native loop.
+                if (commitHead.mode === 'exclusive') exclusiveActive = false
+                continue
+              }
+              const head = pendingQueue[0]
+              if (head !== undefined) {
+                if (runController.signal.aborted) {
+                  pendingQueue.shift()
+                  head.abandon()
+                  continue
+                }
+                // Reclassify at start time (fail-closed on registry changes).
+                const mode = head.classify()
+                const capacity = !exclusiveActive
+                  && (mode === 'exclusive' ? inFlight.size === 0 : inFlight.size < maxParallel)
+                if (capacity) {
+                  if (mode === 'exclusive') exclusiveActive = true
+                  head.mode = mode
+                  pendingQueue.shift()
+                  // Joined before start() so the commit cursor sees submission
+                  // order; nothing commits it until `settled` flips.
+                  commitQueue.push(head)
+                  await head.start()
+                  const flight: Promise<void> = head.flight.finally(() => {
+                    inFlight.delete(flight)
+                    wakeup()
+                  })
+                  inFlight.add(flight)
+                  continue
+                }
+              }
+              if (pendingQueue.length === 0 && commitQueue.length === 0 && inFlight.size === 0) return
+              await signal
+            }
+          } finally {
+            driving = false
+            wake = undefined
           }
-          return task()
-        })
-        queue = turn.then(() => undefined, () => undefined)
-        return turn
+        })()
+        return driverRun
+      }
+      /** Every dispatch settled AND committed; nothing can start (the run is aborted at call time). */
+      const drainDispatches = async (): Promise<void> => {
+        // The abort already fired: the driver abandons queued-unstarted
+        // entries, awaits the live pool, and drains the ordered commit lane —
+        // including a commit already in progress when the program returned.
+        await drive()
+        // Every settle event is appended inside the open run_code turn
+        // (tasks self-remove on settlement).
+        while (logWork.size > 0) await Promise.allSettled([...logWork])
       }
 
       // Read through a call, not a bare property: the abort state genuinely
@@ -185,50 +461,136 @@ export function createRunCodeTool(registry: ToolRegistry, requireRuntime: () => 
       // would be narrowed away by control flow analysis.
       const runOver = (): boolean => runController.signal.aborted
 
-      const binding = (name: string): CodeBindingFunction => async (rawArgs: unknown): Promise<unknown> => {
+      const binding = (name: string): CodeBindingFunction => async (rawArgs: unknown): Promise<JsonValue> => {
         if (runOver()) {
           throw new Error(`run_code run is over (${String(runController.signal.reason)}); ${name} not dispatched`)
         }
         const normalized = jsonNormalizeArgs(rawArgs)
-        const outcome = await enqueue(async () => {
-          const n = ++dispatches
-          const subCallId = CallId(`${String(exec.callId)}:code:${n}`)
-          const result = await registry.execute({
-            callId: subCallId,
-            name,
-            arguments: normalized.dispatched,
-            ...exec.agent ? { agent: exec.agent } : {},
-            parent: exec.token,
-            signal: runController.signal,
-          })
-          for (const context of result.additionalContexts ?? []) {
-            exec.deferContext(context)
+        const n = ++dispatches
+        const subCallId = CallId(`${String(exec.callId)}:code:${n}`)
+        const input = {
+          callId: subCallId,
+          rootCallId: exec.rootCallId,
+          name,
+          arguments: normalized.dispatched,
+          ...exec.agent ? { agent: exec.agent } : {},
+          parent: exec.token,
+          signal: runController.signal,
+        }
+        type DispatchOutcome = { isError: true; message: string } | { isError: false; value: JsonValue }
+        const scheduler = registry[TOOL_RUNTIME_SCHEDULER]
+        const outcome = await new Promise<DispatchOutcome>((resolve, reject) => {
+          // Set by the dispatch stage (or start() for a pre-settled result): what commit() finalizes in submission order.
+          let parked:
+            | { kind: 'post-result' | 'final-result'; exec: ToolRunContext; result: ToolExecutionResult }
+            | undefined
+          const settle = (result: ToolExecutionResult): void => {
+            // The program gets its value NOW: the log-content listener (for
+            // example, a spill backend) must never delay the binding or occupy
+            // a dispatch slot. The event append is tracked side work; the run's
+            // settlement drains logWork so every settle event is still appended
+            // inside the open turn (shapeDispatchLog is contained, so this
+            // chain cannot reject).
+            resolve(result.isError
+              ? { isError: true, message: result.error.message }
+              : { isError: false, value: result.value })
+            const agent = exec.agent
+            if (agent === undefined) return
+            const task: Promise<void> = (async () => {
+              // The listener may replace the durable copy with a preview and
+              // locator; the program's value and model-visible result are
+              // untouched.
+              const logged = await shapeDispatchLog({
+                exec, agent, subCallId, name, isError: result.isError,
+                // The registry deep-froze this projection at result
+                // finalization; append snapshots the final copy again, so
+                // the log stays detached.
+                content: result.content,
+              })
+              agent.session.append('tool/code-dispatch', {
+                rootCallId: exec.rootCallId,
+                parentCallId: exec.callId,
+                subCallId,
+                name,
+                // The SIBLING parse of the dispatched value: byte-identical JSON,
+                // but a separate object — a tool mutating its args cannot desync
+                // this record from what it actually received.
+                arguments: normalized.logged,
+                isError: result.isError,
+                content: logged,
+              })
+            })().finally(() => { logWork.delete(task) })
+            logWork.add(task)
           }
-          const text = textOf(result.content)
-          exec.agent?.session.append('tool/code-dispatch', {
-            parentCallId: exec.callId,
-            subCallId,
-            name,
-            // The SIBLING parse of the dispatched value: byte-identical JSON,
-            // but a separate object — a tool mutating its args cannot desync
-            // this record from what it actually received.
-            arguments: normalized.logged,
-            isError: result.isError,
-            resultSummary: summarize(text, exec.agent.session.header.cwd),
+          pendingQueue.push({
+            flight: Promise.resolve(),
+            settled: false,
+            // Re-read per driver pass against the same agent view the SDK
+            // declared; fail-closed exclusive when undeclared/invalid.
+            classify: () => registry.executionMode(input).kind,
+            abandon: () => {
+              reject(new Error(`run_code run is over (${String(runController.signal.reason)}); ${name} tool call abandoned`))
+            },
+            async start(): Promise<void> {
+              exec.agent?.session.append('tool/code-dispatch-start', {
+                rootCallId: exec.rootCallId,
+                parentCallId: exec.callId,
+                subCallId,
+                name,
+                arguments: normalized.logged,
+              })
+              // Ordered prepare runs INSIDE the driver lane: the next entry's
+              // pre-execute waits for this resolution, as under the native
+              // scheduler. Only the launched body below overlaps.
+              const prepared = await scheduler.prepare(input)
+              if (prepared.kind === 'dispatch') {
+                this.flight = scheduler.dispatch(prepared.exec).then((dispatchOutcome) => {
+                  parked = { kind: dispatchOutcome.kind, exec: prepared.exec, result: dispatchOutcome.result }
+                  this.settled = true
+                })
+                return
+              }
+              parked = { kind: prepared.kind, exec: prepared.exec, result: prepared.result }
+              this.settled = true
+            },
+            async commit(): Promise<void> {
+              /* v8 ignore next -- commit() runs only after `settled` flipped, which set parked. */
+              if (parked === undefined) return
+              const result = parked.kind === 'post-result'
+                ? await scheduler.finalize(parked.exec, parked.result)
+                : scheduler.finish(parked.exec, parked.result)
+              for (const context of result.additionalContexts ?? []) {
+                exec.deferContext(context)
+              }
+              // The composite forwards `additionalContexts` above and
+              // `concludesTurn` here from the nested result. Only a successful
+              // nested result can carry the terminal marker
+              // (ToolExecutionFailure types it never), so a policy-converted
+              // failure cannot stop the turn through a recovering program.
+              if (result.concludesTurn) exec.concludeTurn()
+              settle(result)
+              // Backpressure on pending event-append tasks: each task retains
+              // a full result while a slow backend stores it, so the pool cap
+              // bounds their count. Beyond the cap, the
+              // ordered lane waits, so later sub-calls cannot start and
+              // pending I/O/memory cannot grow without bound.
+              while (logWork.size > maxParallel) await Promise.race(logWork)
+            },
           })
-          return { text, isError: result.isError }
+          wakeup()
+          void drive()
         })
-        // A budget expiry or outer cancel that lands while this call was in
+        // A budget expiry or outer cancel that occurs while this call was in
         // flight already aborted the dispatch; stop the program now rather
         // than hand it a result from a run that is over.
         if (runOver()) {
           throw new Error(`run_code run is over (${String(runController.signal.reason)}); ${name} result discarded`)
         }
-        // A failed tool call REJECTS — real code signals failure by throwing,
-        // so try/catch and Promise.all short-circuiting behave as models
-        // expect (the error text is the tool's model-facing result text).
-        if (outcome.isError) throw new Error(outcome.text)
-        return outcome.text
+        // The worker turns a binding rejection into ToolCallError and adds
+        // only the binding name. Native content and internal error metadata
+        // stay outside the program-facing failure contract.
+        if (outcome.isError) throw new Error(outcome.message)
+        return outcome.value
       }
 
       // Null-prototype + defineProperty, mirroring the worker-side namespace
@@ -251,49 +613,61 @@ export function createRunCodeTool(registry: ToolRegistry, requireRuntime: () => 
         try {
           result = await runtime.run({
             program: args.code,
-            bindings: [{ global: 'tools', functions }],
+            bindings: [{
+              global: 'tools',
+              functions,
+              errorClass: { name: 'ToolCallError', memberNameProperty: 'toolName' },
+            }],
             signal: runController.signal,
           })
         } finally {
-          // Abort sub-dispatches and drain the folded queue before closing the turn.
+          // Abort sub-dispatches and drain every in-flight dispatch before
+          // closing the turn (queued-unstarted ones are abandoned unlogged).
           // Binding failures remain observable through their individual promises.
           runController.abort('run_code settled')
-          await queue
+          await drainDispatches()
         }
 
         if (result.error) {
           const logsText = result.logs.length > 0 ? `\nCaptured output:\n${result.logs.join('\n')}` : ''
           throw new CodeRunFailedError(`code run failed (${result.error.kind}): ${result.error.message}${logsText}`)
         }
-        const rendered = renderValue(result.value)
-        const parts = [result.logs.join('\n'), rendered].filter(part => part.length > 0)
-        const meta: RunCodeMeta = { logs: result.logs }
         return {
-          content: [{ type: 'text', text: parts.length > 0 ? parts.join('\n') : '(run_code completed with no output)' }],
-          meta,
+          logs: result.logs,
+          ...result.value !== undefined ? { result: result.value } : {},
         }
       } finally {
-        exec.signal?.removeEventListener('abort', onOuterAbort)
+        exec.signal.removeEventListener('abort', onOuterAbort)
       }
     },
-    // ACP execute cards use the program as their visible title.
+    // The model-authored description is the call's always-visible UI label
+    // (the bash `description` precedent); the program itself rides rawInput.
     presentCall: args => ({
       card: 'generic',
-      title: args.code,
+      title: args.description,
       kind: 'execute',
       rawInput: args.code,
     }),
-    // Title omitted on the result: an update replaces only the fields it
-    // carries, so the pending card's program title persists through
-    // completion; the captured output rides as body content.
-    presentResult: (_args, result) => {
-      const meta = asRunCodeMeta(result.meta)
-      if (!meta) return undefined
-      const output = meta.logs.join('\n')
-      return {
-        card: 'generic',
-        ...output.length > 0 ? { content: [{ type: 'text' as const, text: output }] } : {},
-      }
-    },
+    // Deliberately no presentResult: the generic card fallback keeps this
+    // title and reads durable result content without duplicating a large raw
+    // result into the host view payload.
   })
+  // Resolve the language flavor lazily, at the moment the registry projects the
+  // schema (`schemaOf` destructures `description`/`parameters`). The definition
+  // is minted once at registration, before a runtime is known; deferring here
+  // is the least invasive point that still emits the loaded runtime's language.
+  Object.defineProperty(definition, 'description', {
+    enumerable: true,
+    get: () => resolveFlavor(peekRuntime).description,
+  })
+  Object.defineProperty(definition, 'parameters', {
+    enumerable: true,
+    // Recompile through the same spec→schema projection defineTool used, so
+    // the emitted schema always matches the validated specification.
+    get: () => parameterSchemaSpecToJsonSchema({
+      code: { type: 'string', required: true, description: resolveFlavor(peekRuntime).codeDescription },
+      description: { type: 'string', required: true, description: RUN_CODE_DESCRIPTION_PARAM_DESCRIPTION },
+    }) as unknown as Record<string, unknown>,
+  })
+  return definition
 }

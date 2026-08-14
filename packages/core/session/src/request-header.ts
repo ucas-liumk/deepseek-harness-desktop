@@ -8,22 +8,25 @@
  */
 
 import { callConfigEquals } from '@deepseek-ai/dsh-llm'
-import type { Message, ToolSchema } from '@deepseek-ai/dsh-llm'
+import type { ToolSchema } from '@deepseek-ai/dsh-llm'
 import type { EpochHeader, SessionEvent } from './types.ts'
 
 /**
- * Normalize a header to canonical form: an empty system prompt, an empty tool
- * list, and an empty session prefix become absent fields, matching how requests
- * are built. Logging, folding, and comparison use this one representation.
+ * Normalize a header to canonical form: an empty system prompt and empty tool
+ * list become absent fields, matching how requests are built. Logging, folding,
+ * and comparison use this one representation.
  * @param header - the header to normalize (not mutated).
  * @returns the canonical header.
  */
 export function canonicalHeader(header: EpochHeader): EpochHeader {
+  const adapterDefaults = header.adapterDefaults
   return {
     config: header.config,
+    ...adapterDefaults?.reasoningEffort === true || adapterDefaults?.maxTokens === true
+      ? { adapterDefaults }
+      : {},
     ...header.system !== undefined && header.system.length > 0 ? { system: header.system } : {},
     ...header.tools !== undefined && header.tools.length > 0 ? { tools: header.tools } : {},
-    ...header.messagePrefix !== undefined && header.messagePrefix.length > 0 ? { messagePrefix: header.messagePrefix } : {},
   }
 }
 
@@ -32,21 +35,19 @@ function sameSchema(a: ToolSchema, b: ToolSchema): boolean {
   return JSON.stringify(a) === JSON.stringify(b)
 }
 
-/** Canonical JSON equality over session-prefix arrays; absence equals empty. */
-function sameMessages(a: readonly Message[] | undefined, b: readonly Message[] | undefined): boolean {
-  return JSON.stringify(a ?? []) === JSON.stringify(b ?? [])
-}
-
 /**
- * Field-wise equality over canonical headers. Tool schemas compare in order;
- * the session prefix compares as canonical JSON.
+ * Field-wise equality over canonical headers. Tool schemas compare in order.
  * @param a - one canonical header.
  * @param b - the other.
- * @returns whether config, system, tools, and session prefix all match.
+ * @returns whether config, system, and tools all match.
  */
 export function headerEquals(a: EpochHeader, b: EpochHeader): boolean {
-  if (!callConfigEquals(a.config, b.config) || a.system !== b.system) return false
-  if (!sameMessages(a.messagePrefix, b.messagePrefix)) return false
+  if (
+    !callConfigEquals(a.config, b.config)
+    || a.adapterDefaults?.reasoningEffort !== b.adapterDefaults?.reasoningEffort
+    || a.adapterDefaults?.maxTokens !== b.adapterDefaults?.maxTokens
+    || a.system !== b.system
+  ) return false
   const at = a.tools ?? []
   const bt = b.tools ?? []
   return at.length === bt.length && at.every((tool, i) => sameSchema(tool, bt[i] as ToolSchema))

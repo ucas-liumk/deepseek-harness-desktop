@@ -18,10 +18,16 @@
       "path": "../../core/agent"
     },
     {
+      "path": "../../core/session"
+    },
+    {
       "path": "../../util/brand"
     },
     {
       "path": "../../llm/llm"
+    },
+    {
+      "path": "../../runtime-diagnostics/invariants"
     }
   ]
 }

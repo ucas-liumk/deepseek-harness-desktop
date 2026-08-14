@@ -15,11 +15,13 @@ from deepseek_harness.errors import TransportClosedError
 from deepseek_harness_runtime import resolve_bundled_launch_args
 
 _MODES = ("exe", "node")
+_REPO_ROOT = Path(__file__).parents[3]
+_MINIMAL_CONFIG = _REPO_ROOT / "examples" / "jsonrpc-agent" / "minimal.cordis.yml"
 
 # The config must include the JSON-RPC serving plugin.
 _CORDIS_YML = """\
-- id: jsonrpc
-  name: '@deepseek-ai/dsh-jsonrpc'
+- id: sdk-jsonrpc-server
+  name: '@deepseek-ai/dsh-sdk-jsonrpc-server'
 - id: agent-core
   name: '@deepseek-ai/dsh-agent-spine-demo'
   config:
@@ -28,12 +30,18 @@ _CORDIS_YML = """\
   name: '@deepseek-ai/dsh-session-persistence-jsonl'
   config:
     root: './sessions'
+- id: session-checkpoints
+  name: '@deepseek-ai/dsh-session-checkpoint-policy'
+- id: subprocess
+  name: '@deepseek-ai/dsh-subprocess-local'
 - id: bash
   name: '@deepseek-ai/dsh-bash-local'
   config:
     cwd: '.'
 - id: todo
   name: '@deepseek-ai/dsh-tool-todo'
+  config:
+    allowParallelInProgress: true
 """
 
 
@@ -68,10 +76,34 @@ def test_bundled_runtime_boots_a_cordis_config(tmp_path: Path, mode: str) -> Non
     (tmp_path / "cordis.yml").write_text(_CORDIS_YML)
 
     with _client(tmp_path, launch_args) as client:
-        init = client.initialize(provider="deepseek", cwd=str(tmp_path), model="deepseek-v4-pro")
+        init = client.initialize(provider="deepseek-official", cwd=str(tmp_path), model="deepseek-v4-pro")
 
     assert init.serverInfo is not None
     assert init.serverInfo.name == "deepseek-harness-sdk-runtime"
+
+
+@pytest.mark.parametrize("mode", _MODES)
+def test_python_sdk_boots_minimal_jsonrpc_config(tmp_path: Path, mode: str) -> None:
+    launch_args = _launch_args(mode)
+    model = "minimal-environment-model"
+    harness = DeepSeekHarness(
+        model=model,
+        cwd=str(tmp_path),
+        session_root=str(tmp_path / "sessions"),
+        cordis=str(_MINIMAL_CONFIG),
+        env={
+            "DSH_MODEL": model,
+            "DSH_CONTEXT_WINDOW": "1000000",
+            "DSH_SYSTEM_PROMPT": "You are the Python SDK minimal boot test agent.",
+        },
+        api_key="sk-dummy-for-boot",
+        base_url="http://127.0.0.1:9",
+        launch_args_override=launch_args,
+        request_timeout_seconds=120,
+    )
+
+    with harness:
+        pass
 
 
 @pytest.mark.parametrize("mode", _MODES)
@@ -85,7 +117,7 @@ def test_bundled_runtime_surfaces_unbundled_plugin_failure(tmp_path: Path, mode:
     client.start()
     try:
         with pytest.raises((TransportClosedError, TimeoutError)) as excinfo:
-            client.initialize(provider="deepseek", cwd=str(tmp_path), model="deepseek-v4-pro")
+            client.initialize(provider="deepseek-official", cwd=str(tmp_path), model="deepseek-v4-pro")
     finally:
         client.close()
 

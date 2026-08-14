@@ -1,31 +1,33 @@
 /** Covers fail-closed per-call classification and model-schema isolation. */
 
 import { describe, expect, expectTypeOf, it } from 'vitest'
-import { Context } from 'cordis'
+import { Context } from '@deepseek-ai/cordis'
 import { CallId } from '@deepseek-ai/dsh-llm'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
-import ToolRegistry, {
-  defineTool,
+import ToolRuntime, {
+  defineContentToolFixture,
   type ToolDefinition,
   type ToolExecutionInput,
   type ToolExecutionMode,
 } from '@deepseek-ai/dsh-tools'
 
+const testToolSignal = new AbortController().signal
+
 async function setup() {
   const ctx = new Context()
   await ctx.plugin(SystemPrompt)
-  await ctx.plugin(ToolRegistry)
+  await ctx.plugin(ToolRuntime)
   return ctx
 }
 
 function exec(name: string, args: unknown): ToolExecutionInput {
-  return { callId: CallId('c1'), name, arguments: args }
+  return { signal: testToolSignal, callId: CallId('c1'), name, arguments: args }
 }
 
-describe('ToolRegistry.executionMode', () => {
+describe('ToolRuntime.executionMode', () => {
   it('returns parallel only for an explicit true classifier', async () => {
     const ctx = await setup()
-    ctx.tools.register(defineTool({
+    ctx.tools.register(defineContentToolFixture({
       name: 'safe',
       description: 'parallel-safe',
       parameters: {},
@@ -37,7 +39,7 @@ describe('ToolRegistry.executionMode', () => {
 
   it('defaults to exclusive for a tool with no isConcurrencySafe declaration', async () => {
     const ctx = await setup()
-    ctx.tools.register(defineTool({
+    ctx.tools.register(defineContentToolFixture({
       name: 'plain',
       description: 'no declaration',
       parameters: {},
@@ -53,7 +55,7 @@ describe('ToolRegistry.executionMode', () => {
 
   it('returns exclusive when the classifier returns false for these args', async () => {
     const ctx = await setup()
-    ctx.tools.register(defineTool({
+    ctx.tools.register(defineContentToolFixture({
       name: 'rw',
       description: 'read or write',
       parameters: { mode: { type: 'string', required: true } },
@@ -64,9 +66,9 @@ describe('ToolRegistry.executionMode', () => {
     expect(ctx.tools.executionMode(exec('rw', { mode: 'write' }))).toEqual({ kind: 'exclusive' })
   })
 
-  it('classifies invalid defineTool arguments as exclusive without throwing', async () => {
+  it('classifies invalid defineContentToolFixture arguments as exclusive without throwing', async () => {
     const ctx = await setup()
-    ctx.tools.register(defineTool({
+    ctx.tools.register(defineContentToolFixture({
       name: 'needs-mode',
       description: 'requires mode',
       parameters: { mode: { type: 'string', required: true } },
@@ -82,8 +84,9 @@ describe('ToolRegistry.executionMode', () => {
       name: 'thrower',
       description: 'classifier throws',
       parameters: { type: 'object', properties: {} },
+      output: { schema: { type: 'null' }, render: () => [] },
       isConcurrencySafe() { throw new Error('boom') },
-      async execute() { return [] },
+      async execute() { return null },
     }
     ctx.tools.register(raw)
     expect(ctx.tools.executionMode(exec('thrower', {}))).toEqual({ kind: 'exclusive' })
@@ -95,8 +98,9 @@ describe('ToolRegistry.executionMode', () => {
       name: 'truthy',
       description: 'classifier returns a truthy string',
       parameters: { type: 'object', properties: {} },
+      output: { schema: { type: 'null' }, render: () => [] },
       isConcurrencySafe() { return 'yes' },
-      async execute() { return [] },
+      async execute() { return null },
     } as unknown as ToolDefinition
     ctx.tools.register(raw)
     expect(ctx.tools.executionMode(exec('truthy', {}))).toEqual({ kind: 'exclusive' })
@@ -109,8 +113,9 @@ describe('ToolRegistry.executionMode', () => {
       name: 'raw-safe',
       description: 'raw',
       parameters: { type: 'object', properties: {} },
+      output: { schema: { type: 'null' }, render: () => [] },
       isConcurrencySafe(args) { seen = args; return true },
-      async execute() { return [] },
+      async execute() { return null },
     })
     expect(ctx.tools.executionMode(exec('raw-safe', { anything: 1 }))).toEqual({ kind: 'parallel' })
     expect(seen).toEqual({ anything: 1 })
@@ -118,7 +123,7 @@ describe('ToolRegistry.executionMode', () => {
 
   it('isConcurrencySafe never reaches the model-facing schemas() projection', async () => {
     const ctx = await setup()
-    ctx.tools.register(defineTool({
+    ctx.tools.register(defineContentToolFixture({
       name: 'safe',
       description: 'parallel-safe',
       parameters: { x: { type: 'string', required: true } },

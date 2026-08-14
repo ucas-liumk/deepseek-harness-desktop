@@ -2,9 +2,9 @@
 # $DSH_CORDIS_CONFIG or argv path; the SDK injects this path for bundled
 # zero-config launches. SDK-set session-root and cwd variables have manual-run fallbacks.
 
-# Stdio JSON-RPC serving surface; without it the agent has no SDK client.
-- id: jsonrpc
-  name: '@deepseek-ai/dsh-jsonrpc'
+# Stdio JSON-RPC server entry; without it the agent has no SDK client.
+- id: sdk-jsonrpc-server
+  name: '@deepseek-ai/dsh-sdk-jsonrpc-server'
 
 # Agent spine; the SDK server creates agents per sessionId.
 - id: agent-core
@@ -13,13 +13,12 @@
     workspaceContext:
       maxBytes: 65536
 
-# Stock DeepSeek adapters. Loading requires an API key; initialize and shutdown
-# may use a dummy key because they do not call the model.
+# Stock DeepSeek adapters. The adapter resolves DEEPSEEK_API_KEY through the
+# credential seam and, with no provider mounted here, from the launching
+# environment; DEEPSEEK_BASE_URL follows the same environment ladder. Neither
+# is inlined, so this file names no secret and no route.
 - id: llm-deepseek
   name: '@deepseek-ai/dsh-llm-deepseek'
-  config:
-    apiKey: !!js process.env.DEEPSEEK_API_KEY
-    baseURL: !!js process.env.DEEPSEEK_BASE_URL
 
 # JSONL persistence; $DSH_SESSION_ROOT wins over ./.sessions in the process cwd.
 - id: sessions
@@ -27,7 +26,16 @@
   config:
     root: !!js process.env.DSH_SESSION_ROOT ?? './.sessions'
 
+# Persistence owns durable storage; this separate policy explicitly selects
+# the request, tool-dispatch, and completed-step durability checkpoints.
+- id: session-checkpoints
+  name: '@deepseek-ai/dsh-session-checkpoint-policy'
+
 # Local bash executor; $DSH_CWD wins over the process cwd.
+# Managed child-process groups for the bash executor (spawn/kill/output plumbing).
+- id: subprocess
+  name: '@deepseek-ai/dsh-subprocess-local'
+
 - id: bash
   name: '@deepseek-ai/dsh-bash-local'
   config:

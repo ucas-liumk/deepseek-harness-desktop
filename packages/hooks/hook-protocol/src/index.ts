@@ -2,7 +2,7 @@
  * Shared, non-plugin hook protocol library: matching, command execution and
  * decoding, restrictive outcome merging, durable event helpers, and detached
  * run quiescence. Claude Code and Codex bridges own their distinct payloads,
- * environment rules, matcher mode, and typed seam mappings.
+ * environment rules, matcher mode, and typed extension-point mappings.
  * @module @deepseek-ai/dsh-hook-protocol
  */
 
@@ -13,7 +13,7 @@ export type {
   MatcherGroup,
   MatcherMode,
 } from './types.ts'
-export { matchesMatcher } from './matcher.ts'
+export { matcherDiagnostic, matchesMatcher } from './matcher.ts'
 export { parseHookOutput } from './codec.ts'
 export { DEFAULT_HOOK_TIMEOUT_MS, runHook } from './runner.ts'
 export type { RunHookOptions, RunHookResult } from './runner.ts'

@@ -1,9 +1,13 @@
 # todo/ — todo / planning capability family
 
-The model-facing todo tool. A single **product** package — there is no interface/implementation seam here, because the list is single-owner session state (one agent session owns its own list), not a swappable capability.
+English | [中文](README.zh.md)
+
+The model-facing todo capability. It is a single **product** package because one agent session owns the list; there is no replaceable provider contract.
 
 | Package | Role | ctx key |
 |---|---|---|
-| `tool-todo/` | Model-facing `todo_write` tool; writes the whole list to the session log (`todo/write`) | (registers on `ctx.tools`) |
+| [`tool-todo/`](tool-todo/README.md) | Stores and exposes the session's todo list. | (registers on `ctx.tools`) |
 
-The list lives on the event-sourced session log (`SessionEventMap['todo/write']`, owned by [`dsh-session`](../core/session)); this package is the thin consumer that appends the snapshot. UIs render off `session/event`: the [terminal app](../examples/stdio-demo) shows a persistent TUI plan or readline checklist, while the [ACP bridge](../ui/acp) maps it to a `plan` sessionUpdate.
+The child README owns the tool, persistence, and rendering contract.
+
+The event payload is documented on [docs/subsystems/session.md](../../docs/subsystems/session.md).

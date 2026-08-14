@@ -1,6 +1,6 @@
-import { defineProperty } from 'cosmokit'
+import { defineProperty } from '@deepseek-ai/cosmokit'
 import { Context } from './context.ts'
-import { createCallable, joinPrototype, symbols, Tracker } from './utils.ts'
+import { createCallable, joinPrototype, symbols, type Tracker } from './utils.ts'
 
 /**
  * Base class for services that expose a named API on `ctx`.

@@ -8,7 +8,7 @@
  * @module dsh-llm-deepseek/translate
  */
 
-import { CallId, LlmError } from '@deepseek-ai/dsh-llm'
+import { CallId, EMPTY_RESPONSE_CODE, LlmError } from '@deepseek-ai/dsh-llm'
 import type { ContentBlock, FinishReason, StreamChunk, TokenUsage } from '@deepseek-ai/dsh-llm'
 import { DONE } from './sse.ts'
 import type { WireChunk, WireUsage } from './types.ts'
@@ -35,7 +35,10 @@ export function mapFinishReason(reason: string): FinishReason {
     case 'length': return { kind: 'max-tokens' }
     default:
       // content_filter, insufficient_system_resource, future additions.
-      return { kind: 'error', message: `model stopped: ${reason}`, code: reason.toUpperCase() }
+      return {
+        kind: 'error',
+        failure: { message: `model stopped: ${reason}`, code: reason.toUpperCase() },
+      }
   }
 }
 
@@ -77,6 +80,8 @@ function closeBlock(block: OpenBlock): ContentBlock {
  * Malformed JSON payloads abort the stream with `MALFORMED_RESPONSE`.
  * @param payloads - SSE data payloads from {@link parseSse}, `[DONE]`-terminated.
  * @returns deltas as they arrive; `block-end`s, `usage`, and `finish` are all deferred to the `[DONE]` sentinel.
+ *   A `stop` (or absent) finish with no opened blocks is a degenerate provider completion and maps to an
+ *   `EMPTY_RESPONSE` error finish instead of a successful empty message.
  */
 export async function* translate(payloads: AsyncIterable<string>): AsyncGenerator<StreamChunk> {
   let nextIndex = 0
@@ -99,7 +104,16 @@ export async function* translate(payloads: AsyncIterable<string>): AsyncGenerato
         yield { type: 'block-end', index: block.index, block: closeBlock(block) }
       }
       if (pendingUsage) yield { type: 'usage', usage: pendingUsage }
-      yield { type: 'finish', reason: pendingFinish ?? { kind: 'stop' } }
+      const reason = pendingFinish ?? { kind: 'stop' as const }
+      yield {
+        type: 'finish',
+        reason: reason.kind === 'stop' && order.length === 0
+          ? {
+            kind: 'error',
+            failure: { message: 'model returned a completed response with no content', code: EMPTY_RESPONSE_CODE },
+          }
+          : reason,
+      }
       return
     }
 

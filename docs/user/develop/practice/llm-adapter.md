@@ -11,8 +11,8 @@ An LLM adapter extends `LlmAdapter` and implements `stream()`, translating Harne
 ## Minimal implementation
 
 ```ts
-import type { Context } from 'cordis'
-import Schema from 'schemastery'
+import type { Context } from '@deepseek-ai/cordis'
+import Schema from '@deepseek-ai/schemastery'
 import { LlmAdapter, type GenerateOptions, type StreamChunk } from '@deepseek-ai/dsh-llm'
 
 class MyAdapter extends LlmAdapter {
@@ -32,12 +32,12 @@ class MyAdapter extends LlmAdapter {
 
 export interface Config {
   apiKey: string
-  models: string[]
+  providers: string[]
 }
 
 export const Config: Schema<Config> = Schema.object({
   apiKey: Schema.string().required(),
-  models: Schema.array(Schema.string()).required(),
+  providers: Schema.array(Schema.string()).required(),
 })
 
 export const name = 'my-llm-adapter'
@@ -45,7 +45,7 @@ export const inject = ['llm']
 
 export function apply(ctx: Context, config: Config) {
   const adapter = new MyAdapter(config.apiKey)
-  ctx.llm.registerAdapter(config.models, adapter)
+  ctx.llm.registerAdapter(config.providers, adapter)
 }
 ```
 
@@ -110,15 +110,17 @@ async function* exampleChunks(): AsyncIterable<StreamChunk> {
 
 ## GenerateOptions
 
-`stream()` receives the exported `GenerateOptions` type. It includes the model, conversation history, system prompt, tool schemas, generation parameters, stop sequences, and abort signal; treat the TypeScript type exported by `@deepseek-ai/dsh-llm` as authoritative. Map supported fields to the provider API. If the provider cannot honor a field, throw `LlmError` with a stable code instead of silently dropping it.
+`stream()` receives the exported `GenerateOptions` type. It includes the model, adapter-owned reasoning-effort id, conversation history, system prompt, tool schemas, generation parameters, stop sequences, and abort signal; treat the TypeScript type exported by `@deepseek-ai/dsh-llm` as authoritative. Map supported fields to the provider API. If the provider cannot honor a field, throw `LlmError` with a stable code instead of silently dropping it.
+
+Override `resolveModel(provider, model, signal?)` to return exact provider/model identity plus optional `context` and `reasoning` metadata in one lookup. Reasoning metadata contains ordered opaque ids and display names plus an optional configured default; preserve the adapter's authoritative selectable list, including `off` when its upstream capability API returns it, instead of promoting those values into a core enum. Honor the optional signal for asynchronous lookup so cancellation and disposal reach quiescence. The service validates the aggregate and rejects unsupported explicit efforts before `stream()`; omitting `reasoning` means that model has no selectable reasoning-effort capability.
 
 ## Register an adapter
 
 ```ts ignore-check
-ctx.llm.registerAdapter(['model-name-1', 'model-name-2'], adapter)
+ctx.llm.registerAdapter(['my-provider'], adapter)
 ```
 
-The first argument lists the model names handled by the adapter. If `cordis.yml` selects `model: model-name-1`, the service routes that request to this adapter.
+The first argument lists provider routes handled by the adapter. `GenerateOptions.provider` selects the registered adapter, while `GenerateOptions.model` passes an adapter-owned model id without lifecycle registration. Override `listModels()` when the adapter can advertise model choices to selectors.
 
 ## Use it from cordis.yml
 
@@ -127,14 +129,16 @@ The first argument lists the model names handled by the adapter. If `cordis.yml`
   name: './src/my-llm-adapter.ts'
   config:
     apiKey: !!js process.env.MY_API_KEY
-    models:
-      - my-model-v1
-      - my-model-v2
+    providers:
+      - my-provider
 
-- id: stdio-agent
-  name: '@deepseek-ai/dsh-stdio-demo'
+- id: agent-loop
+  name: '@deepseek-ai/dsh-agent-loop'
   config:
-    model: my-model-v1  # References the model registered above.
+    agents:
+      - id: main
+        provider: my-provider
+        model: my-model-v1
 ```
 
 ## Reference implementations
@@ -143,9 +147,8 @@ The repository contains complete implementations:
 
 - `packages/llm/llm-deepseek/` — DeepSeek API adapter using the OpenAI-compatible format
 - `packages/llm/llm-pi-ai/` — Pi AI adapter using a different API format
-- `examples/echo-agent/src/mock-llm.ts` — minimal local teaching adapter
 
-Start with the mock adapter to study a complete chunk sequence without network behavior.
+Compare the two shipped adapters to see the same harness contract implemented over different provider SDKs.
 
 ## Error handling
 

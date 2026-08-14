@@ -1,4 +1,3 @@
-import { spawn } from 'node:child_process'
 import { createServer } from 'node:http'
 import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -6,6 +5,7 @@ import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
 import { zstdDecompress } from 'node:zlib'
+import { execa } from 'execa'
 import { describe, expect, it } from 'vitest'
 
 const binScript = fileURLToPath(new URL('../../../packages/examples/jsonrpc-demo/src/bin.ts', import.meta.url))
@@ -47,10 +47,10 @@ function waitForLine(
 
 describe('jsonrpc-agent keyless smoke', () => {
   it.each([
-    { label: 'accepts max-token results by default', envValue: undefined, expectedStatus: 'ok' },
-    { label: 'accepts max-token results when enabled through env', envValue: 'true', expectedStatus: 'ok' },
-    { label: 'reports max-token results as errors when disabled through env', envValue: 'false', expectedStatus: 'error' },
-  ])('$label', async ({ envValue, expectedStatus }) => {
+    { label: 'reports max-token turns with the default mapping config', envValue: undefined },
+    { label: 'reports max-token turns with mapping enabled through env', envValue: 'true' },
+    { label: 'reports max-token turns with mapping disabled through env', envValue: 'false' },
+  ])('$label', async ({ envValue }) => {
     const root = await mkdtemp(join(tmpdir(), 'dsh-jsonrpc-agent-smoke-'))
     const modelRequests: Record<string, unknown>[] = []
     const modelServer = createServer((request, response) => {
@@ -69,8 +69,9 @@ describe('jsonrpc-agent keyless smoke', () => {
     await new Promise<void>(resolve => modelServer.listen(0, '127.0.0.1', resolve))
     const address = modelServer.address()
     if (address === null || typeof address === 'string') throw new Error('model server did not bind a TCP port')
-    const child = spawn(process.execPath, [
-      '--expose-internals',
+    // The line-predicate protocol driving below is the genuinely custom part;
+    // execa owns spawn, the deadline, and exit settlement around it.
+    const child = execa(process.execPath, [
       '--import',
       'tsx',
       binScript,
@@ -78,34 +79,33 @@ describe('jsonrpc-agent keyless smoke', () => {
     ], {
       cwd: repoRoot,
       env: {
-        ...process.env,
         DEEPSEEK_API_KEY: 'keyless-smoke-no-call',
         DEEPSEEK_BASE_URL: `http://127.0.0.1:${address.port}`,
         DSH_CWD: root,
         DSH_SESSION_ROOT: join(root, '.sessions'),
         ...(envValue === undefined ? {} : { DSH_MAX_TOKENS_AS_SUCCESS: envValue }),
       },
-      stdio: ['pipe', 'pipe', 'pipe'],
+      timeout: 35_000,
+      killSignal: 'SIGKILL',
+      reject: false,
     })
     const lines: string[] = []
     let stdoutBuffer = ''
     let stderr = ''
-    child.stdout.setEncoding('utf8')
-    child.stdout.on('data', (chunk: string) => {
-      stdoutBuffer += chunk
+    child.stdout.on('data', (chunk: Buffer) => {
+      stdoutBuffer += chunk.toString('utf8')
       const parts = stdoutBuffer.split('\n')
       stdoutBuffer = parts.pop() ?? ''
       lines.push(...parts)
     })
-    child.stderr.setEncoding('utf8')
-    child.stderr.on('data', (chunk: string) => { stderr += chunk })
+    child.stderr.on('data', (chunk: Buffer) => { stderr += chunk.toString('utf8') })
 
     try {
       child.stdin.write(`${JSON.stringify({
         jsonrpc: '2.0',
         id: 1,
         method: 'initialize',
-        params: { cwd: root, provider: 'deepseek', model: 'deepseek-v4-pro' },
+        params: { cwd: root, provider: 'deepseek-official', model: 'deepseek-v4-pro', maxTokens: 1234 },
       })}\n`)
       const initialized = await waitForLine(lines, value => value.id === 1, () => stderr)
       expect(initialized).toMatchObject({
@@ -120,19 +120,31 @@ describe('jsonrpc-agent keyless smoke', () => {
         method: 'session/prompt',
         params: { sessionId: 'main', contentBlocks: [{ type: 'text', text: 'inspect tools' }] },
       })}\n`)
-      const finished = await waitForLine(lines, value => value.method === 'session.finished', () => stderr)
-      expect(finished).toMatchObject({
+      const prompt = await waitForLine(lines, value => value.id === 2, () => stderr)
+      expect(prompt).toMatchObject({
         jsonrpc: '2.0',
-        method: 'session.finished',
+        id: 2,
+        result: { messageId: expect.any(String) as unknown },
+      })
+      const turnEnd = await waitForLine(lines, (value) => {
+        if (value.method !== 'session.event') return false
+        const params = value.params as Record<string, unknown> | undefined
+        const event = params?.event as Record<string, unknown> | undefined
+        return params?.sessionId === 'main' && event?.type === 'turn/end'
+      }, () => stderr)
+      expect(turnEnd).toMatchObject({
+        jsonrpc: '2.0',
+        method: 'session.event',
         params: {
           sessionId: 'main',
-          status: expectedStatus,
-          reason: { kind: 'max-tokens' },
+          event: {
+            type: 'turn/end',
+            data: { reason: { kind: 'max-tokens' } },
+          },
         },
       })
-      const prompt = await waitForLine(lines, value => value.id === 2, () => stderr)
-      expect(prompt).toMatchObject({ jsonrpc: '2.0', id: 2, result: { accepted: true } })
       const tools = modelRequests[0]?.tools as { function?: { name?: string } }[]
+      expect(modelRequests[0]?.max_tokens).toBe(1234)
       expect(tools.map(tool => tool.function?.name).sort()).toEqual([
         'bash',
         'edit',
@@ -145,16 +157,8 @@ describe('jsonrpc-agent keyless smoke', () => {
       child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id: 3, method: 'shutdown' })}\n`)
       const shutdown = await waitForLine(lines, value => value.id === 3, () => stderr)
       expect(shutdown).toMatchObject({ jsonrpc: '2.0', id: 3, result: {} })
-      if (child.exitCode === null) {
-        await new Promise<void>((resolve, reject) => {
-          child.once('exit', (code) => {
-            if (code === 0) resolve()
-            else reject(new Error(`runtime exited ${code}; stderr=${stderr}`))
-          })
-        })
-      } else {
-        expect(child.exitCode, stderr).toBe(0)
-      }
+      const exit = await child
+      expect(exit.exitCode, `signal=${String(exit.signal)}; stderr=${stderr}`).toBe(0)
       const sessionsRoot = join(root, '.sessions')
       const files = await readdir(sessionsRoot, { recursive: true })
       const log = files.find(file => file.endsWith('.jsonl.zstd'))
@@ -163,15 +167,16 @@ describe('jsonrpc-agent keyless smoke', () => {
       expect(compressed.subarray(0, 4).toString('hex')).toBe('28b52ffd')
       expect(JSON.parse((await decompress(compressed)).toString())).toMatchObject({ type: 'session', id: 'main' })
     } finally {
-      if (child.exitCode === null) child.kill('SIGKILL')
+      // No-op after exit; reject: false settles on every outcome, so cleanup never races teardown.
+      child.kill('SIGKILL')
+      await child
       await new Promise<void>(resolve => modelServer.close(() => { resolve() }))
       await rm(root, { recursive: true, force: true })
     }
   }, 40_000)
 
   it('rejects an invalid max-token success env value', async () => {
-    const child = spawn(process.execPath, [
-      '--expose-internals',
+    const { exitCode, stdout, stderr } = await execa(process.execPath, [
       '--import',
       'tsx',
       binScript,
@@ -179,26 +184,19 @@ describe('jsonrpc-agent keyless smoke', () => {
     ], {
       cwd: repoRoot,
       env: {
-        ...process.env,
         DEEPSEEK_API_KEY: 'keyless-smoke-no-call',
         DSH_MAX_TOKENS_AS_SUCCESS: 'sometimes',
       },
-      stdio: ['ignore', 'pipe', 'pipe'],
-    })
-    let stdout = ''
-    let stderr = ''
-    child.stdout.setEncoding('utf8')
-    child.stdout.on('data', (chunk: string) => { stdout += chunk })
-    child.stderr.setEncoding('utf8')
-    child.stderr.on('data', (chunk: string) => { stderr += chunk })
-
-    const exitCode = await new Promise<number | null>((resolve, reject) => {
-      child.once('error', reject)
-      child.once('exit', resolve)
+      stdin: 'ignore',
+      timeout: 25_000,
+      killSignal: 'SIGKILL',
+      reject: false,
     })
 
     expect(exitCode, stderr).toBe(1)
     expect(stdout).toBe('')
-    expect(stderr).toContain('plugin(s) failed to load: @deepseek-ai/dsh-jsonrpc')
-  }, 10_000)
+    expect(stderr).toContain('plugin tree failed to load')
+    expect(stderr).toContain('failed to apply loader entry sdk-jsonrpc-server (@deepseek-ai/dsh-sdk-jsonrpc-server)')
+    expect(stderr).toContain('sometimes')
+  }, 30_000)
 })

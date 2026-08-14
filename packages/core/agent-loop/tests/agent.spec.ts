@@ -1,341 +1,140 @@
+import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { describe, expect, it, vi } from 'vitest'
-import { Context } from 'cordis'
-import LlmService from '@deepseek-ai/dsh-llm'
+import { Context } from '@deepseek-ai/cordis'
+import AgentRegistry, { type Agent } from '@deepseek-ai/dsh-agent'
+import AgentLoop from '@deepseek-ai/dsh-agent-loop'
+import LlmRuntime from '@deepseek-ai/dsh-llm'
 import SessionStore, { SessionId } from '@deepseek-ai/dsh-session'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
-import ToolRegistry from '@deepseek-ai/dsh-tools'
-import AgentRegistry, { type Agent } from '@deepseek-ai/dsh-agent'
-import AgentLoop, { DEFAULT_MAX_PARALLEL_TOOL_CALLS } from '@deepseek-ai/dsh-agent-loop'
-import { bindReactLoopAgentContext, prepareReactLoopAgent, type ReactLoopAgent } from '../src/agent.ts'
+import ToolRuntime from '@deepseek-ai/dsh-tools'
 import { MockAdapter, textResponse } from './mock-adapter.ts'
 
-function driverDone(agent: Agent): Promise<void> {
-  return (agent as Agent & { done: Promise<void> }).done
-}
-
-async function harness(adapter: MockAdapter) {
+async function harness(adapter: MockAdapter): Promise<Context> {
   const ctx = new Context()
-  await ctx.plugin(LlmService)
+  await ctx.plugin(LlmRuntime)
   await ctx.plugin(SessionStore)
   await ctx.plugin(SystemPrompt)
-  await ctx.plugin(ToolRegistry)
+  await ctx.plugin(ToolRuntime)
   await ctx.plugin(AgentRegistry)
   await ctx.plugin(AgentLoop, { agents: [] })
   ctx.llm.registerAdapter(['mock'], adapter)
   return ctx
 }
 
-function waitForIdle(ctx: Context, agent: Agent): Promise<void> {
-  return new Promise((resolve) => {
-    const dispose = ctx.on('agent/status', (subject, status) => {
-      if (subject === agent && status === 'idle') {
-        dispose()
-        resolve()
-      }
-    })
-  })
-}
-
-function waitForStatus(ctx: Context, agent: Agent, expected: Agent['status']): Promise<void> {
-  return new Promise((resolve) => {
-    const dispose = ctx.on('agent/status', (subject, status) => {
-      if (subject === agent && status === expected) {
-        dispose()
-        resolve()
-      }
-    })
-  })
-}
-
-function send(agent: Agent, text: string) {
-  agent.send([{ type: 'text', text }])
+function send(agent: Agent, text: string): void {
+  agent.followup(createUserMessage({ content: [{ type: 'text', text }], source: { kind: 'user' } }))
 }
 
 describe('Agent', () => {
-  it('rejects access before context binding and a second driver for one session', async () => {
-    const ctx = new Context()
-    await ctx.plugin(SessionStore)
-    const session = ctx.sessions.create(SessionId('exclusive-driver'))
-    const prepared = prepareReactLoopAgent(
-      ctx, SessionId('first-driver'), { provider: 'mock', model: 'mock' }, session, DEFAULT_MAX_PARALLEL_TOOL_CALLS,
-    )
-
-    expect(() => prepared.agent.ctx).toThrow('context is not bound')
-    expect(() => prepareReactLoopAgent(
-      ctx, SessionId('second-driver'), { provider: 'mock', model: 'mock' }, session, DEFAULT_MAX_PARALLEL_TOOL_CALLS,
-    ))
-      .toThrow('already has a concrete agent driver')
-
-    await prepared.dispose()
-    await ctx.fiber.dispose()
-  })
-
-  it('borrows caller options and binds its scoped context exactly once', async () => {
-    const ctx = await harness(new MockAdapter([textResponse('unused')]))
-    const options = { provider: 'mock', model: 'mock' }
-    const agent = ctx.agentLoop.create(SessionId('owned-bindings'), options)
-
-    expect(agent.options).toBe(options)
-    expect(agent.id).toBe('owned-bindings')
-    expect(agent.session.id).toBe(agent.id)
-    expect(() => { bindReactLoopAgentContext(agent as ReactLoopAgent, new Context()) }).toThrow(/context is already bound/)
-
-    await ctx.fiber.dispose()
-  })
-
-  it('send() throws after disposal', async () => {
-    const adapter = new MockAdapter(['hang'])
-    const ctx = await harness(adapter)
-    let agent!: Agent
-    const fiber = await ctx.plugin(Object.assign((inner: Context) => {
-      agent = inner.agentLoop.create(SessionId('scoped'), { provider: 'mock', model: 'mock' })
-    }, { inject: ['agentLoop'] }))
-    send(agent, 'go')
-    await new Promise(r => setTimeout(r, 30))
-    await fiber.dispose()
-    await driverDone(agent)
-
-    expect(() => { agent.send([{ type: 'text', text: 'too late' }]) }).toThrow('disposed')
-  })
-
-  it('steer() throws after disposal', async () => {
-    const adapter = new MockAdapter(['hang'])
-    const ctx = await harness(adapter)
-    let agent!: Agent
-    const fiber = await ctx.plugin(Object.assign((inner: Context) => {
-      agent = inner.agentLoop.create(SessionId('scoped'), { provider: 'mock', model: 'mock' })
-    }, { inject: ['agentLoop'] }))
-    send(agent, 'go')
-    await new Promise(r => setTimeout(r, 30))
-    await fiber.dispose()
-    await driverDone(agent)
-
-    expect(() => { agent.steer([{ type: 'text', text: 'too late' }]) }).toThrow('disposed')
-  })
-
-  it('inject() throws after disposal', async () => {
-    const adapter = new MockAdapter(['hang'])
-    const ctx = await harness(adapter)
-    let agent!: Agent
-    const fiber = await ctx.plugin(Object.assign((inner: Context) => {
-      agent = inner.agentLoop.create(SessionId('scoped'), { provider: 'mock', model: 'mock' })
-    }, { inject: ['agentLoop'] }))
-    send(agent, 'go')
-    await new Promise(r => setTimeout(r, 30))
-    await fiber.dispose()
-    await driverDone(agent)
-
-    expect(() => { agent.inject([{ type: 'text', text: 'too late' }]) }).toThrow('disposed')
-  })
-
-  it('inject() decides enclosure from the LOG (open turn), not agent status', async () => {
+  it('idle inject() durably stages context without opening a turn', async () => {
     const adapter = new MockAdapter([textResponse('ok')])
     const ctx = await harness(adapter)
     const agent = ctx.agentLoop.create(SessionId('a1'), { provider: 'mock', model: 'mock' })
 
-    // Simulate an OPEN turn in the log while the agent is idle (status is not a
-    // reliable open-turn signal). inject must append into that open turn, NOT
-    // wrap a new one.
-    agent.session.append('turn/start', { turn: 1, trigger: { kind: 'message', source: { kind: 'user' } } })
-    agent.inject([{ type: 'text', text: 'mid' }], { source: { kind: 'plugin', plugin: 'p' } })
-    expect(agent.session.events.filter(e => e.type === 'turn/start')).toHaveLength(1)
-    expect(agent.session.events.at(-1)!.type).toBe('context/message')
+    agent.inject(createUserMessage({ content: [{ type: 'text', text: 'context' }], source: { kind: 'plugin', plugin: 'p' } }))
 
-    // Close the turn; now inject must wrap its own one-shot injection turn.
-    agent.session.append('turn/end', { turn: 1, reason: { kind: 'completed' } })
-    agent.inject([{ type: 'text', text: 'after' }], { source: { kind: 'plugin', plugin: 'p' } })
-    const starts = agent.session.events.filter(e => e.type === 'turn/start')
-    expect(starts).toHaveLength(2)
-    const last = starts[1]!
-    expect(last.type === 'turn/start' && last.data.trigger.kind).toBe('injection')
-    expect(agent.session.events.at(-1)!.type).toBe('turn/end') // turn-enclosed
+    expect(agent.session.events.map(event => event.type)).toEqual(['agent/inbox/spliced'])
+    expect(agent.status).toBe('idle')
+    expect(adapter.requests).toHaveLength(0)
+    await agent.whenIdle()
   })
 
-  it('idle inject() contains a failing flush (logs, does not throw into the caller)', async () => {
-    const adapter = new MockAdapter([textResponse('ok')])
-    const ctx = await harness(adapter)
-    // A persistence-like listener whose flush rejects.
-    ctx.on('session/flush', () => { throw new Error('disk gone') })
-    const warn = vi.spyOn(ctx.logger, 'warn').mockImplementation(() => undefined)
+  it('inject() preserves an explicitly empty plugin source', async () => {
+    const ctx = await harness(new MockAdapter([textResponse('ok')]))
     const agent = ctx.agentLoop.create(SessionId('a1'), { provider: 'mock', model: 'mock' })
 
-    // inject() is synchronous and fires a fire-and-forget flush; a rejecting
-    // flush must be contained (logged), never thrown into the caller.
-    expect(() => { agent.inject([{ type: 'text', text: 'notice' }], { source: { kind: 'plugin', plugin: 'p' } }) }).not.toThrow()
-    await new Promise(r => setTimeout(r, 20)) // let the contained flush settle
-    expect(warn).toHaveBeenCalledWith(expect.stringContaining('flush after idle injection failed'))
-    warn.mockRestore()
+    agent.inject(createUserMessage({ content: [{ type: 'text', text: 'empty plugin source' }], source: { kind: 'plugin', plugin: '' } }))
+
+    const injected = agent.session.events.at(-1)
+    expect(injected?.type === 'agent/inbox/spliced' && injected.data.inserted[0]?.source)
+      .toEqual({ kind: 'plugin', plugin: '' })
   })
 
-  it('idle inject() closes its one-shot turn AND still checkpoints even if the append throws', async () => {
-    const adapter = new MockAdapter([textResponse('ok')])
-    const ctx = await harness(adapter)
-    const agent = ctx.agentLoop.create(SessionId('a1'), { provider: 'mock', model: 'mock' })
-    let flushes = 0
-    ctx.on('session/flush', () => { flushes += 1 })
-
-    // Non-serializable injected content makes Session.append throw AFTER
-    // turn/start was recorded. The turn/end must still be appended (finally),
-    // AND the durability checkpoint must still fire — the balanced turn is in
-    // memory and a crash before the next turn/dispose would otherwise lose it.
-    expect(() => {
-      agent.inject([{ type: 'text', text: 'x', bad: 1n } as never], { source: { kind: 'plugin', plugin: 'p' } })
-    }).toThrow(/non-JSON-serializable/)
-    const types = agent.session.events.map(e => e.type)
-    expect(types).toEqual(['turn/start', 'turn/end']) // balanced, no open turn
-    await new Promise(r => setTimeout(r, 10)) // let the fire-and-forget flush run
-    expect(flushes).toBe(1) // checkpoint fired despite the throw
-  })
-
-  it('idle inject() still checkpoints when a listener throws on the synthetic turn/end', async () => {
-    const adapter = new MockAdapter([textResponse('ok')])
-    const ctx = await harness(adapter)
-    const agent = ctx.agentLoop.create(SessionId('a1'), { provider: 'mock', model: 'mock' })
-    let flushes = 0
-    ctx.on('session/flush', () => { flushes += 1 })
-    // Session contains a throwing post-commit turn/end observer. The accepted
-    // boundary still triggers the idle injection's durability checkpoint.
-    let threw = false
-    ctx.on('session/event', (_s, event) => {
-      if (!threw && event.type === 'turn/end') { threw = true; throw new Error('boom turn/end') }
+  it('emits exact inserted, claimed, and discarded inbox messages', async () => {
+    const ctx = await harness(new MockAdapter([textResponse('ok')]))
+    const agent = ctx.agentLoop.create(SessionId('inbox-events'), { provider: 'mock', model: 'mock' })
+    const inserted: unknown[] = []
+    const claimed: unknown[] = []
+    const discarded: unknown[] = []
+    const lifecycle: string[] = []
+    ctx.on('session/event', (session, event) => {
+      if (session === agent.session && event.type === 'turn/start') lifecycle.push('turn/start')
     })
+    ctx.on('agent/inbox/inserted', ({ agent: subject, message }) => {
+      if (subject === agent) inserted.push({ message })
+    })
+    ctx.on('agent/inbox/claimed', ({ agent: subject, message, turn }) => {
+      if (subject === agent) {
+        lifecycle.push('agent/inbox/claimed')
+        claimed.push({ message, turn })
+      }
+    })
+    ctx.on('agent/inbox/discarded', ({ agent: subject, message }) => {
+      if (subject === agent) discarded.push({ message })
+    })
+    const context = createUserMessage({
+      content: [{ type: 'text', text: 'discard me' }],
+      source: { kind: 'plugin', plugin: 'test' },
+    })
+    agent.inject(context)
+    agent.inbox.remove(context.id)
+    const prompt = createUserMessage({ content: [{ type: 'text', text: 'run' }], source: { kind: 'user' } })
+    agent.followup(prompt)
+    await agent.whenIdle()
 
-    expect(() => { agent.inject([{ type: 'text', text: 'notice' }], { source: { kind: 'plugin', plugin: 'p' } }) }).not.toThrow()
-    const types = agent.session.events.map(e => e.type)
-    expect(types).toEqual(['turn/start', 'context/message', 'turn/end']) // balanced
-    await new Promise(r => setTimeout(r, 10))
-    expect(flushes).toBe(1) // checkpoint fired despite the throwing turn/end listener
+    expect(inserted).toEqual([{ message: context }, { message: prompt }])
+    expect(discarded).toEqual([{ message: context }])
+    expect(claimed).toEqual([{ message: prompt, turn: 1 }])
+    expect(lifecycle).toEqual(['turn/start', 'agent/inbox/claimed'])
   })
 
-  it('idle inject() reports a failing flush via agent/error (step 0) AND the logger', async () => {
-    const adapter = new MockAdapter([textResponse('ok')])
-    const ctx = await harness(adapter)
-    // A non-Error rejection exercises the String() normalization branch.
-    ctx.on('session/flush', () => { throw 'disk gone' })
-    const warn = vi.spyOn(ctx.logger, 'warn').mockImplementation(() => undefined)
-    const agent = ctx.agentLoop.create(SessionId('a1'), { provider: 'mock', model: 'mock' })
-    const errors: { turn: number; step: number; message: string }[] = []
-    ctx.on('agent/error', (_a, turn, step, error) => void errors.push({ turn, step, message: error.message }))
-
-    agent.inject([{ type: 'text', text: 'notice' }], { source: { kind: 'plugin', plugin: 'p' } })
-    await new Promise(r => setTimeout(r, 20)) // let the contained flush settle
-
-    // Reported via agent/error (step 0 — the idle-injection convention) so
-    // plugins monitoring agent/error see idle-injection persistence failures,
-    // mirroring the loop's post-turn/end flush path. A non-Error throw is
-    // normalized to an Error.
-    expect(errors).toEqual([{ turn: 1, step: 0, message: 'disk gone' }])
-    expect(warn).toHaveBeenCalledWith(expect.stringContaining('flush after idle injection failed'))
-    warn.mockRestore()
-  })
-
-  it('idle inject() with a non-serializable source opens no turn (nothing to close)', async () => {
-    const adapter = new MockAdapter([textResponse('ok')])
-    const ctx = await harness(adapter)
+  it('idle inject() rejects invalid input before enqueue', async () => {
+    const ctx = await harness(new MockAdapter([textResponse('ok')]))
     const agent = ctx.agentLoop.create(SessionId('a1'), { provider: 'mock', model: 'mock' })
 
-    // A non-serializable source makes the turn/start append throw BEFORE the
-    // event is pushed (Session.append validates before push), so NO turn opens.
-    // The finally's isTurnOpen() guard sees no open turn and appends nothing —
-    // the log stays empty, not left with a dangling turn/start.
     expect(() => {
-      agent.inject([{ type: 'text', text: 'x' }], { source: { kind: 'plugin', plugin: 'p', bad: 1n } as never })
+      agent.inject(createUserMessage({ content: [{ type: 'text', text: 'x', bad: 1n } as never], source: { kind: 'plugin', plugin: 'p' } }))
     }).toThrow(/non-JSON-serializable/)
     expect(agent.session.events).toHaveLength(0)
   })
 
-  it('steer() when idle falls through to send() and starts a turn', async () => {
+  it('steer() while idle becomes a woken prompt turn', async () => {
     const adapter = new MockAdapter([textResponse('ok')])
     const ctx = await harness(adapter)
     const agent = ctx.agentLoop.create(SessionId('a1'), { provider: 'mock', model: 'mock' })
 
-    // steer while idle delegates to send
-    agent.steer([{ type: 'text', text: 'steer idle' }], { source: { kind: 'plugin', plugin: 'test' } })
-    await waitForIdle(ctx, agent)
+    agent.steer(createUserMessage({ content: [{ type: 'text', text: 'steer idle' }], source: { kind: 'plugin', plugin: 'test' } }))
+    await agent.whenIdle()
 
-    // The message was recorded as a user-level message (send path)
-    expect(agent.session.events.some(e => e.type === 'user/message')).toBe(true)
+    expect(agent.session.events.some(event => event.type === 'user/message')).toBe(true)
     expect(adapter.requests).toHaveLength(1)
   })
 
-  it('disposer is idempotent (double-stop)', async () => {
-    // Create a bare Agent and start it through the package-internal
-    // test seam. Then call its disposer twice — the second call hits the
-    // early-return branch.
-    const ctx = new Context()
-    await ctx.plugin(SessionStore)
-    await ctx.plugin(AgentRegistry)
-    const session = ctx.sessions.create(SessionId('test'))
-    const prepared = prepareReactLoopAgent(
-      ctx, SessionId('bare'), { provider: 'mock', model: 'mock' }, session, DEFAULT_MAX_PARALLEL_TOOL_CALLS,
-    )
-    const { agent } = prepared
-
-    // Start the loop to get the disposer; the agent waits for messages
-    // (idle, never-resolving cancel), so it will stay idle.
-    prepared.markPublished()
-    const dispose = prepared.startDriver()
-
-    // First dispose
-    const firstDisposal = dispose()
-    expect(agent.status).toBe('disposed')
-    await firstDisposal
-
-    // Second dispose — idempotent, no throw
-    await expect(dispose()).resolves.toBeUndefined()
-    expect(agent.status).toBe('disposed')
-  })
-
-  it('a pre-start disposal makes a later driver-start attempt inert', async () => {
-    const ctx = new Context()
-    await ctx.plugin(SessionStore)
-    const session = ctx.sessions.create(SessionId('pre-start-dispose'))
-    const prepared = prepareReactLoopAgent(
-      ctx, SessionId('pre-start-dispose'), { provider: 'mock', model: 'mock' }, session, DEFAULT_MAX_PARALLEL_TOOL_CALLS,
-    )
-
-    await prepared.dispose()
-    expect(prepared.agent.status).toBe('disposed')
-    const dispose = prepared.startDriver()
-    await dispose()
-    await expect(prepared.agent.done).resolves.toBeUndefined()
-    expect(prepared.agent.session.events).toEqual([])
-    await ctx.fiber.dispose()
-  })
-
-  it('setting the same status does not emit agent/status again', async () => {
-    const adapter = new MockAdapter([textResponse('ok')])
-    const ctx = await harness(adapter)
+  it('emits one running and idle transition for one completed turn', async () => {
+    const ctx = await harness(new MockAdapter([textResponse('ok')]))
     const agent = ctx.agentLoop.create(SessionId('a1'), { provider: 'mock', model: 'mock' })
-
     const statuses: string[] = []
-    ctx.on('agent/status', (subject, status) => {
+    ctx.on('agent/status', ({ agent: subject, status }) => {
       if (subject === agent) statuses.push(status)
     })
 
     send(agent, 'hi')
-    await waitForIdle(ctx, agent)
+    await agent.whenIdle()
 
-    // After the turn, agent is idle. Send again to trigger another attempt
-    // to go idle — but it's already idle, so no emission.
-    const idleTransitionCount = statuses.filter(s => s === 'idle').length
-    expect(idleTransitionCount).toBe(1) // only the final transition from running
+    expect(statuses).toEqual(['running', 'idle'])
   })
 
-  it('whenIdle() resolves immediately when the agent is not running', async () => {
-    const adapter = new MockAdapter([textResponse('ok')])
-    const ctx = await harness(adapter)
+  it('whenIdle() resolves immediately without active work', async () => {
+    const ctx = await harness(new MockAdapter([textResponse('ok')]))
     const agent = ctx.agentLoop.create(SessionId('a1'), { provider: 'mock', model: 'mock' })
 
-    // Fresh agent is idle — whenIdle() takes the not-running fast path and
-    // resolves without subscribing. await must not hang.
     await agent.whenIdle()
-    expect(agent.status).not.toBe('running')
+
+    expect(agent.status).toBe('idle')
   })
 
-  it('whenIdle() waits for queued work that has not flipped status yet', async () => {
-    const adapter = new MockAdapter(['hang'])
-    const ctx = await harness(adapter)
+  it('whenIdle() waits for active work until explicit cancellation', async () => {
+    const ctx = await harness(new MockAdapter(['hang']))
     const agent = ctx.agentLoop.create(SessionId('a1'), { provider: 'mock', model: 'mock' })
 
     send(agent, 'queued')
@@ -344,150 +143,25 @@ describe('Agent', () => {
     await Promise.resolve()
     expect(settled).toBe(false)
 
-    await waitForStatus(ctx, agent, 'running')
-    agent.cancel('done')
+    agent.cancel({ kind: 'user' })
     await idle
-    expect(settled).toBe(true)
     expect(agent.status).toBe('idle')
   })
 
-  it('whenIdle() awaits the running→idle transition, ignoring other subjects/running events', async () => {
-    const adapter = new MockAdapter([textResponse('ok'), textResponse('ok')])
-    const ctx = await harness(adapter)
+  it('contains a throwing status listener on both transitions', async () => {
+    const ctx = await harness(new MockAdapter([textResponse('ok')]))
+    const warn = vi.spyOn(ctx.logger, 'warn').mockImplementation(() => undefined)
     const agent = ctx.agentLoop.create(SessionId('a1'), { provider: 'mock', model: 'mock' })
-    const other = ctx.agentLoop.create(SessionId('a2'), { provider: 'mock', model: 'mock' })
-
-    // Drive `agent` into `running`, then await whenIdle() — it subscribes to
-    // agent/status and resolves on the first transition out of running.
-    const running = new Promise<void>((resolve) => {
-      const dispose = ctx.on('agent/status', (subject, status) => {
-        if (subject === agent && status === 'running') { dispose(); resolve() }
-      })
+    ctx.on('agent/status', ({ status }) => {
+      throw new Error(`bad ${status} listener`)
     })
+
     send(agent, 'go')
-    await running
-    expect(agent.status).toBe('running')
-
-    // While `agent`'s whenIdle is pending, churn `other` through running→idle:
-    // every status event it emits hits whenIdle's guard with `subject !== this`,
-    // so the wait must ignore them and only resolve on `agent`'s own idle.
-    send(other, 'go')
-
     await agent.whenIdle()
-    expect(agent.status).toBe('idle')
-  })
 
-  it('whenIdle() subscribed while running resolves via done when the agent is then disposed', async () => {
-    // Covers the waiter's disposed arm: whenIdle() queues an internal waiter
-    // while running (not the fast path), then the disposer settles it and chains
-    // `done` (loop exit), not an eager resolve. A bare Agent + direct
-    // internal driver disposer keeps the emit synchronous.
-    const ctx = new Context()
-    await ctx.plugin(LlmService)
-    await ctx.plugin(SessionStore)
-    await ctx.plugin(SystemPrompt)
-    await ctx.plugin(ToolRegistry)
-    await ctx.plugin(AgentRegistry)
-    const adapter = new MockAdapter(['hang'])
-    ctx.llm.registerAdapter(['mock'], adapter)
-    const session = ctx.sessions.create(SessionId('bare'))
-    const prepared = prepareReactLoopAgent(
-      ctx, SessionId('bare'), { provider: 'mock', model: 'mock' }, session, DEFAULT_MAX_PARALLEL_TOOL_CALLS,
+    expect(agent.status).toBe('idle')
+    expect(warn).toHaveBeenCalledWith(
+      expect.stringContaining('agent event "agent/status" listener threw'),
     )
-    const { agent } = prepared
-    prepared.markPublished()
-    const dispose = prepared.startDriver()
-    agent.send([{ type: 'text', text: 'go' }])
-    await new Promise(r => setTimeout(r, 30))
-    expect(agent.status).toBe('running')
-
-    const idle = agent.whenIdle() // queues an internal waiter (running)
-    const disposal = dispose() // settles the waiter synchronously; whenIdle chains done
-    await idle
-    expect(agent.status).toBe('disposed')
-    await disposal
-  })
-
-  it('whenIdle() subscribed while running survives a FIBER dispose (no hung promise)', async () => {
-    // The waiter is internal agent state, NOT an effect-scoped ctx.on listener:
-    // disposing the OWNING fiber runs the agent's listener disposers, which would
-    // have dropped a ctx.on-based waiter before the 'disposed' transition and
-    // hung the promise. With internal waiters, the fiber disposer still settles it.
-    const adapter = new MockAdapter(['hang'])
-    const ctx = await harness(adapter)
-    let agent!: Agent
-    const fiber = await ctx.plugin(Object.assign((inner: Context) => {
-      agent = inner.agentLoop.create(SessionId('scoped'), { provider: 'mock', model: 'mock' })
-    }, { inject: ['agentLoop'] }))
-    send(agent, 'go')
-    await new Promise(r => setTimeout(r, 30))
-    expect(agent.status).toBe('running')
-
-    const idle = agent.whenIdle() // queued while running
-    await fiber.dispose()         // tears the fiber down (drops agent listeners)
-    await idle                    // must resolve, not hang
-    expect(agent.status).toBe('disposed')
-  })
-
-  it('whenIdle() on a disposed agent awaits the loop exit (done), not just the status flip', async () => {
-    // The disposer emits agent/status('disposed') BEFORE the driver loop
-    // unwinds, so whenIdle() must chain `done` (true quiescence) on the
-    // disposed path. Dispose a running agent, then assert whenIdle() resolves
-    // only after `done` — i.e. the loop has actually exited.
-    const adapter = new MockAdapter(['hang'])
-    const ctx = await harness(adapter)
-    let agent!: Agent
-    const fiber = await ctx.plugin(Object.assign((inner: Context) => {
-      agent = inner.agentLoop.create(SessionId('scoped'), { provider: 'mock', model: 'mock' })
-    }, { inject: ['agentLoop'] }))
-    send(agent, 'go')
-    await new Promise(r => setTimeout(r, 30))
-
-    let doneResolved = false
-    void driverDone(agent).then(() => { doneResolved = true })
-    await fiber.dispose() // sets status disposed, aborts, drains the loop
-    expect(agent.status).toBe('disposed')
-
-    // whenIdle() must not resolve before `done` has — chaining `done` is the
-    // quiescence guarantee. By here dispose() awaited the loop, so done is
-    // settled; whenIdle resolves and done is observed resolved.
-    await agent.whenIdle()
-    expect(doneResolved).toBe(true)
-  })
-
-  it('contains a throwing agent/status listener on the running transition', async () => {
-    const adapter = new MockAdapter([textResponse('ok')])
-    const ctx = await harness(adapter)
-    const warn = vi.spyOn(ctx.logger, 'warn').mockImplementation(() => undefined)
-    const agent = ctx.agentLoop.create(SessionId('a1'), { provider: 'mock', model: 'mock' })
-    ctx.on('agent/status', (_subject, status) => {
-      if (status === 'running') throw new Error('bad running listener')
-    })
-
-    send(agent, 'go')
-    await agent.whenIdle()
-
-    expect(adapter.requests).toHaveLength(1)
-    expect(agent.status).toBe('idle')
-    expect(warn).toHaveBeenCalledWith(expect.stringContaining('agent event "agent/status" listener threw'))
-    warn.mockRestore()
-  })
-
-  it('contains a throwing agent/status listener on the idle transition', async () => {
-    const adapter = new MockAdapter([textResponse('ok')])
-    const ctx = await harness(adapter)
-    const warn = vi.spyOn(ctx.logger, 'warn').mockImplementation(() => undefined)
-    const agent = ctx.agentLoop.create(SessionId('a1'), { provider: 'mock', model: 'mock' })
-    ctx.on('agent/status', (_subject, status) => {
-      if (status === 'idle') throw new Error('bad idle listener')
-    })
-
-    send(agent, 'go')
-    await agent.whenIdle()
-
-    expect(adapter.requests).toHaveLength(1)
-    expect(agent.status).toBe('idle')
-    expect(warn).toHaveBeenCalledWith(expect.stringContaining('agent event "agent/status" listener threw'))
-    warn.mockRestore()
   })
 })

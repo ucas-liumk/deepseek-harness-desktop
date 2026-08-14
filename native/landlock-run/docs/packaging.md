@@ -1,13 +1,13 @@
 # Packaging
 
-The package family uses the same broad shape as native packages such as esbuild: one JS entry package plus platform optional packages. Unlike Node addons there is no ABI or backend dimension — each platform package carries exactly the static executables its `prebuilds.json` declares.
+The package family uses the same layout as native packages such as esbuild: one JS entry package plus platform optional packages. Unlike Node addons there is no ABI or backend division — each platform package carries exactly the static executables its `prebuilds.json` declares.
 
 ## Published packages
 
 ```text
-node-addon-landlock-run
-node-addon-landlock-run-linux-x64
-node-addon-landlock-run-linux-arm64
+@deepseek-ai/node-addon-landlock-run
+@deepseek-ai/node-addon-landlock-run-linux-x64
+@deepseek-ai/node-addon-landlock-run-linux-arm64
 ```
 
 Unsupported platforms are intentionally absent from `optionalDependencies` — see [support-matrix.md](support-matrix.md).

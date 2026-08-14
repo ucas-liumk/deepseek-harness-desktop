@@ -1,0 +1,981 @@
+# Build each desktop package on its matching native host. The publish job receives
+# only packages that passed the sidecar smoke test, Rust tests, package inspection,
+# architecture checks, and per-platform SHA-256 generation.
+name: Desktop release
+
+on:
+  push:
+    tags:
+      - 'desktop-v*'
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish to GitHub Releases. The selected ref must be the matching desktop-v* tag.
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  PRIMARY_NODE_VERSION: '24.19.0'
+  RUST_TOOLCHAIN_VERSION: '1.94.0'
+  DSH_TELEMETRY_DISABLED: '1'
+
+jobs:
+  plan:
+    name: Validate release request
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      publish: ${{ steps.release.outputs.publish }}
+      tag: ${{ steps.release.outputs.tag }}
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
+        with:
+          node-version: ${{ env.PRIMARY_NODE_VERSION }}
+
+      - name: Match tag and desktop versions
+        id: release
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          PUBLISH_REQUEST: ${{ github.event_name == 'push' || inputs.publish }}
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const { appendFileSync, readFileSync } = require('node:fs')
+          const config = JSON.parse(readFileSync('src-tauri/tauri.conf.json', 'utf8'))
+          const cargo = readFileSync('src-tauri/Cargo.toml', 'utf8')
+          const cargoVersion = cargo.match(/^version\s*=\s*"([^"]+)"/m)?.[1]
+          if (typeof config.version !== 'string' || cargoVersion === undefined) {
+            throw new Error('desktop version is missing from tauri.conf.json or Cargo.toml')
+          }
+          if (config.version !== cargoVersion) {
+            throw new Error(`desktop versions disagree: tauri ${config.version}, Cargo ${cargoVersion}`)
+          }
+          const tag = `desktop-v${config.version}`
+          const publish = process.env.PUBLISH_REQUEST === 'true'
+          if (process.env.EVENT_NAME === 'push' && process.env.REF_NAME !== tag) {
+            throw new Error(`tag ${process.env.REF_NAME} does not match configured desktop version ${tag}`)
+          }
+          if (publish && (process.env.REF_TYPE !== 'tag' || process.env.REF_NAME !== tag)) {
+            throw new Error(`publication requires the exact ${tag} tag ref`)
+          }
+          appendFileSync(process.env.GITHUB_OUTPUT, `publish=${String(publish)}\ntag=${tag}\nversion=${config.version}\n`)
+          NODE
+
+  build:
+    name: Build ${{ matrix.id }}
+    needs: plan
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - id: macos-arm64
+            runner: macos-15
+            platform: darwin
+            architecture: arm64
+            rust-triple: aarch64-apple-darwin
+            bundles: app,dmg
+          - id: windows-x64
+            runner: windows-2025
+            platform: win32
+            architecture: x64
+            rust-triple: x86_64-pc-windows-msvc
+            bundles: nsis
+          - id: linux-x64
+            runner: ubuntu-22.04
+            platform: linux
+            architecture: x64
+            rust-triple: x86_64-unknown-linux-gnu
+            bundles: deb
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - uses: pnpm/action-setup@a8198c4bff370c8506180b035930dea56dbd5288 # v5
+        with:
+          dest: ${{ runner.temp }}/setup-pnpm
+
+      - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
+        with:
+          node-version: ${{ env.PRIMARY_NODE_VERSION }}
+          cache: pnpm
+
+      - name: Install Linux desktop prerequisites
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -q
+          sudo apt-get install -yq \
+            build-essential \
+            file \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            patchelf \
+            xdotool \
+            xvfb
+
+      - name: Install pinned Rust
+        run: >-
+          node -e "const cp = require('node:child_process');
+          const run = (args) => cp.execFileSync('rustup', args, { stdio: 'inherit' });
+          run(['set', 'profile', 'minimal']);
+          run(['toolchain', 'install', process.env.RUST_TOOLCHAIN_VERSION, '--no-self-update']);
+          run(['default', process.env.RUST_TOOLCHAIN_VERSION]);
+          const actual = cp.execFileSync('rustc', ['--version'], { encoding: 'utf8' }).trim();
+          if (!actual.startsWith('rustc ' + process.env.RUST_TOOLCHAIN_VERSION + ' '))
+          throw new Error('Rust version mismatch: ' + actual);"
+
+      - name: Audit Rust lockfile
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/cargo-audit-x86_64-unknown-linux-gnu-v0.22.2.tgz"
+          curl --fail --location --proto '=https' --tlsv1.2 \
+            --retry 5 --retry-all-errors --output "$archive" \
+            'https://github.com/rustsec/rustsec/releases/download/cargo-audit%2Fv0.22.2/cargo-audit-x86_64-unknown-linux-gnu-v0.22.2.tgz'
+          printf '%s  %s\n' \
+            ab28a1bdb54db4d5d8ad5981cf1f959410370b3d28250dbd35f6a44248620e39 \
+            "$archive" | sha256sum --check --strict
+          tar -xzf "$archive" -C "$RUNNER_TEMP"
+          "$RUNNER_TEMP/cargo-audit-x86_64-unknown-linux-gnu-v0.22.2/cargo-audit" \
+            audit --file src-tauri/Cargo.lock
+
+      - name: Install (immutable)
+        run: pnpm install --frozen-lockfile
+
+      - name: Test desktop regression contracts
+        run: >-
+          pnpm exec vitest run
+          packages/client/runtime/tests/sessions-service.client.spec.ts
+          packages/client/runtime/tests/workspaces-service.client.spec.ts
+          packages/session-query/session-log-export/tests/controller.client.spec.ts
+          packages/session-query/session-log-export/tests/dialog.client.spec.tsx
+          packages/preset/agent-presets/tests/mount.spec.ts
+          packages/typert/loader/tests/loader.spec.ts
+          scripts/build-desktop.spec.ts
+          scripts/desktop-release.spec.ts
+          scripts/gen-desktop-third-party-licenses.spec.ts
+          apps/cli/tests/desktop-api-auth.spec.ts
+          packages/client/connection/tests/api-request-trust.host.spec.ts
+          packages/client/connection/tests/node-half.host.spec.ts
+          packages/bundle/web-app/tests/web-app.spec.ts
+          packages/client/connection/tests/desktop-download-ticket.host.spec.ts
+
+      - name: Verify native host architecture
+        env:
+          EXPECTED_ARCHITECTURE: ${{ matrix.architecture }}
+          EXPECTED_PLATFORM: ${{ matrix.platform }}
+          EXPECTED_RUST_TRIPLE: ${{ matrix.rust-triple }}
+        run: >-
+          node -e "if (process.version !== 'v' + process.env.PRIMARY_NODE_VERSION)
+          throw new Error('Node version mismatch: ' + process.version);
+          if (process.platform !== process.env.EXPECTED_PLATFORM || process.arch !== process.env.EXPECTED_ARCHITECTURE)
+          throw new Error('native host mismatch: got ' + process.platform + '/' + process.arch + ', expected ' +
+          process.env.EXPECTED_PLATFORM + '/' + process.env.EXPECTED_ARCHITECTURE);
+          const cp = require('node:child_process'); const host = cp.execFileSync('rustc', ['-vV'], { encoding: 'utf8' });
+          if (!host.includes('host: ' + process.env.EXPECTED_RUST_TRIPLE)) throw new Error('Rust host mismatch:\n' + host);"
+
+      - name: Build and smoke-test the native sidecar
+        run: pnpm run desktop:build -- --prepare-only
+
+      - name: Test desktop Rust host against the real sidecar
+        run: cargo test --locked --manifest-path src-tauri/Cargo.toml
+
+      - name: Build native desktop packages from verified inputs
+        run: pnpm run desktop:build -- --skip-prepare --bundles ${{ matrix.bundles }}
+
+      - name: Package and verify macOS arm64 DMG
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          set -euo pipefail
+          app='src-tauri/target/release/bundle/macos/Unofficial DeepSeek Harness Desktop.app'
+          main="$app/Contents/MacOS/deepseek-harness-desktop"
+          backend="$app/Contents/MacOS/dsh-backend"
+          helper="$app/Contents/MacOS/dsh-backend-spawn-helper"
+          expected_entitlements="$RUNNER_TEMP/expected-desktop-entitlements.json"
+          minimum_supported_macos='15.0'
+          plutil -convert json -o "$expected_entitlements" src-tauri/Entitlements.plist
+          assert_bundle_metadata() {
+            local bundle="$1" plist minimum short_version bundle_version
+            plist="$bundle/Contents/Info.plist"
+            [ -f "$plist" ] || { echo "::error::$plist is missing"; exit 1; }
+            minimum="$(plutil -extract LSMinimumSystemVersion raw -o - "$plist")"
+            short_version="$(plutil -extract CFBundleShortVersionString raw -o - "$plist")"
+            bundle_version="$(plutil -extract CFBundleVersion raw -o - "$plist")"
+            [ "$minimum" = "$minimum_supported_macos" ] || {
+              echo "::error::$plist declares LSMinimumSystemVersion=$minimum, expected $minimum_supported_macos"; exit 1;
+            }
+            [ "$short_version" = '0.1.0' ] || {
+              echo "::error::$plist declares CFBundleShortVersionString=$short_version, expected 0.1.0"; exit 1;
+            }
+            [ "$bundle_version" = '108' ] || {
+              echo "::error::$plist declares CFBundleVersion=$bundle_version, expected 108"; exit 1;
+            }
+          }
+          assert_macos_minos() {
+            local binary="$1" maximum="$2" exact="${3:-}"
+            node - "$binary" "$maximum" "$exact" <<'NODE'
+          const { execFileSync } = require('node:child_process')
+          const [binary, maximum, exact] = process.argv.slice(2)
+          const parse = (value) => {
+            if (!/^\d+(?:\.\d+)*$/.test(value)) throw new Error(`invalid macOS version ${JSON.stringify(value)}`)
+            return value.split('.').map(Number)
+          }
+          const compare = (left, right) => {
+            const width = Math.max(left.length, right.length)
+            for (let index = 0; index < width; index += 1) {
+              const difference = (left[index] ?? 0) - (right[index] ?? 0)
+              if (difference !== 0) return difference
+            }
+            return 0
+          }
+          const output = execFileSync('otool', ['-l', binary], { encoding: 'utf8' })
+          const versions = [...output.matchAll(/^\s*minos\s+(\d+(?:\.\d+)*)\s*$/gm)].map(match => match[1])
+          if (versions.length === 0) throw new Error(`${binary} has no LC_BUILD_VERSION minos`)
+          const actual = versions.reduce((latest, candidate) => (
+            compare(parse(candidate), parse(latest)) > 0 ? candidate : latest
+          ))
+          if (compare(parse(actual), parse(maximum)) > 0) {
+            throw new Error(`${binary} requires macOS ${actual}, newer than ${maximum}`)
+          }
+          if (exact !== '' && compare(parse(actual), parse(exact)) !== 0) {
+            throw new Error(`${binary} requires macOS ${actual}, expected exactly ${exact}`)
+          }
+          console.log(`${binary}: LC_BUILD_VERSION minos ${actual} <= ${maximum}`)
+          NODE
+          }
+          assert_entitlements() {
+            local binary="$1" stem actual_plist actual_json diagnostics
+            stem="$(basename "$binary")"
+            actual_plist="$RUNNER_TEMP/$stem-entitlements.plist"
+            actual_json="$RUNNER_TEMP/$stem-entitlements.json"
+            diagnostics="$RUNNER_TEMP/$stem-entitlements.log"
+            codesign -d --entitlements :- "$binary" >"$actual_plist" 2>"$diagnostics" || {
+              echo "::error::could not read entitlements from $binary"
+              sed -n '1,80p' "$diagnostics"
+              exit 1
+            }
+            plutil -convert json -o "$actual_json" "$actual_plist"
+            node - "$expected_entitlements" "$actual_json" <<'NODE'
+          const { readFileSync } = require('node:fs')
+          const [expectedPath, actualPath] = process.argv.slice(2)
+          const stable = path => JSON.stringify(Object.fromEntries(
+            Object.entries(JSON.parse(readFileSync(path, 'utf8'))).sort(([left], [right]) => left.localeCompare(right)),
+          ))
+          if (stable(expectedPath) !== stable(actualPath)) {
+            throw new Error(`signed entitlements do not match ${expectedPath}: ${actualPath}`)
+          }
+          NODE
+          }
+          assert_bundle_metadata "$app"
+          for binary in "$main" "$backend" "$helper"; do
+            [ -x "$binary" ] || { echo "::error::$binary is missing or not executable"; exit 1; }
+            [ "$(lipo -archs "$binary")" = arm64 ] || {
+              echo "::error::$binary is not arm64"; lipo -info "$binary"; exit 1;
+            }
+            assert_entitlements "$binary"
+            assert_macos_minos "$binary" "$minimum_supported_macos"
+          done
+          native_vfs_files="$RUNNER_TEMP/desktop-native-vfs-files.txt"
+          node --import tsx --input-type=module - "$backend" '.artifacts/desktop-sidecar/node' "$native_vfs_files" <<'NODE'
+          import { readFileSync, statSync, writeFileSync } from 'node:fs'
+          import { resolve, sep } from 'node:path'
+          import {
+            extractPkgVfsManifest,
+            hostNativeLayout,
+            resolveHostTarget,
+          } from './scripts/build-desktop-sidecar.ts'
+
+          const [sidecar, stagingInput, output] = process.argv.slice(2)
+          const staging = resolve(stagingInput)
+          const sea = readFileSync(sidecar)
+          const parsed = JSON.parse(extractPkgVfsManifest(sea))
+          const target = resolveHostTarget('darwin', 'arm64')
+          const layout = hostNativeLayout(target)
+          const roots = [
+            `/app/${layout.ripgrep.relativePath}`,
+            `/app/node_modules/${layout.sharpPackage}/`,
+            `/app/node_modules/${layout.sharpLibvipsPackage}/`,
+            `/app/node_modules/${layout.koffiPackage}/`,
+            `/app/node_modules/${layout.addonRequireBuiltinPackage}/`,
+            `/app/${layout.nodePtyNativeDirectory}/`,
+          ]
+          const belongsToNativeClosure = (path) => roots.some(root => (
+            root.endsWith('/') ? path.startsWith(root) : path === root
+          ))
+          const paths = Object.entries(parsed.stats)
+            .filter(([path, metadata]) => belongsToNativeClosure(path) && metadata?.isFile === true)
+            .map(([path, metadata]) => {
+              if (!path.startsWith('/app/')) throw new Error(`unexpected native VFS path ${path}`)
+              const physical = resolve(staging, path.slice('/app/'.length))
+              if (!physical.startsWith(`${staging}${sep}`)) throw new Error(`native VFS path escapes staging: ${path}`)
+              const stat = statSync(physical)
+              if (!stat.isFile() || stat.size !== metadata.size) {
+                throw new Error(`staged native file does not match the SEA VFS manifest: ${physical}`)
+              }
+              const nativeBytes = readFileSync(physical)
+              const magic = nativeBytes.subarray(0, 4).toString('hex')
+              if ([
+                'feedface', 'cefaedfe', 'feedfacf', 'cffaedfe',
+                'cafebabe', 'bebafeca', 'cafebabf', 'bfbafeca',
+              ].includes(magic)
+                  && sea.indexOf(nativeBytes) === -1) {
+                throw new Error(`staged Mach-O bytes are absent from the final SEA: ${physical}`)
+              }
+              return physical
+            })
+            .sort()
+          if (paths.length === 0) throw new Error('SEA VFS manifest contains no target-native files')
+          writeFileSync(output, `${paths.join('\n')}\n`)
+          NODE
+          addon="$PWD/.artifacts/desktop-sidecar/node/node_modules/node-addon-require-builtin-darwin-arm64/prebuilt/darwin-arm64-napi-v9.node"
+          grep -Fqx -- "$addon" "$native_vfs_files" || {
+            echo '::error::SEA target-native manifest is missing node-addon-require-builtin darwin-arm64 napi-v9'; exit 1;
+          }
+          mach_o_count=0
+          while IFS= read -r native_file; do
+            [ -n "$native_file" ] || continue
+            if file -b "$native_file" | grep -q 'Mach-O'; then
+              assert_macos_minos "$native_file" "$minimum_supported_macos"
+              mach_o_count=$((mach_o_count + 1))
+            fi
+          done < "$native_vfs_files"
+          [ "$mach_o_count" -gt 0 ] || { echo '::error::SEA target-native manifest contains no Mach-O files'; exit 1; }
+          assert_macos_minos "$addon" "$minimum_supported_macos" '15.0'
+          cmp -s LICENSE "$app/Contents/Resources/LICENSE" || {
+            echo '::error::macOS bundle is missing the exact upstream LICENSE'; exit 1;
+          }
+          cmp -s THIRD_PARTY_NOTICES.md "$app/Contents/Resources/THIRD_PARTY_NOTICES.md" || {
+            echo '::error::macOS bundle is missing the exact third-party notices'; exit 1;
+          }
+          cmp -s desktop/DISTRIBUTION_BOUNDARY.md "$app/Contents/Resources/DISTRIBUTION_BOUNDARY.md" || {
+            echo '::error::macOS bundle is missing the exact desktop distribution boundary'; exit 1;
+          }
+          pnpm exec tsx scripts/gen-desktop-third-party-licenses.ts \
+            --verify "$app/Contents/Resources/THIRD_PARTY_LICENSES"
+          codesign --verify --deep --strict --verbose=2 "$app"
+          codesign -dv --verbose=4 "$app" 2>&1 | tee "$RUNNER_TEMP/codesign.txt"
+          grep -q '^Signature=adhoc$' "$RUNNER_TEMP/codesign.txt" || {
+            echo '::error::macOS package is not explicitly ad-hoc signed'; exit 1;
+          }
+          dmg_count="$(find src-tauri/target/release/bundle/dmg -maxdepth 1 -type f -name '*.dmg' | wc -l | tr -d ' ')"
+          [ "$dmg_count" = 1 ] || { echo "::error::expected one DMG, found $dmg_count"; exit 1; }
+          dmg="$(find src-tauri/target/release/bundle/dmg -maxdepth 1 -type f -name '*.dmg')"
+          name="Unofficial-DeepSeek-Harness-Desktop_${VERSION}_macos-arm64_app-adhoc_dmg-unsigned.dmg"
+          mkdir -p dist/desktop
+          destination="dist/desktop/$name"
+          cp "$dmg" "$destination"
+          if codesign --verify --verbose=2 "$destination" 2>"$RUNNER_TEMP/dmg-codesign.txt"; then
+            echo '::error::the DMG container is unexpectedly signed'; exit 1
+          fi
+          grep -qi 'not signed' "$RUNNER_TEMP/dmg-codesign.txt" || {
+            echo '::error::could not prove that the DMG container is unsigned'
+            sed -n '1,80p' "$RUNNER_TEMP/dmg-codesign.txt"
+            exit 1
+          }
+
+          mount="$RUNNER_TEMP/final-dmg-mount"
+          ready="$RUNNER_TEMP/final-dmg-ready"
+          log="$RUNNER_TEMP/final-dmg-app.log"
+          rm -rf "$mount" "$ready" "$log"
+          mkdir -p "$mount"
+          mounted=0
+          app_pid=''
+          cleanup_macos_smoke() {
+            if [ -n "$app_pid" ] && kill -0 "$app_pid" 2>/dev/null; then
+              kill -TERM "$app_pid" 2>/dev/null || true
+              wait "$app_pid" 2>/dev/null || true
+            fi
+            if [ "$mounted" = 1 ]; then
+              hdiutil detach "$mount" -force >/dev/null 2>&1 || true
+            fi
+          }
+          trap cleanup_macos_smoke EXIT
+          hdiutil attach "$destination" -nobrowse -readonly -mountpoint "$mount" >/dev/null
+          mounted=1
+          mounted_app="$mount/Unofficial DeepSeek Harness Desktop.app"
+          mounted_main="$mounted_app/Contents/MacOS/deepseek-harness-desktop"
+          mounted_backend="$mounted_app/Contents/MacOS/dsh-backend"
+          mounted_helper="$mounted_app/Contents/MacOS/dsh-backend-spawn-helper"
+          assert_bundle_metadata "$mounted_app"
+          for binary in "$mounted_main" "$mounted_backend" "$mounted_helper"; do
+            [ -x "$binary" ] || { echo "::error::$binary is missing or not executable in the final DMG"; exit 1; }
+            [ "$(lipo -archs "$binary")" = arm64 ] || {
+              echo "::error::$binary is not arm64 in the final DMG"; lipo -info "$binary"; exit 1;
+            }
+            assert_entitlements "$binary"
+            assert_macos_minos "$binary" "$minimum_supported_macos"
+          done
+          cmp -s LICENSE "$mounted_app/Contents/Resources/LICENSE" || {
+            echo '::error::final DMG is missing the exact upstream LICENSE'; exit 1;
+          }
+          cmp -s THIRD_PARTY_NOTICES.md "$mounted_app/Contents/Resources/THIRD_PARTY_NOTICES.md" || {
+            echo '::error::final DMG is missing the exact third-party notices'; exit 1;
+          }
+          cmp -s desktop/DISTRIBUTION_BOUNDARY.md "$mounted_app/Contents/Resources/DISTRIBUTION_BOUNDARY.md" || {
+            echo '::error::final DMG is missing the exact desktop distribution boundary'; exit 1;
+          }
+          pnpm exec tsx scripts/gen-desktop-third-party-licenses.ts \
+            --verify "$mounted_app/Contents/Resources/THIRD_PARTY_LICENSES"
+          codesign --verify --deep --strict --verbose=2 "$mounted_app"
+
+          DSH_DESKTOP_SMOKE_READY_FILE="$ready" "$mounted_main" >"$log" 2>&1 &
+          app_pid=$!
+          for _ in $(seq 1 240); do
+            [ -f "$ready" ] && break
+            kill -0 "$app_pid" 2>/dev/null || break
+            sleep 0.25
+          done
+          if [ ! -f "$ready" ]; then
+            echo '::error::the app mounted from the final DMG did not report ready'
+            sed -n '1,200p' "$log" || true
+            exit 1
+          fi
+          osascript -e 'tell application id "io.github.ucas-liumk.deepseek-harness-desktop" to quit'
+          exited=0
+          for _ in $(seq 1 80); do
+            if ! kill -0 "$app_pid" 2>/dev/null; then exited=1; break; fi
+            sleep 0.25
+          done
+          [ "$exited" = 1 ] || { echo '::error::the app from the final DMG did not quit'; exit 1; }
+          set +e
+          wait "$app_pid"
+          app_status=$?
+          set -e
+          app_pid=''
+          [ "$app_status" = 0 ] || { echo "::error::the app from the final DMG exited with $app_status"; exit 1; }
+          for binary in "$mounted_backend" "$mounted_helper"; do
+            clean=0
+            for _ in $(seq 1 80); do
+              if ! pgrep -f -- "$binary" >/dev/null; then clean=1; break; fi
+              sleep 0.25
+            done
+            [ "$clean" = 1 ] || { echo "::error::$binary remained running after app quit"; pgrep -alf -- "$binary"; exit 1; }
+          done
+          hdiutil detach "$mount" >/dev/null
+          mounted=0
+          trap - EXIT
+          (cd dist/desktop && shasum -a 256 "$name") > dist/desktop/SHA256SUMS-macos-arm64.txt
+
+      - name: Package and verify unsigned Windows x64 installer
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          function Assert-X64Pe([string]$Path) {
+            if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { throw "$Path is missing" }
+            $bytes = [IO.File]::ReadAllBytes($Path)
+            if ($bytes.Length -lt 64) { throw "$Path is not a PE executable" }
+            $header = [BitConverter]::ToInt32($bytes, 0x3c)
+            if ($header -lt 0 -or $header + 6 -gt $bytes.Length) { throw "$Path has an invalid PE header" }
+            if ([Text.Encoding]::ASCII.GetString($bytes, $header, 4) -ne "PE`0`0") { throw "$Path has no PE signature" }
+            if ([BitConverter]::ToUInt16($bytes, $header + 4) -ne 0x8664) { throw "$Path is not Windows x64" }
+          }
+          function Wait-ReadyFile([string]$Path, [Diagnostics.Process]$Process, [int]$TimeoutSeconds = 60) {
+            $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+            while ([DateTime]::UtcNow -lt $deadline) {
+              if (Test-Path -LiteralPath $Path -PathType Leaf) { return $true }
+              $Process.Refresh()
+              if ($Process.HasExited) { return $false }
+              Start-Sleep -Milliseconds 250
+            }
+            return (Test-Path -LiteralPath $Path -PathType Leaf)
+          }
+          function Get-ProcessesAtPath([string]$Path) {
+            @(Get-CimInstance Win32_Process | Where-Object {
+              $null -ne $_.ExecutablePath -and $_.ExecutablePath -ieq $Path
+            })
+          }
+          function Wait-NoProcessAtPath([string]$Path, [int]$TimeoutSeconds = 20) {
+            $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+            while ([DateTime]::UtcNow -lt $deadline) {
+              if ((Get-ProcessesAtPath $Path).Count -eq 0) { return $true }
+              Start-Sleep -Milliseconds 250
+            }
+            return ((Get-ProcessesAtPath $Path).Count -eq 0)
+          }
+          $main = 'src-tauri/target/release/deepseek-harness-desktop.exe'
+          $backend = 'src-tauri/binaries/dsh-backend-x86_64-pc-windows-msvc.exe'
+          Assert-X64Pe $main
+          Assert-X64Pe $backend
+          $installers = @(Get-ChildItem 'src-tauri/target/release/bundle/nsis' -File -Filter '*.exe')
+          if ($installers.Count -ne 1) { throw "expected one NSIS installer, found $($installers.Count)" }
+          $installer = $installers[0].FullName
+          Assert-X64Pe $installer
+          $sevenZip = Get-Command 7z -ErrorAction SilentlyContinue
+          if ($null -eq $sevenZip) { throw '7z is required to inspect the NSIS installer payload' }
+          $extractRoot = Join-Path $env:RUNNER_TEMP 'nsis-package'
+          New-Item -ItemType Directory -Force $extractRoot | Out-Null
+          & $sevenZip.Source x '-y' "-o$extractRoot" $installer | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "7z could not extract $installer" }
+          $notices = @{
+            'LICENSE' = 'LICENSE'
+            'THIRD_PARTY_NOTICES.md' = 'THIRD_PARTY_NOTICES.md'
+            'DISTRIBUTION_BOUNDARY.md' = 'desktop/DISTRIBUTION_BOUNDARY.md'
+          }
+          foreach ($notice in $notices.GetEnumerator()) {
+            $expectedHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $notice.Value).Hash
+            $matchingFiles = @(Get-ChildItem -LiteralPath $extractRoot -Recurse -File |
+              Where-Object { $_.Name -eq $notice.Key -and (Get-FileHash -Algorithm SHA256 -LiteralPath $_.FullName).Hash -eq $expectedHash })
+            if ($matchingFiles.Count -eq 0) { throw "NSIS installer is missing the exact $($notice.Key)" }
+          }
+          $licenseBundles = @(Get-ChildItem -LiteralPath $extractRoot -Recurse -Directory |
+            Where-Object { $_.Name -eq 'THIRD_PARTY_LICENSES' })
+          if ($licenseBundles.Count -ne 1) { throw "NSIS installer must contain one THIRD_PARTY_LICENSES directory; found $($licenseBundles.Count)" }
+          pnpm exec tsx scripts/gen-desktop-third-party-licenses.ts --verify $licenseBundles[0].FullName
+          if ($LASTEXITCODE -ne 0) { throw 'NSIS third-party license bundle failed verification' }
+          foreach ($binary in @($main, $backend, $installer)) {
+            $signature = Get-AuthenticodeSignature -FilePath $binary
+            if ($signature.Status -ne 'NotSigned') { throw "$binary unexpectedly reports signature status $($signature.Status)" }
+          }
+
+          $installRoot = Join-Path $env:RUNNER_TEMP 'final-nsis-install'
+          $ready = Join-Path $env:RUNNER_TEMP 'final-nsis-ready'
+          $stdoutLog = Join-Path $env:RUNNER_TEMP 'final-nsis-app.stdout.log'
+          $stderrLog = Join-Path $env:RUNNER_TEMP 'final-nsis-app.stderr.log'
+          foreach ($path in @($installRoot, $ready, $stdoutLog, $stderrLog)) {
+            if (Test-Path -LiteralPath $path) { throw "refusing to reuse smoke-test path $path" }
+          }
+          $appProcess = $null
+          $uninstaller = $null
+          try {
+            $install = Start-Process -FilePath $installer -ArgumentList @('/S', "/D=$installRoot") -Wait -PassThru
+            if ($install.ExitCode -ne 0) { throw "silent NSIS installation exited with $($install.ExitCode)" }
+            $installedMain = Join-Path $installRoot 'deepseek-harness-desktop.exe'
+            $installedBackend = Join-Path $installRoot 'dsh-backend.exe'
+            Assert-X64Pe $installedMain
+            Assert-X64Pe $installedBackend
+            $uninstallers = @(Get-ChildItem -LiteralPath $installRoot -Recurse -File -Filter 'uninstall.exe')
+            if ($uninstallers.Count -ne 1) { throw "installed NSIS package must contain one uninstaller; found $($uninstallers.Count)" }
+            $uninstaller = $uninstallers[0].FullName
+
+            $env:DSH_DESKTOP_SMOKE_READY_FILE = $ready
+            $appProcess = Start-Process -FilePath $installedMain -PassThru `
+              -RedirectStandardOutput $stdoutLog -RedirectStandardError $stderrLog
+            if (-not (Wait-ReadyFile $ready $appProcess)) {
+              if (Test-Path -LiteralPath $stdoutLog) { Get-Content -LiteralPath $stdoutLog -ErrorAction SilentlyContinue }
+              if (Test-Path -LiteralPath $stderrLog) { Get-Content -LiteralPath $stderrLog -ErrorAction SilentlyContinue }
+              throw 'the app installed by the final NSIS package did not report ready'
+            }
+            $appProcess.Refresh()
+            if (-not $appProcess.CloseMainWindow()) { throw 'the installed app did not accept a main-window close request' }
+            if (-not $appProcess.WaitForExit(20000)) { throw 'the installed app did not exit after its main window closed' }
+            if ($appProcess.ExitCode -ne 0) { throw "the installed app exited with $($appProcess.ExitCode)" }
+            if (-not (Wait-NoProcessAtPath $installedBackend)) {
+              throw "the installed backend remained running after app exit: $installedBackend"
+            }
+            $appProcess = $null
+          }
+          finally {
+            Remove-Item Env:DSH_DESKTOP_SMOKE_READY_FILE -ErrorAction SilentlyContinue
+            if ($null -ne $appProcess) {
+              $appProcess.Refresh()
+              if (-not $appProcess.HasExited) { Stop-Process -Id $appProcess.Id -Force -ErrorAction SilentlyContinue }
+            }
+            if ($null -ne $uninstaller -and (Test-Path -LiteralPath $uninstaller -PathType Leaf)) {
+              $uninstall = Start-Process -FilePath $uninstaller -ArgumentList '/S' -Wait -PassThru
+              if ($uninstall.ExitCode -ne 0) { throw "silent NSIS uninstall exited with $($uninstall.ExitCode)" }
+            }
+          }
+          if (Test-Path -LiteralPath (Join-Path $installRoot 'deepseek-harness-desktop.exe')) {
+            throw 'silent NSIS uninstall left the installed application executable behind'
+          }
+          $name = "Unofficial-DeepSeek-Harness-Desktop_$($env:VERSION)_windows-x64_unsigned-setup.exe"
+          New-Item -ItemType Directory -Force 'dist/desktop' | Out-Null
+          $destination = Join-Path 'dist/desktop' $name
+          Copy-Item -LiteralPath $installer -Destination $destination
+          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $destination).Hash.ToLowerInvariant()
+          "$hash  $name" | Set-Content -Encoding ascii 'dist/desktop/SHA256SUMS-windows-x64.txt'
+
+      - name: Package and verify unsigned Linux x64 deb
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          set -euo pipefail
+          assert_x64_elf() {
+            local binary="$1"
+            [ -x "$binary" ] || { echo "::error::$binary is missing or not executable"; exit 1; }
+            file "$binary" | grep -q 'ELF 64-bit.*x86-64' || { echo "::error::$binary is not an x64 ELF"; file "$binary"; exit 1; }
+            readelf -h "$binary" | grep -q 'Machine:.*Advanced Micro Devices X86-64' || {
+              echo "::error::$binary has the wrong ELF machine"; readelf -h "$binary"; exit 1;
+            }
+          }
+          assert_x64_elf src-tauri/target/release/deepseek-harness-desktop
+          assert_x64_elf src-tauri/binaries/dsh-backend-x86_64-unknown-linux-gnu
+          deb_count="$(find src-tauri/target/release/bundle/deb -maxdepth 1 -type f -name '*.deb' | wc -l | tr -d ' ')"
+          [ "$deb_count" = 1 ] || { echo "::error::expected one deb, found $deb_count"; exit 1; }
+          deb="$(find src-tauri/target/release/bundle/deb -maxdepth 1 -type f -name '*.deb')"
+          [ "$(dpkg-deb -f "$deb" Architecture)" = amd64 ] || {
+            echo "::error::$deb is not an amd64 package"; dpkg-deb -f "$deb" Architecture; exit 1;
+          }
+          mkdir -p "$RUNNER_TEMP/deb"
+          dpkg-deb --extract "$deb" "$RUNNER_TEMP/deb"
+          assert_notice() {
+            local root="$1" source="$2" target="$3" found
+            while IFS= read -r found; do
+              if cmp -s "$source" "$found"; then return 0; fi
+            done < <(find "$root" -type f -name "$target")
+            echo "::error::$root is missing the exact $target"; exit 1
+          }
+          root="$RUNNER_TEMP/deb"
+          assert_notice "$root" LICENSE LICENSE
+          assert_notice "$root" THIRD_PARTY_NOTICES.md THIRD_PARTY_NOTICES.md
+          assert_notice "$root" desktop/DISTRIBUTION_BOUNDARY.md DISTRIBUTION_BOUNDARY.md
+          license_bundle="$(find "$root" -type d -name THIRD_PARTY_LICENSES -print -quit)"
+          [ -n "$license_bundle" ] || { echo "::error::$root is missing THIRD_PARTY_LICENSES"; exit 1; }
+          [ "$(find "$root" -type d -name THIRD_PARTY_LICENSES | wc -l | tr -d ' ')" = 1 ] || {
+            echo "::error::$root contains multiple THIRD_PARTY_LICENSES directories"; exit 1;
+          }
+          pnpm exec tsx scripts/gen-desktop-third-party-licenses.ts --verify "$license_bundle"
+          find_unique_file() {
+            local root="$1" name="$2" output_name="$3" matches count
+            matches="$(find "$root" -type f -name "$name" -print)"
+            count="$(printf '%s\n' "$matches" | sed '/^$/d' | wc -l | tr -d ' ')"
+            [ "$count" = 1 ] || { echo "::error::$root must contain exactly one $name; found $count"; exit 1; }
+            printf -v "$output_name" '%s' "$matches"
+          }
+          find_unique_file "$RUNNER_TEMP/deb" deepseek-harness-desktop deb_main
+          find_unique_file "$RUNNER_TEMP/deb" dsh-backend deb_backend
+          find_unique_file "$RUNNER_TEMP/deb" dsh-backend-spawn-helper deb_helper
+          assert_x64_elf "$deb_main"
+          assert_x64_elf "$deb_backend"
+          assert_x64_elf "$deb_helper"
+
+          run_linux_smoke() {
+            local main="$1" backend="$2" helper="$3" smoke_root="$4"
+            rm -rf "$smoke_root"
+            mkdir -p "$smoke_root/data"
+            xvfb-run -a bash -s -- "$main" "$backend" "$helper" "$smoke_root" <<'SMOKE'
+          set -euo pipefail
+          main="$1"
+          backend="$2"
+          helper="$3"
+          smoke_root="$4"
+          ready="$smoke_root/ready"
+          log="$smoke_root/app.log"
+          export DSH_DESKTOP_SMOKE_READY_FILE="$ready"
+          export XDG_DATA_HOME="$smoke_root/data"
+          app_pid=''
+          cleanup_smoke() {
+            if [ -n "$app_pid" ] && kill -0 "$app_pid" 2>/dev/null; then
+              kill -TERM "$app_pid" 2>/dev/null || true
+              wait "$app_pid" 2>/dev/null || true
+            fi
+          }
+          trap cleanup_smoke EXIT
+          "$main" >"$log" 2>&1 &
+          app_pid=$!
+          for _ in $(seq 1 240); do
+            [ -f "$ready" ] && break
+            kill -0 "$app_pid" 2>/dev/null || break
+            sleep 0.25
+          done
+          if [ ! -f "$ready" ]; then
+            echo "::error::$main did not report ready"
+            sed -n '1,200p' "$log" || true
+            exit 1
+          fi
+          window=''
+          for _ in $(seq 1 80); do
+            window="$(xdotool search --pid "$app_pid" --name '^Unofficial DeepSeek Harness Desktop$' 2>/dev/null | head -n 1 || true)"
+            [ -n "$window" ] && break
+            sleep 0.25
+          done
+          [ -n "$window" ] || { echo "::error::$main did not expose its expected desktop window"; exit 1; }
+          xdotool windowclose "$window"
+          exited=0
+          for _ in $(seq 1 80); do
+            if ! kill -0 "$app_pid" 2>/dev/null; then exited=1; break; fi
+            sleep 0.25
+          done
+          [ "$exited" = 1 ] || { echo "::error::$main did not exit after its window closed"; exit 1; }
+          set +e
+          wait "$app_pid"
+          app_status=$?
+          set -e
+          app_pid=''
+          [ "$app_status" = 0 ] || { echo "::error::$main exited with $app_status"; exit 1; }
+          process_at_path() {
+            local expected link actual
+            expected="$(readlink -f "$1")"
+            for link in /proc/[0-9]*/exe; do
+              actual="$(readlink -f "$link" 2>/dev/null || true)"
+              [ "$actual" = "$expected" ] && return 0
+            done
+            return 1
+          }
+          for binary in "$backend" "$helper"; do
+            clean=0
+            for _ in $(seq 1 80); do
+              if ! process_at_path "$binary"; then clean=1; break; fi
+              sleep 0.25
+            done
+            [ "$clean" = 1 ] || { echo "::error::$binary remained running after app exit"; exit 1; }
+          done
+          trap - EXIT
+          SMOKE
+          }
+
+          deb_package="$(dpkg-deb -f "$deb" Package)"
+          [ -n "$deb_package" ] || { echo '::error::deb package name is empty'; exit 1; }
+          if dpkg-query -W -f='${db:Status-Status}\n' "$deb_package" 2>/dev/null | grep -q '^installed$'; then
+            echo "::error::$deb_package is already installed on the runner"; exit 1
+          fi
+          deb_installed=0
+          cleanup_deb() {
+            if [ "$deb_installed" = 1 ]; then
+              sudo dpkg --purge "$deb_package" >/dev/null 2>&1 || true
+            fi
+          }
+          trap cleanup_deb EXIT
+          sudo dpkg -i "$deb"
+          deb_installed=1
+          package_file() {
+            local name="$1" output_name="$2" matches count
+            matches="$(dpkg-query -L "$deb_package" | while IFS= read -r path; do
+              if [ -f "$path" ] && [ "$(basename "$path")" = "$name" ]; then printf '%s\n' "$path"; fi
+            done)"
+            count="$(printf '%s\n' "$matches" | sed '/^$/d' | wc -l | tr -d ' ')"
+            [ "$count" = 1 ] || { echo "::error::installed $deb_package must contain exactly one $name; found $count"; exit 1; }
+            printf -v "$output_name" '%s' "$matches"
+          }
+          package_file deepseek-harness-desktop installed_main
+          package_file dsh-backend installed_backend
+          package_file dsh-backend-spawn-helper installed_helper
+          assert_x64_elf "$installed_main"
+          assert_x64_elf "$installed_backend"
+          assert_x64_elf "$installed_helper"
+          run_linux_smoke "$installed_main" "$installed_backend" "$installed_helper" "$RUNNER_TEMP/deb-smoke"
+          sudo dpkg --purge "$deb_package"
+          deb_installed=0
+          trap - EXIT
+          for binary in "$installed_main" "$installed_backend" "$installed_helper"; do
+            [ ! -e "$binary" ] || { echo "::error::deb purge left $binary behind"; exit 1; }
+          done
+          if dpkg-query -W -f='${db:Status-Status}\n' "$deb_package" 2>/dev/null | grep -q '^installed$'; then
+            echo "::error::deb purge left $deb_package installed"; exit 1
+          fi
+          deb_name="Unofficial-DeepSeek-Harness-Desktop_${VERSION}_linux-x64_unsigned.deb"
+          mkdir -p dist/desktop
+          cp "$deb" "dist/desktop/$deb_name"
+          (cd dist/desktop && sha256sum "$deb_name") > dist/desktop/SHA256SUMS-linux-x64.txt
+
+      - name: Upload verified desktop packages
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: desktop-${{ matrix.id }}-verified
+          path: dist/desktop/*
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish one GitHub Release
+    if: needs.plan.outputs.publish == 'true'
+    needs: [plan, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: desktop-release
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: desktop-*-verified
+          path: dist/release
+          merge-multiple: true
+
+      - name: Verify complete release payload
+        shell: bash
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          set -euo pipefail
+          expected=(
+            "Unofficial-DeepSeek-Harness-Desktop_${VERSION}_macos-arm64_app-adhoc_dmg-unsigned.dmg"
+            "Unofficial-DeepSeek-Harness-Desktop_${VERSION}_windows-x64_unsigned-setup.exe"
+            "Unofficial-DeepSeek-Harness-Desktop_${VERSION}_linux-x64_unsigned.deb"
+          )
+          for name in "${expected[@]}"; do
+            [ -f "dist/release/$name" ] || { echo "::error::missing verified release asset $name"; exit 1; }
+          done
+          [ "$(find dist/release -maxdepth 1 -type f -name 'SHA256SUMS-*.txt' | wc -l | tr -d ' ')" = 3 ] || {
+            echo '::error::release payload must contain three platform checksum manifests'; exit 1;
+          }
+          cat dist/release/SHA256SUMS-*.txt | LC_ALL=C sort -k2 > dist/release/SHA256SUMS.txt
+          (cd dist/release && sha256sum -c SHA256SUMS.txt)
+          rm dist/release/SHA256SUMS-*.txt
+          [ "$(find dist/release -maxdepth 1 -type f | wc -l | tr -d ' ')" = 4 ] || {
+            echo '::error::release payload contains unexpected files'; find dist/release -maxdepth 1 -type f; exit 1;
+          }
+
+      - name: Publish verified assets
+        shell: bash
+        env:
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_SHA: ${{ github.sha }}
+          TAG: ${{ needs.plan.outputs.tag }}
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          set -euo pipefail
+          resolve_tag_commit() {
+            local object_type object_sha depth=0
+            IFS=$'\t' read -r object_type object_sha < <(
+              gh api "repos/$GH_REPO/git/ref/tags/$TAG" --jq '.object | [.type, .sha] | @tsv'
+            )
+            while [ "$object_type" = tag ]; do
+              depth=$((depth + 1))
+              [ "$depth" -le 8 ] || {
+                echo "::error::Tag $TAG exceeds the annotated-tag resolution limit"; return 1;
+              }
+              IFS=$'\t' read -r object_type object_sha < <(
+                gh api "repos/$GH_REPO/git/tags/$object_sha" --jq '.object | [.type, .sha] | @tsv'
+              )
+            done
+            [ "$object_type" = commit ] && [[ "$object_sha" =~ ^[0-9a-f]{40}$ ]] || {
+              echo "::error::Tag $TAG resolves to invalid object $object_type:$object_sha"; return 1;
+            }
+            printf '%s\n' "$object_sha"
+          }
+          assert_tag_commit() {
+            local actual_sha
+            actual_sha="$(resolve_tag_commit)"
+            [ "$actual_sha" = "$EXPECTED_SHA" ] || {
+              echo "::error::Tag $TAG resolves to $actual_sha, but this workflow verified $EXPECTED_SHA"; return 1;
+            }
+          }
+          notes="$RUNNER_TEMP/desktop-release-notes.md"
+          cat > "$notes" <<'NOTES'
+          This is an unofficial derivative and is not an official DeepSeek release.
+
+          ## Signing status
+
+          - macOS arm64 (requires macOS 15.0 or later): the DMG is unsigned and not notarized. The contained app uses an ad-hoc signature for integrity checks only; it is not Developer ID signed.
+          - Windows x64: unsigned.
+          - Linux x64: unsigned deb package.
+
+          ## Desktop API boundary
+
+          Each native desktop launch generates a fresh 256-bit credential. Same-origin `/api` HTTP requests use an Authorization bearer, the two event WebSockets use ordered `dsh-v1` and `dsh-auth-*` protocols, and Session-log downloads use a 30-second one-use ticket bound to the exact path and query. Ordinary `dsh web` remains unauthenticated. This blocks blind and ordinary local access, not inspection by another process running under the same operating-system account.
+
+          The installers exclude Anthropic's Agent SDK package and Claude Code platform payloads. The default closed Web-profile runtime does not enable the Claude Code subagent plugin.
+
+          ## Windows x64 functional limit
+
+          Persistent Bash sessions and persistent shell sessions are not supported. Use ordinary, non-persistent PowerShell command execution. Shell state is not preserved between commands, so the Windows package does not have complete feature parity with the macOS and Linux packages.
+
+          ## Redistribution boundary
+
+          - Every installer includes the upstream `LICENSE`, `THIRD_PARTY_NOTICES.md`, the bilingual `DISTRIBUTION_BOUNDARY.md`, and a target-specific, hash-inventoried `THIRD_PARTY_LICENSES/` directory.
+          - The Anthropic Agent SDK package, its platform packages, and bundled `claude` executables are excluded. The upstream source integration and any separately installed Claude Code CLI remain subject to Anthropic's terms.
+          - The upstream owner's identity-scoped Anthropic distribution authorization does not transfer to this derivative.
+          - The MIT license does not grant DeepSeek trademark rights. No OpenAI or Codex trademark rights are granted or claimed.
+          - Codex supplied stability ideas only. This desktop shell copies no Codex code or UI assets.
+
+          `SHA256SUMS.txt` covers every installer attached to this release.
+          NOTES
+          assert_tag_commit
+          existing_tags="$RUNNER_TEMP/existing-release-tags.txt"
+          gh api --paginate "repos/$GH_REPO/releases?per_page=100" --jq '.[].tag_name' > "$existing_tags"
+          if grep -Fqx -- "$TAG" "$existing_tags"; then
+            echo "::error::Release $TAG already exists, including as a draft; refusing to reuse or replace it"
+            exit 1
+          fi
+          cleanup_failed_draft() {
+            local status=$?
+            local release_state observed_id observed_tag observed_draft
+            trap - EXIT
+            set +e
+            if [ "$status" -ne 0 ]; then
+              if release_state="$(
+                gh api "repos/$GH_REPO/releases/$created_release_id" \
+                  --jq '[.id, .tag_name, .draft] | @tsv'
+              )"; then
+                IFS=$'\t' read -r observed_id observed_tag observed_draft <<< "$release_state"
+                if [ "$observed_id" = "$created_release_id" ] \
+                  && [ "$observed_tag" = "$TAG" ] \
+                  && [ "$observed_draft" = true ]; then
+                  if gh api --method DELETE "repos/$GH_REPO/releases/$created_release_id"; then
+                    echo "::notice::Removed failed draft release id $created_release_id; tag $TAG was not modified"
+                  else
+                    echo "::warning::Could not remove failed draft release id $created_release_id"
+                  fi
+                else
+                  echo "::warning::Refusing to remove release id $created_release_id because its id, tag, or draft state changed"
+                fi
+              else
+                echo "::warning::Could not verify failed draft release id $created_release_id; refusing cleanup"
+              fi
+            fi
+            exit "$status"
+          }
+          prerelease=false
+          if [[ "$VERSION" == *-* ]]; then prerelease=true; fi
+          created_release_id="$(
+            gh api --method POST "repos/$GH_REPO/releases" \
+              -f "tag_name=$TAG" \
+              -f "target_commitish=$EXPECTED_SHA" \
+              -f "name=Unofficial DeepSeek Harness Desktop $VERSION" \
+              -F "body=@$notes" \
+              -F draft=true \
+              -F "prerelease=$prerelease" \
+              --jq '.id'
+          )"
+          [[ "$created_release_id" =~ ^[0-9]+$ ]] || {
+            echo "::error::Created release $TAG returned invalid database id $created_release_id"; exit 1;
+          }
+          trap cleanup_failed_draft EXIT
+          observed_release_id="$(gh release view "$TAG" --json databaseId --jq '.databaseId')"
+          [ "$observed_release_id" = "$created_release_id" ] || {
+            echo "::error::Release $TAG changed from id $created_release_id to $observed_release_id"; exit 1;
+          }
+          assert_tag_commit
+          assets=(
+            "dist/release/Unofficial-DeepSeek-Harness-Desktop_${VERSION}_macos-arm64_app-adhoc_dmg-unsigned.dmg"
+            "dist/release/Unofficial-DeepSeek-Harness-Desktop_${VERSION}_windows-x64_unsigned-setup.exe"
+            "dist/release/Unofficial-DeepSeek-Harness-Desktop_${VERSION}_linux-x64_unsigned.deb"
+            'dist/release/SHA256SUMS.txt'
+          )
+          gh release upload "$TAG" "${assets[@]}"
+          expected_assets="$RUNNER_TEMP/expected-release-assets.txt"
+          remote_assets="$RUNNER_TEMP/remote-release-assets.txt"
+          printf '%s\n' "${assets[@]##*/}" | LC_ALL=C sort > "$expected_assets"
+          observed_release_id="$(gh release view "$TAG" --json databaseId --jq '.databaseId')"
+          [ "$observed_release_id" = "$created_release_id" ] || {
+            echo "::error::Release $TAG changed from id $created_release_id to $observed_release_id"; exit 1;
+          }
+          gh release view "$TAG" --json assets --jq '.assets[].name' | LC_ALL=C sort > "$remote_assets"
+          diff -u "$expected_assets" "$remote_assets"
+          assert_tag_commit
+          gh api --method PATCH "repos/$GH_REPO/releases/$created_release_id" -F draft=false --silent
+          trap - EXIT

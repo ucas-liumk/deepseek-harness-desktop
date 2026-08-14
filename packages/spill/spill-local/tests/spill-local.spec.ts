@@ -7,10 +7,10 @@
  */
 
 import { describe, expect, it, beforeEach, afterEach } from 'vitest'
-import { Context } from 'cordis'
+import { Context } from '@deepseek-ai/cordis'
 import { mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { dirname, isAbsolute, join } from 'node:path'
+import { basename, dirname, isAbsolute, join, normalize } from 'node:path'
 import { CallId } from '@deepseek-ai/dsh-llm'
 import { SessionId } from '@deepseek-ai/dsh-session'
 import type { SaveTextSpill } from '@deepseek-ai/dsh-spill'
@@ -63,7 +63,8 @@ describe('sessionDir', () => {
   it('is a stable per-session hash under the root', () => {
     const dir = sessionDir('/spill', 'sess-1')
     expect(dir).toBe(sessionDir('/spill', 'sess-1'))
-    expect(dir).toMatch(/\/spill\/session-[0-9a-f]{12}$/)
+    expect(dirname(dir)).toBe(normalize('/spill'))
+    expect(basename(dir)).toMatch(/^session-[0-9a-f]{12}$/)
     expect(sessionDir('/spill', 'sess-2')).not.toBe(dir)
   })
 })
@@ -74,7 +75,7 @@ describe('saveTextFile', () => {
     expect(readFileSync(saved.path, 'utf8')).toBe('héllo')
     expect(saved.bytes).toBe(Buffer.byteLength('héllo', 'utf8'))
     expect(dirname(saved.path)).toBe(sessionDir(root, 'sess-1'))
-    expect(saved.path).toMatch(/\/[0-9a-f]{12}-r\.txt$/)
+    expect(basename(saved.path)).toMatch(/^[0-9a-f]{12}-r\.txt$/)
   })
 
   it('sanitizes a traversal-shaped suggested name into one segment', async () => {
@@ -84,11 +85,16 @@ describe('saveTextFile', () => {
     expect(saved.path.includes('/..')).toBe(false)
   })
 
-  it('creates the session dir with owner-only permissions', async () => {
+  it('creates the session directory and file with owner-only POSIX permissions', async () => {
     const saved = await saveTextFile({ root, sessionId: 'sess-1', suggestedName: 'r.txt', content: 'x' })
-    // 0o700 dir, 0o600 file (masked by umask, but the owner bits must hold).
-    expect(statSync(dirname(saved.path)).mode & 0o700).toBe(0o700)
-    expect(statSync(saved.path).mode & 0o600).toBe(0o600)
+    const directory = statSync(dirname(saved.path))
+    const file = statSync(saved.path)
+    expect(directory.isDirectory()).toBe(true)
+    expect(file.isFile()).toBe(true)
+    if (process.platform !== 'win32') {
+      expect(directory.mode & 0o777).toBe(0o700)
+      expect(file.mode & 0o777).toBe(0o600)
+    }
   })
 
   it('gives distinct paths to two saves of the same name', async () => {

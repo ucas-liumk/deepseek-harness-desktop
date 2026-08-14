@@ -9,20 +9,20 @@ function output(over: Partial<HookOutput> = {}): HookOutput {
 
 describe('hook/* session events', () => {
   it('appendHookInvoked records a log-only hook/invoked (with matcher when present)', () => {
-    const session = new Session(SessionId('s'))
-    appendHookInvoked(session, { turn: 1, point: 'PreToolUse', dialect: 'claude', handlerId: 'h1', matcher: 'Bash' })
+    const session = Session.create(SessionId('s'))
+    appendHookInvoked(session, { turn: 1, point: 'PreToolUse', dialect: 'claude-code', handlerId: 'h1', matcher: 'Bash' })
 
     const ev = [...session.events].find(e => e.type === 'hook/invoked')
     expect(ev?.type).toBe('hook/invoked')
     if (ev?.type === 'hook/invoked') {
-      expect(ev.data).toMatchObject({ turn: 1, point: 'PreToolUse', dialect: 'claude', handlerId: 'h1', matcher: 'Bash' })
+      expect(ev.data).toMatchObject({ turn: 1, point: 'PreToolUse', dialect: 'claude-code', handlerId: 'h1', matcher: 'Bash' })
     }
     // Log-only: no surfaceOp on the event.
     expect((ev as unknown as { surfaceOp?: unknown }).surfaceOp).toBeUndefined()
   })
 
   it('omits matcher when absent (match-all hook)', () => {
-    const session = new Session(SessionId('s'))
+    const session = Session.create(SessionId('s'))
     appendHookInvoked(session, { turn: 2, point: 'Stop', dialect: 'codex', handlerId: 'h2' })
 
     const ev = [...session.events].find(e => e.type === 'hook/invoked')
@@ -32,7 +32,7 @@ describe('hook/* session events', () => {
   })
 
   it('appendHookResult derives decision/exitCode/stderrSummary from the output', () => {
-    const session = new Session(SessionId('s'))
+    const session = Session.create(SessionId('s'))
     appendHookResult(session, {
       turn: 1, point: 'PreToolUse', handlerId: 'h1',
       stderrSummaryMaxChars: 500, durationMs: 5, output: output({ exitCode: 2, stderr: 'blocked', decision: 'deny' }),
@@ -43,7 +43,7 @@ describe('hook/* session events', () => {
     }
 
     // A result with no exit code / no stderr (e.g. a hook that could not run) omits both keys.
-    const session2 = new Session(SessionId('s2'))
+    const session2 = Session.create(SessionId('s2'))
     appendHookResult(session2, {
       turn: 1, point: 'Stop', handlerId: 'h3',
       stderrSummaryMaxChars: 500, durationMs: 5, output: output({ exitCode: undefined, decision: 'allow' }),
@@ -57,7 +57,7 @@ describe('hook/* session events', () => {
   })
 
   it('the decision falls back to stop on continue:false, else pass', () => {
-    const session = new Session(SessionId('s'))
+    const session = Session.create(SessionId('s'))
     appendHookResult(session, { turn: 1, point: 'Stop', handlerId: 'halt', stderrSummaryMaxChars: 500, durationMs: 5, output: output({ continue: false }) })
     appendHookResult(session, { turn: 1, point: 'Stop', handlerId: 'noop', stderrSummaryMaxChars: 500, durationMs: 5, output: output() })
     // An explicit decision wins over the continue:false fallback.
@@ -70,7 +70,7 @@ describe('hook/* session events', () => {
   })
 
   it('stderrSummary is trimmed and truncated to 500 characters with an ellipsis', () => {
-    const session = new Session(SessionId('s'))
+    const session = Session.create(SessionId('s'))
     appendHookResult(session, {
       turn: 1, point: 'PreToolUse', handlerId: 'long',
       stderrSummaryMaxChars: 500, durationMs: 5, output: output({ exitCode: 2, stderr: `  ${'x'.repeat(600)}  ` }),
@@ -82,7 +82,7 @@ describe('hook/* session events', () => {
   })
 
   it('a 500-character stderr is kept verbatim (the cap is exclusive)', () => {
-    const session = new Session(SessionId('s'))
+    const session = Session.create(SessionId('s'))
     appendHookResult(session, {
       turn: 1, point: 'PreToolUse', handlerId: 'edge',
       stderrSummaryMaxChars: 500, durationMs: 5, output: output({ exitCode: 2, stderr: 'y'.repeat(500) }),
@@ -94,8 +94,8 @@ describe('hook/* session events', () => {
   })
 
   it('an invoked/result pair correlates by handlerId', () => {
-    const session = new Session(SessionId('s'))
-    appendHookInvoked(session, { turn: 1, point: 'PreToolUse', dialect: 'claude', handlerId: 'pair-1' })
+    const session = Session.create(SessionId('s'))
+    appendHookInvoked(session, { turn: 1, point: 'PreToolUse', dialect: 'claude-code', handlerId: 'pair-1' })
     appendHookResult(session, { turn: 1, point: 'PreToolUse', handlerId: 'pair-1', stderrSummaryMaxChars: 500, durationMs: 5, output: output({ decision: 'allow' }) })
 
     const invoked = [...session.events].find(e => e.type === 'hook/invoked')

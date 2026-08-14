@@ -1,5 +1,6 @@
-import { defineProperty, Dict } from 'cosmokit'
-import { StandardSchemaV1 } from '@standard-schema/spec'
+import { defineProperty } from '@deepseek-ai/cosmokit'
+import type { Dict } from '@deepseek-ai/cosmokit'
+import type { StandardSchemaV1 } from '@standard-schema/spec'
 import { Context } from './context.ts'
 import { Fiber } from './fiber.ts'
 import { buildOuterStack, DisposableList, symbols, withProps } from './utils.ts'

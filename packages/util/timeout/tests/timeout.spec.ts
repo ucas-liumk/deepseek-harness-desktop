@@ -1,5 +1,12 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { clampTimeout, deadline, timeoutOf, TimeoutReason } from '@deepseek-ai/dsh-timeout'
+import {
+  clampTimeout,
+  deadline,
+  idleWatchdog,
+  MAX_TIMER_DELAY_MS,
+  timeoutOf,
+  TimeoutReason,
+} from '@deepseek-ai/dsh-timeout'
 
 describe('TimeoutReason', () => {
   it('is an Error carrying the code and elapsed ms', () => {
@@ -66,6 +73,13 @@ describe('deadline — timeout arm', () => {
     vi.advanceTimersByTime(1_000)
     expect(d.signal.aborted).toBe(false)
     expect(timeoutOf(d.signal)).toBeUndefined()
+  })
+
+  it('rejects delays that Node would clamp to one millisecond', () => {
+    expect(() => deadline(undefined, MAX_TIMER_DELAY_MS + 1, 'BASH_TIMEOUT'))
+      .toThrow(`no greater than ${MAX_TIMER_DELAY_MS}`)
+    expect(() => deadline(undefined, Number.POSITIVE_INFINITY, 'BASH_TIMEOUT'))
+      .toThrow(`no greater than ${MAX_TIMER_DELAY_MS}`)
   })
 })
 
@@ -180,5 +194,98 @@ describe('deadline — nested deadlines', () => {
     expect(inner.signal.aborted).toBe(true)
     expect(timeoutOf(inner.signal, 'BASH_TIMEOUT')).toBeUndefined() // not ours → upstream-cancel path
     expect(timeoutOf(inner.signal)?.code).toBe('OUTER_TIMEOUT') // but IS a timeout, unscoped
+  })
+})
+
+describe('idleWatchdog', () => {
+  afterEach(() => { vi.useRealTimers() })
+
+  it('arms only while next is outstanding and rearms the same signal for later demand', async () => {
+    vi.useFakeTimers()
+    const first = Promise.withResolvers<IteratorResult<number>>()
+    const second = Promise.withResolvers<IteratorResult<number>>()
+    const iterator: AsyncIterator<number> = {
+      next: vi.fn()
+        .mockImplementationOnce(() => first.promise)
+        .mockImplementationOnce(() => second.promise),
+    }
+    using watchdog = idleWatchdog(undefined, 100, 'LLM_STREAM_IDLE_TIMEOUT')
+    const stableSignal = watchdog.signal
+
+    const firstNext = watchdog.next(iterator)
+    await vi.advanceTimersByTimeAsync(99)
+    expect(stableSignal.aborted).toBe(false)
+    first.resolve({ done: false, value: 1 })
+    await expect(firstNext).resolves.toEqual({ done: false, value: 1 })
+
+    await vi.advanceTimersByTimeAsync(10_000)
+    expect(stableSignal.aborted).toBe(false)
+    expect(watchdog.signal).toBe(stableSignal)
+
+    const secondNext = watchdog.next(iterator)
+    await vi.advanceTimersByTimeAsync(100)
+    expect(timeoutOf(stableSignal, 'LLM_STREAM_IDLE_TIMEOUT')).toMatchObject({ timeoutMs: 100 })
+    second.reject(stableSignal.reason)
+    await expect(secondNext).rejects.toBe(stableSignal.reason)
+  })
+
+  it('rearms outstanding demand on an out-of-band activity pulse', async () => {
+    vi.useFakeTimers()
+    const pending = Promise.withResolvers<IteratorResult<number>>()
+    const watchdog = idleWatchdog(undefined, 100, 'LLM_STREAM_IDLE_TIMEOUT')
+    watchdog.pulse()
+    await vi.advanceTimersByTimeAsync(1_000)
+    expect(watchdog.signal.aborted).toBe(false)
+
+    const next = watchdog.next({ next: () => pending.promise })
+    await vi.advanceTimersByTimeAsync(99)
+    watchdog.pulse()
+    await vi.advanceTimersByTimeAsync(99)
+    expect(watchdog.signal.aborted).toBe(false)
+    await vi.advanceTimersByTimeAsync(1)
+    expect(timeoutOf(watchdog.signal, 'LLM_STREAM_IDLE_TIMEOUT')).toMatchObject({ timeoutMs: 100 })
+    pending.reject(watchdog.signal.reason)
+    await expect(next).rejects.toBe(watchdog.signal.reason)
+
+    watchdog[Symbol.dispose]()
+    watchdog.pulse()
+  })
+
+  it('keeps an earlier upstream abort distinct from its own timeout', async () => {
+    vi.useFakeTimers()
+    const upstream = new AbortController()
+    using watchdog = idleWatchdog(upstream.signal, 100, 'LLM_STREAM_IDLE_TIMEOUT')
+    upstream.abort('caller cancelled')
+    expect(watchdog.signal.aborted).toBe(true)
+    expect(timeoutOf(watchdog.signal, 'LLM_STREAM_IDLE_TIMEOUT')).toBeUndefined()
+    await vi.advanceTimersByTimeAsync(1_000)
+    expect(watchdog.signal.reason).toBe('caller cancelled')
+  })
+
+  it('clears an outstanding arm on disposal', async () => {
+    vi.useFakeTimers()
+    const pending = Promise.withResolvers<IteratorResult<number>>()
+    const watchdog = idleWatchdog(undefined, 100, 'LLM_STREAM_IDLE_TIMEOUT')
+    void watchdog.next({ next: () => pending.promise })
+    watchdog[Symbol.dispose]()
+    await vi.advanceTimersByTimeAsync(1_000)
+    expect(watchdog.signal.aborted).toBe(false)
+    pending.resolve({ done: true, value: undefined })
+    await expect(watchdog.next({ next: () => Promise.resolve({ done: true, value: undefined }) }))
+      .rejects.toThrow(/disposed/)
+    watchdog[Symbol.dispose]()
+  })
+
+  it('rejects invalid bounds and concurrent iterator demand', async () => {
+    expect(() => idleWatchdog(undefined, 0, 'IDLE')).toThrow(/positive finite/)
+    expect(() => idleWatchdog(undefined, Number.NaN, 'IDLE')).toThrow(/positive finite/)
+    expect(() => idleWatchdog(undefined, MAX_TIMER_DELAY_MS + 1, 'IDLE'))
+      .toThrow(`no greater than ${MAX_TIMER_DELAY_MS}`)
+    const pending = Promise.withResolvers<IteratorResult<number>>()
+    using watchdog = idleWatchdog(undefined, 100, 'IDLE')
+    const iterator = { next: () => pending.promise }
+    void watchdog.next(iterator)
+    await expect(watchdog.next(iterator)).rejects.toThrow(/already outstanding/)
+    pending.resolve({ done: true, value: undefined })
   })
 })

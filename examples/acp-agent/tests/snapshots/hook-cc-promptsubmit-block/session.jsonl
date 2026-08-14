@@ -1,6 +1,1 @@
 {"type":"session","version":0,"id":"{{sessionId}}","createdAt":0,"cwd":"{{cwd}}","delegationDepth":0}
-{"type":"turn/start","seq":0,"time":0,"data":{"turn":1,"trigger":{"kind":"message","source":{"kind":"user"}}}}
-{"type":"hook/invoked","seq":1,"time":0,"data":{"turn":1,"point":"UserPromptSubmit","dialect":"claude","handlerId":"claude:UserPromptSubmit:1"}}
-{"type":"hook/result","seq":2,"time":0,"data":{"turn":1,"point":"UserPromptSubmit","handlerId":"claude:UserPromptSubmit:1","decision":"block","exitCode":2,"stderrSummary":"blocked by policy hook","durationMs":0}}
-{"type":"prompt/blocked","seq":3,"time":0,"data":{"content":[{"type":"text","text":"Delete everything in the repo."}],"source":{"kind":"user"},"reason":"blocked by policy hook"}}
-{"type":"turn/end","seq":4,"time":0,"data":{"turn":1,"reason":{"kind":"rejected","reason":"blocked by policy hook"}}}

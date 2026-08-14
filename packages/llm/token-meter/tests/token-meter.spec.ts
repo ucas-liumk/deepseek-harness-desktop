@@ -1,10 +1,10 @@
-import { describe, expect, it } from 'vitest'
-import { Context } from 'cordis'
-import { CallId } from '@deepseek-ai/dsh-llm'
+import { describe, expect, expectTypeOf, it } from 'vitest'
+import { Context } from '@deepseek-ai/cordis'
+import { createUserMessage, CallId, createMessage } from '@deepseek-ai/dsh-llm'
 import type { ContentBlock, Message, TokenUsage } from '@deepseek-ai/dsh-llm'
 import SessionStore, { Session, SessionId, canonicalHeader } from '@deepseek-ai/dsh-session'
 import type { EpochHeader, SessionEvent } from '@deepseek-ai/dsh-session'
-import TokenMeterService from '@deepseek-ai/dsh-token-meter'
+import TokenMeter from '@deepseek-ai/dsh-token-meter'
 import type { TokenMeasurement, TokenMeterConfig } from '@deepseek-ai/dsh-token-meter'
 
 function header(model: string, extras: Omit<EpochHeader, 'config'> = {}): EpochHeader {
@@ -12,7 +12,13 @@ function header(model: string, extras: Omit<EpochHeader, 'config'> = {}): EpochH
 }
 
 function textMessage(text: string, role: Message['role'] = 'user'): Message {
-  return { role, content: [{ type: 'text', text }] }
+  return createMessage({
+    role,
+    content: [{ type: 'text', text }],
+    source: role === 'assistant'
+      ? { kind: 'model', provider: 'mock', model: 'mock' }
+      : { kind: 'user' },
+  })
 }
 
 function appendHeader(session: Session, value: EpochHeader): void {
@@ -65,20 +71,26 @@ function appendSuccessfulCall(
     ? { surfaceOp: 'append' as const }
     : { surfaceOp: 'append' as const, sourceEventSeqs: provenance === 'empty' ? [] : sources }
   session.append('assistant/message', {
-    provenance: {
-      provider: value.config.provider,
-      model: value.config.model,
-    },
     turn,
     step,
-    content: durableText.length === 0 ? [] : [{ type: 'text', text: durableText }],
+    message: createMessage({
+      role: 'assistant',
+      content: durableText.length === 0 ? [] : [{ type: 'text', text: durableText }],
+      source: {
+        kind: 'model',
+        ...{
+          provider: value.config.provider,
+          model: value.config.model,
+        },
+      },
+    }),
     ...options.usage === undefined ? {} : { usage: options.usage },
   }, intent)
   session.append('step/end', { turn, step })
 }
 
-function meter(config: TokenMeterConfig = {}): TokenMeterService {
-  return new TokenMeterService(new Context(), config)
+function meter(config: TokenMeterConfig = {}): TokenMeter {
+  return new TokenMeter(new Context(), config)
 }
 
 function expectSurfaceTotal(measurement: TokenMeasurement): void {
@@ -86,44 +98,33 @@ function expectSurfaceTotal(measurement: TokenMeasurement): void {
     .toBe(measurement.surfaceTokens)
 }
 
-describe('TokenMeterService configuration and registration', () => {
-  it('provides one zero-config context window', () => {
-    const service = meter()
-    expect(service.contextWindow).toBe(128_000)
+describe('TokenMeter configuration and registration', () => {
+  it('exposes an empty public configuration type', () => {
+    expectTypeOf<{}>().toExtend<TokenMeterConfig>()
+    expectTypeOf<{ contextWindow: number }>().not.toExtend<TokenMeterConfig>()
   })
 
-  it('accepts one service-wide context-window override', () => {
-    expect(meter({ contextWindow: 32_000 }).contextWindow).toBe(32_000)
-  })
-
-  it.each(['models', 'contextWidow'])('rejects unknown top-level config key %s', (key) => {
-    expect(() => meter({ [key]: {} }))
-      .toThrow(`TokenMeterConfig: unknown key "${key}"`)
-  })
-
-  it.each([
-    { contextWindow: 0 },
-    { contextWindow: -1 },
-    { contextWindow: 1.5 },
-    { contextWindow: Number.NaN },
-    { contextWindow: null },
-  ] as unknown as TokenMeterConfig[])('rejects invalid context capacity %#', (config) => {
-    expect(() => meter(config)).toThrow(/contextWindow .* positive integer/)
-  })
+  it.each(['models', 'contextWindow', 'contextWidow'])(
+    'rejects stale or unknown top-level config key %s',
+    (key) => {
+      expect(() => meter({ [key]: {} } as unknown as TokenMeterConfig))
+        .toThrow(`TokenMeterConfig: unknown key "${key}"`)
+    },
+  )
 
   it('registers and unregisters ctx.tokenMeter with its plugin fiber', async () => {
     const ctx = new Context()
     await ctx.plugin(SessionStore)
-    const fiber = await ctx.plugin(TokenMeterService)
-    expect(ctx.get('tokenMeter')).toBeInstanceOf(TokenMeterService)
+    const fiber = await ctx.plugin(TokenMeter)
+    expect(ctx.get('tokenMeter')).toBeInstanceOf(TokenMeter)
     await fiber.dispose()
     expect(ctx.get('tokenMeter')).toBeUndefined()
   })
 })
 
-describe('TokenMeterService pricing', () => {
+describe('TokenMeter pricing', () => {
   it('prices every built-in content shape and merge-extended blocks with one fixed heuristic', () => {
-    const service = meter({ contextWindow: 100 })
+    const service = meter()
     const blocks: ContentBlock[] = [
       { type: 'text', text: 'abcd' },
       { type: 'reasoning', text: 'ab' },
@@ -136,14 +137,17 @@ describe('TokenMeterService pricing', () => {
       },
       { type: 'future-block', payload: 'abcd' } as unknown as ContentBlock,
     ]
-    const estimated = service.estimateMessage({ role: 'assistant', content: blocks })
+    const estimated = service.estimateMessage(createMessage({
+      role: 'assistant', content: blocks,
+      source: { kind: 'plugin', plugin: 'test' },
+    }))
     expect(estimated).toBeGreaterThan(30)
     expect(service.estimateMessage(textMessage('abcd'))).toBe(9)
   })
 
   it('returns a detached deeply immutable empty measurement', () => {
     const service = meter()
-    const session = new Session(SessionId('empty'))
+    const session = Session.create(SessionId('empty'))
     const result = service.measure(session)
     expect(result).toEqual({
       logRevision: 0,
@@ -164,11 +168,11 @@ describe('TokenMeterService pricing', () => {
 
   it('keeps an earlier unified snapshot detached from later replay', () => {
     const service = meter()
-    const session = new Session(SessionId('detached'))
-    session.append('user/message', {
+    const session = Session.create(SessionId('detached'))
+    session.append('user/message', createUserMessage({
       content: [{ type: 'text', text: 'first' }],
       source: { kind: 'user' },
-    }, { surfaceOp: 'append' })
+    }), { surfaceOp: 'append' })
     const snapshot = service.measure(session)
     const snapshotCopy = structuredClone(snapshot)
     expect(Object.isFrozen(snapshot.nodes)).toBe(true)
@@ -181,10 +185,10 @@ describe('TokenMeterService pricing', () => {
       ;(snapshot.nodes[0] as { seq: number; tokens: number }).tokens = 1
     }).toThrow(TypeError)
 
-    session.append('user/message', {
+    session.append('user/message', createUserMessage({
       content: [{ type: 'text', text: 'second' }],
       source: { kind: 'user' },
-    }, { surfaceOp: 'append' })
+    }), { surfaceOp: 'append' })
     const advanced = service.measure(session)
     expect(advanced.logRevision).toBe(2)
     expect(advanced.nodes).toHaveLength(2)
@@ -194,16 +198,15 @@ describe('TokenMeterService pricing', () => {
     expect(snapshot.nodes).toHaveLength(1)
   })
 
-  it('prices header, prefix, tools, and surface when no reusable usage exists', () => {
+  it('prices header, tools, and surface when no reusable usage exists', () => {
     const service = meter()
-    const session = new Session(SessionId('heuristic'))
-    session.append('user/message', {
+    const session = Session.create(SessionId('heuristic'))
+    session.append('user/message', createUserMessage({
       content: [{ type: 'text', text: 'question' }],
       source: { kind: 'user' },
-    }, { surfaceOp: 'append' })
+    }), { surfaceOp: 'append' })
     appendHeader(session, header('deepseek-v4-flash', {
       system: 'system',
-      messagePrefix: [textMessage('prefix')],
       tools: [{ name: 'read', description: 'read', parameters: { type: 'object' } }],
     }))
     const result = service.measure(session)
@@ -215,11 +218,11 @@ describe('TokenMeterService pricing', () => {
 
   it('keeps request-header overrides out of the returned surface', () => {
     const service = meter()
-    const session = new Session(SessionId('override-surface'))
-    session.append('user/message', {
+    const session = Session.create(SessionId('override-surface'))
+    session.append('user/message', createUserMessage({
       content: [{ type: 'text', text: 'question' }],
       source: { kind: 'user' },
-    }, { surfaceOp: 'append' })
+    }), { surfaceOp: 'append' })
 
     const logged = service.measure(session)
     const overridden = service.measure(session, header('another-model', {
@@ -243,11 +246,11 @@ describe('replay anchors and surface folds', () => {
 
   it('uses disjoint provider usage and signed durable-output rewrites', () => {
     const service = meter()
-    const session = new Session(SessionId('usage'))
-    session.append('user/message', {
+    const session = Session.create(SessionId('usage'))
+    session.append('user/message', createUserMessage({
       content: [{ type: 'text', text: 'before' }],
       source: { kind: 'user' },
-    }, { surfaceOp: 'append' })
+    }), { surfaceOp: 'append' })
     appendSuccessfulCall(session, header('deepseek-v4-flash'), {
       providerText: 'short',
       durableText: 'a much longer rewritten durable assistant answer',
@@ -264,7 +267,7 @@ describe('replay anchors and surface folds', () => {
 
   it('selects a heuristic anchor when provider usage would undercut its scale', () => {
     const service = meter()
-    const session = new Session(SessionId('low-usage-anchor'))
+    const session = Session.create(SessionId('low-usage-anchor'))
     const system = 'system context'
     const requestHeader = header('deepseek-v4-flash', { system })
     appendSuccessfulCall(session, requestHeader, {
@@ -275,10 +278,10 @@ describe('replay anchors and surface folds', () => {
     const anchored = service.measure(session)
     expect(anchored.baseline.kind).toBe('estimated')
     const assistant = anchored.nodes[0]!.seq
-    session.append('user/message', {
+    session.append('user/message', createUserMessage({
       content: [{ type: 'text', text: 'short' }],
       source: { kind: 'plugin', plugin: 'test' },
-    }, {
+    }), {
       surfaceOp: { op: 'replace', start: assistant, end: assistant },
       sourceEventSeqs: [assistant],
     })
@@ -294,7 +297,7 @@ describe('replay anchors and surface folds', () => {
 
   it('uses an estimated anchor when provider usage is absent', () => {
     const service = meter()
-    const session = new Session(SessionId('missing-usage'))
+    const session = Session.create(SessionId('missing-usage'))
     appendSuccessfulCall(session, header('deepseek-v4-flash', { system: 's' }), {
       providerText: 'provider',
       durableText: 'rewritten',
@@ -302,17 +305,17 @@ describe('replay anchors and surface folds', () => {
     const anchored = service.measure(session)
     expect(anchored.baseline.kind).toBe('estimated')
     expect(anchored.surfaceDeltaTokens).toBe(0)
-    session.append('user/message', {
+    session.append('user/message', createUserMessage({
       content: [{ type: 'text', text: 'later' }],
       source: { kind: 'user' },
-    }, { surfaceOp: 'append' })
+    }), { surfaceOp: 'append' })
     const advanced = service.measure(session)
     expect(advanced.surfaceDeltaTokens).toBeGreaterThan(0)
   })
 
-  it('distinguishes explicit empty provenance from absent legacy provenance', () => {
-    const explicit = new Session(SessionId('explicit-empty'))
-    const legacy = new Session(SessionId('legacy-absent'))
+  it('distinguishes an explicit empty source-event list from an absent legacy list', () => {
+    const explicit = Session.create(SessionId('explicit-empty'))
+    const legacy = Session.create(SessionId('legacy-absent'))
     appendSuccessfulCall(explicit, header('deepseek-v4-flash'), {
       durableText: 'listener injected text',
       providerText: '',
@@ -331,8 +334,8 @@ describe('replay anchors and surface folds', () => {
   })
 
   it('keeps only the latest successful request anchor across model switches', () => {
-    const service = meter({ contextWindow: 1_000 })
-    const session = new Session(SessionId('switch'))
+    const service = meter()
+    const session = Session.create(SessionId('switch'))
     const alphaHeader = header('alpha', { system: 'same envelope' })
     appendSuccessfulCall(session, alphaHeader, { usage: USAGE, providerText: 'alpha' })
     expect(service.measure(session).baseline).toMatchObject({ kind: 'usage', tokens: 34 })
@@ -353,7 +356,7 @@ describe('replay anchors and surface folds', () => {
 
   it('invalidates usage for any canonical envelope change or explicit override', () => {
     const service = meter()
-    const session = new Session(SessionId('envelope'))
+    const session = Session.create(SessionId('envelope'))
     const anchoredHeader = header('deepseek-v4-flash', { system: 'one' })
     appendSuccessfulCall(session, anchoredHeader, { usage: USAGE })
     expect(service.measure(session, { ...anchoredHeader, tools: [] }).baseline.kind).toBe('usage')
@@ -367,16 +370,12 @@ describe('replay anchors and surface folds', () => {
     }).baseline.kind).toBe('estimated')
     expect(service.measure(session, {
       ...anchoredHeader,
-      messagePrefix: [textMessage('prefix')],
-    }).baseline.kind).toBe('estimated')
-    expect(service.measure(session, {
-      ...anchoredHeader,
       tools: [{ name: 'read', description: 'read', parameters: { type: 'object' } }],
     }).baseline.kind).toBe('estimated')
   })
 
   it('folds the latest full header snapshot into the effective envelope', () => {
-    const session = new Session(SessionId('header-snapshot'))
+    const session = Session.create(SessionId('header-snapshot'))
     appendHeader(session, header('deepseek-v4-flash'))
     session.append('request/header', {
       header: header('deepseek-v4-pro'),
@@ -389,26 +388,26 @@ describe('replay anchors and surface folds', () => {
 
   it('replays seeded append and replace operations with signed deltas', () => {
     const service = meter()
-    const original = new Session(SessionId('surface-original'))
+    const original = Session.create(SessionId('surface-original'))
     appendSuccessfulCall(original, header('deepseek-v4-flash'), {
       usage: USAGE,
       providerText: 'long provider answer '.repeat(100),
     })
-    original.append('user/message', {
+    original.append('user/message', createUserMessage({
       content: [{ type: 'text', text: 'new tail' }],
       source: { kind: 'user' },
-    }, { surfaceOp: 'append' })
-    const seeded = new Session(SessionId('surface-seeded'), original.events)
+    }), { surfaceOp: 'append' })
+    const seeded = Session.create(SessionId('surface-seeded'), original.events)
     const before = service.measure(seeded)
     expect(before.nodes).toHaveLength(2)
     expect(before.surfaceDeltaTokens).toBeGreaterThan(0)
     expectSurfaceTotal(before)
 
     const first = seeded.surface.nodes[0]!
-    seeded.append('user/message', {
+    seeded.append('user/message', createUserMessage({
       content: [{ type: 'text', text: 'replacement' }],
       source: { kind: 'plugin', plugin: 'test' },
-    }, { surfaceOp: { op: 'replace', start: first, end: first }, sourceEventSeqs: [first] })
+    }), { surfaceOp: { op: 'replace', start: first, end: first }, sourceEventSeqs: [first] })
     const after = service.measure(seeded)
     expect(after.nodes).toHaveLength(2)
     expect(after.nodes[0]!.seq).toBe(seeded.events.length - 1)
@@ -418,12 +417,13 @@ describe('replay anchors and surface folds', () => {
     expect(after.surfaceDeltaTokens).toBeLessThan(0)
     expectSurfaceTotal(after)
     expect(before.nodes).toHaveLength(2)
-    expect(before.logRevision).toBe(original.events.length)
+    // The earlier snapshot still reports the log it measured: seed + boundary.
+    expect(before.logRevision).toBe(original.events.length + 1)
     expect(before.surfaceDeltaTokens).toBeGreaterThan(0)
   })
 
   it('prices an empty assistant surface anchor as zero', () => {
-    const session = new Session(SessionId('empty-assistant'))
+    const session = Session.create(SessionId('empty-assistant'))
     appendSuccessfulCall(session, header('deepseek-v4-flash'), {
       providerText: '',
       durableText: '',
@@ -438,25 +438,31 @@ describe('replay anchors and surface folds', () => {
 })
 
 describe('malformed replay and listener lifecycle', () => {
-  function expectRepeatedFailure(service: TokenMeterService, session: Session, pattern: RegExp): void {
+  function expectRepeatedFailure(service: TokenMeter, session: Session, pattern: RegExp): void {
     expect(() => service.measure(session)).toThrow(pattern)
     expect(() => service.measure(session)).toThrow(pattern)
   }
 
   it('rejects an assistant without its step boundary transactionally', () => {
-    const session = new Session(SessionId('bad-step'))
+    const session = Session.create(SessionId('bad-step'))
     appendHeader(session, header('deepseek-v4-flash'))
     session.append('assistant/message', {
-      provenance: { provider: 'mock', model: 'deepseek-v4-flash' },
       turn: 1,
       step: 1,
-      content: [{ type: 'text', text: 'bad' }],
+      message: createMessage({
+        role: 'assistant',
+        content: [{ type: 'text', text: 'bad' }],
+        source: {
+          kind: 'model',
+          ...{ provider: 'mock', model: 'deepseek-v4-flash' },
+        },
+      }),
     }, { surfaceOp: 'append', sourceEventSeqs: [] })
     expectRepeatedFailure(meter(), session, /no matching step\/start/)
   })
 
   it('clears completed step boundaries and rejects overlapping or late step events', () => {
-    const overlapping = new Session(SessionId('overlapping-step'))
+    const overlapping = Session.create(SessionId('overlapping-step'))
     overlapping.append('step/start', { turn: 1, step: 1 })
     overlapping.append('step/start', { turn: 1, step: 2 })
     expectRepeatedFailure(
@@ -465,15 +471,21 @@ describe('malformed replay and listener lifecycle', () => {
       /arrived before turn 1\/step 1 ended/,
     )
 
-    const late = new Session(SessionId('late-assistant'))
+    const late = Session.create(SessionId('late-assistant'))
     late.append('step/start', { turn: 1, step: 1 })
     appendHeader(late, header('deepseek-v4-flash'))
     late.append('step/end', { turn: 1, step: 1 })
     late.append('assistant/message', {
-      provenance: { provider: 'mock', model: 'deepseek-v4-flash' },
       turn: 1,
       step: 1,
-      content: [],
+      message: createMessage({
+        role: 'assistant',
+        content: [],
+        source: {
+          kind: 'model',
+          ...{ provider: 'mock', model: 'deepseek-v4-flash' },
+        },
+      }),
     }, { surfaceOp: 'append', sourceEventSeqs: [] })
     expectRepeatedFailure(
       meter(),
@@ -481,7 +493,7 @@ describe('malformed replay and listener lifecycle', () => {
       /no matching step\/start/,
     )
 
-    const mismatchedEnd = new Session(SessionId('mismatched-end'))
+    const mismatchedEnd = Session.create(SessionId('mismatched-end'))
     mismatchedEnd.append('step/start', { turn: 1, step: 1 })
     mismatchedEnd.append('step/end', { turn: 1, step: 2 })
     expectRepeatedFailure(
@@ -491,7 +503,7 @@ describe('malformed replay and listener lifecycle', () => {
     )
   })
 
-  it('rejects invalid assistant provenance', () => {
+  it('rejects invalid assistant source-event references', () => {
     const cases: Array<{
       name: string
       appendSource(session: Session): number[]
@@ -500,10 +512,10 @@ describe('malformed replay and listener lifecycle', () => {
       {
         name: 'non-chunk',
         appendSource(session) {
-          return [session.append('user/message', {
+          return [session.append('user/message', createUserMessage({
             content: [{ type: 'text', text: 'x' }],
             source: { kind: 'user' },
-          }, { surfaceOp: 'append' }).seq]
+          }), { surfaceOp: 'append' }).seq]
         },
         pattern: /is not assistant\/chunk/,
       },
@@ -520,23 +532,29 @@ describe('malformed replay and listener lifecycle', () => {
       },
     ]
     for (const testCase of cases) {
-      const session = new Session(SessionId(`bad-source-${testCase.name}`))
+      const session = Session.create(SessionId(`bad-source-${testCase.name}`))
       session.append('step/start', { turn: 1, step: 1 })
       appendHeader(session, header('deepseek-v4-flash'))
       const sourceEventSeqs = testCase.appendSource(session)
       session.append('assistant/message', {
-        provenance: { provider: 'mock', model: 'deepseek-v4-flash' },
         turn: 1,
         step: 1,
-        content: [{ type: 'text', text: 'bad' }],
+        message: createMessage({
+          role: 'assistant',
+          content: [{ type: 'text', text: 'bad' }],
+          source: {
+            kind: 'model',
+            ...{ provider: 'mock', model: 'deepseek-v4-flash' },
+          },
+        }),
         usage: { inputTokens: 1, outputTokens: 1 },
       }, { surfaceOp: 'append', sourceEventSeqs })
       expect(() => meter().measure(session)).toThrow(testCase.pattern)
     }
   })
 
-  it('rejects repeated and non-earlier assistant provenance', () => {
-    const duplicate = new Session(SessionId('duplicate-source'))
+  it('rejects repeated and non-earlier assistant source-event references', () => {
+    const duplicate = Session.create(SessionId('duplicate-source'))
     duplicate.append('step/start', { turn: 1, step: 1 })
     appendHeader(duplicate, header('deepseek-v4-flash'))
     const source = duplicate.append('assistant/chunk', {
@@ -549,10 +567,16 @@ describe('malformed replay and listener lifecycle', () => {
       seq: duplicate.seq,
       time: 0,
       data: {
-        provenance: { provider: 'mock', model: 'deepseek-v4-flash' },
         turn: 1,
         step: 1,
-        content: [],
+        message: createMessage({
+          role: 'assistant',
+          content: [],
+          source: {
+            kind: 'model',
+            ...{ provider: 'mock', model: 'deepseek-v4-flash' },
+          },
+        }),
         usage: { inputTokens: 1, outputTokens: 0 },
       },
       surfaceOp: 'append',
@@ -560,7 +584,7 @@ describe('malformed replay and listener lifecycle', () => {
     })
     expect(() => meter().measure(duplicate)).toThrow(/repeats source seq/)
 
-    const future = new Session(SessionId('future-source'))
+    const future = Session.create(SessionId('future-source'))
     future.append('step/start', { turn: 1, step: 1 })
     appendHeader(future, header('deepseek-v4-flash'))
     appendUnchecked(future, {
@@ -568,10 +592,16 @@ describe('malformed replay and listener lifecycle', () => {
       seq: future.seq,
       time: 0,
       data: {
-        provenance: { provider: 'mock', model: 'deepseek-v4-flash' },
         turn: 1,
         step: 1,
-        content: [],
+        message: createMessage({
+          role: 'assistant',
+          content: [],
+          source: {
+            kind: 'model',
+            ...{ provider: 'mock', model: 'deepseek-v4-flash' },
+          },
+        }),
         usage: { inputTokens: 1, outputTokens: 0 },
       },
       surfaceOp: 'append',
@@ -581,18 +611,24 @@ describe('malformed replay and listener lifecycle', () => {
   })
 
   it('does not partially apply a malformed assistant replacement', () => {
-    const session = new Session(SessionId('transactional-replace'))
-    session.append('user/message', {
+    const session = Session.create(SessionId('transactional-replace'))
+    session.append('user/message', createUserMessage({
       content: [{ type: 'text', text: 'head' }],
       source: { kind: 'user' },
-    }, { surfaceOp: 'append' })
+    }), { surfaceOp: 'append' })
     appendHeader(session, header('deepseek-v4-flash'))
     const head = session.events[0]!.seq
     session.append('assistant/message', {
-      provenance: { provider: 'mock', model: 'deepseek-v4-flash' },
       turn: 1,
       step: 1,
-      content: [{ type: 'text', text: 'replacement' }],
+      message: createMessage({
+        role: 'assistant',
+        content: [{ type: 'text', text: 'replacement' }],
+        source: {
+          kind: 'model',
+          ...{ provider: 'mock', model: 'deepseek-v4-flash' },
+        },
+      }),
     }, { surfaceOp: { op: 'replace', start: head, end: head }, sourceEventSeqs: [head] })
     expectRepeatedFailure(
       meter(),
@@ -602,19 +638,19 @@ describe('malformed replay and listener lifecycle', () => {
   })
 
   it('rejects corrupt replacement ranges without advancing the replay cursor', () => {
-    const session = new Session(SessionId('bad-replace'))
-    const head = session.append('user/message', {
+    const session = Session.create(SessionId('bad-replace'))
+    const head = session.append('user/message', createUserMessage({
       content: [{ type: 'text', text: 'head' }],
       source: { kind: 'user' },
-    }, { surfaceOp: 'append' }).seq
+    }), { surfaceOp: 'append' }).seq
     appendUnchecked(session, {
       type: 'user/message',
       seq: session.seq,
       time: 0,
-      data: {
+      data: createUserMessage({
         content: [{ type: 'text', text: 'bad' }],
         source: { kind: 'user' },
-      },
+      }),
       surfaceOp: { op: 'replace', start: 99, end: 99 },
       sourceEventSeqs: [head],
     })
@@ -624,26 +660,33 @@ describe('malformed replay and listener lifecycle', () => {
   it('handles earlier-reader catch-up, eager observation, and service reload', async () => {
     const ctx = new Context()
     await ctx.plugin(SessionStore)
-    let activeMeter: TokenMeterService | undefined
+    let activeMeter: TokenMeter | undefined
     const revisions: number[] = []
     ctx.on('session/event', (session) => {
       if (activeMeter !== undefined) revisions.push(activeMeter.measure(session).logRevision)
     })
-    const firstFiber = await ctx.plugin(TokenMeterService)
+    const firstFiber = await ctx.plugin(TokenMeter)
     activeMeter = ctx.tokenMeter
-    const session = ctx.sessions.create(SessionId('listener-order'))
+    const session = ctx.sessions.create(SessionId('listener-order'), { seed: [{
+      type: 'turn/start',
+      seq: 0,
+      time: 1,
+      data: { turn: 1 },
+    }] })
     activeMeter.measure(session)
-    session.append('user/message', {
+    session.append('user/message', createUserMessage({
       content: [{ type: 'text', text: 'one' }],
       source: { kind: 'user' },
-    }, { surfaceOp: 'append' })
-    expect(revisions).toEqual([1])
-    expect(activeMeter.measure(session).logRevision).toBe(1)
+    }), { surfaceOp: 'append' })
+    // Seed, end-seed, then one live append. Only the last event published:
+    // end-seed predates store attachment, like the seed.
+    expect(revisions).toEqual([3])
+    expect(activeMeter.measure(session).logRevision).toBe(3)
 
     await firstFiber.dispose()
-    const secondFiber = await ctx.plugin(TokenMeterService)
+    const secondFiber = await ctx.plugin(TokenMeter)
     activeMeter = ctx.tokenMeter
-    expect(activeMeter.measure(session).logRevision).toBe(1)
+    expect(activeMeter.measure(session).logRevision).toBe(3)
     await secondFiber.dispose()
   })
 })

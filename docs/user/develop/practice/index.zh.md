@@ -1,76 +1,69 @@
-# 能力的三层拆分
+# 能力的三种角色设计
 
 [English](index.md) | 中文
 
-当一个能力（插件）足够通用（比如"执行 bash 命令"），Harness 会把它拆成三个包：**接口**、**实现**、**消费者**。这样可以独立替换其中任何一层。
+本文分为两部分：先参考三种角色能力模式的概念，再通过高级教程构建一项能力。请先完成[基础插件路径](../basic/)和[服务教程](../framework/service.md)。
+
+## 概念参考
+
+当一项能力足够通用，需要支持可替换的提供方时（例如 Bash 执行），harness 会区分三种角色：**Service Definition**、**Service Provider** 和 **Consumer**。角色需要独立演进或替换时，将它们放入不同包；否则一个包可以承担多个角色。完整能力构成其 seam。任何单一角色都不是 seam。
 
 ## 以 Bash 为例
 
-考虑 "Bash 执行" 这个能力：
+以 Bash 执行能力为例：
 
-- **接口** (`dsh-bash`) — 定义"bash 执行"长什么样：输入是什么、输出是什么
-- **实现** (`dsh-bash-local`) — 真正在本地跑命令的代码
-- **消费者** (`dsh-tool-bash`) — 把这个能力包装成模型能调用的 tool
+- **Service Definition** (`dsh-shell`)：定义 Cordis 服务以及 Bash 请求和结果类型
+- **Service Provider** (`dsh-bash-local`)：在本地计算机上执行命令
+- **Consumer** (`dsh-tool-bash`)：将该能力公开为模型可调用的工具
 
 ```
 ┌─────────────┐     ┌──────────────────┐     ┌──────────────┐
-│  dsh-bash   │────▶│  dsh-bash-local  │     │ dsh-tool-bash│
-│ (interface) │     │ (implementation) │     │(consumer/tool)│
+│  dsh-shell   │────▶│  dsh-bash-local  │     │ dsh-tool-bash│
+│(definition) │     │    (provider)     │     │(consumer/tool)│
 └─────────────┘     └──────────────────┘     └──────────────┘
        ▲                                            │
        └────────────────────────────────────────────┘
-                    inject: ['bash']
+                    inject: ['shell']
 ```
 
 ## 拆分的好处
 
-### 具体实现可替换
+### 提供方可替换
 
-同一个接口可以有多种实现。用户通过 `cordis.yml` 选择：
+同一个 Service Definition 可以有多个提供方，可通过 `cordis.yml` 选择：
 
 ```yaml
 # Local execution
 - name: '@deepseek-ai/dsh-bash-local'
 
-# Or a future remote sandbox implementation
-# - name: '@deepseek-ai/dsh-bash-remote'
-#   config:
-#     endpoint: 'https://sandbox.example.com'
+# Replace this row with another package that provides the same service.
 ```
 
-接口不变、tool 不变，只换实现。
+更换提供方时，Service Definition 和工具均保持不变。
 
 ### 独立演进
 
-- 接口定义稳定后很少改动
-- 实现可以独立优化（性能、安全）
-- 消费者（tool）可以调整对模型的呈现方式
+- 调用方开始依赖 Service Definition 的约定后，Service Definition 很少改动。
+- Service Provider 可以独立优化性能和安全性。
+- Consumer 可以调整能力向模型呈现的方式。
 
 ### 依赖解耦
 
-- 实现 depend on 接口
-- 消费者 depend on 接口
-- 实现和消费者**互不依赖**
+- Service Provider 依赖 Service Definition。
+- Consumer 依赖 Service Definition。
+- Service Provider 和 Consumer **互不依赖**。
 
-## Harness 中内置的三件套
+当前内置系列及其包链接由[能力 seam 参考](../../../capability-seams.md)负责。
 
-| 能力 | 接口 (seam) | 实现 | 消费者 (tool) |
-|------|-------------|------|---------------|
-| Bash | `dsh-bash` | `dsh-bash-local` | `dsh-tool-bash` |
-| 文件系统 | `dsh-fs` | `dsh-fs-local` + `dsh-fs-policy` | `dsh-tool-fs` |
-| Web | `dsh-web` | `dsh-web-fetch-local` / `dsh-web-search-*` | `dsh-tool-web` |
-| 子代理 | `dsh-subagent` | `dsh-subagent-spawn` / `dsh-subagent-fork` | `dsh-tool-subagent` |
-| 压缩 | `dsh-compact` | `dsh-compact-basic` | 由实现插件消费 agent-loop 的扩展事件 |
+## 教程：开发三种角色的能力
 
-## 开发你自己的三件套
-
-### 第一步：定义接口
+### 第一步：编写 Service Definition
 
 ```ts ignore-check
 // packages/my-cap/my-cap/src/index.ts
-import { Service, type Context } from 'cordis'
+import { Service, type Context } from '@deepseek-ai/cordis'
 
-declare module 'cordis' {
+declare module '@deepseek-ai/cordis' {
   interface Context {
     myCap: MyCapService
   }
@@ -94,16 +87,16 @@ export interface MyCapResult {
 }
 ```
 
-### 第二步：编写实现
+### 第二步：编写 Service Provider
 
 ```ts ignore-check
 // packages/my-cap/my-cap-local/src/index.ts
-import type { Context } from 'cordis'
+import type { Context } from '@deepseek-ai/cordis'
 import { MyCapService, type MyCapRequest, type MyCapResult } from '@deepseek-ai/dsh-my-cap'
 
 class MyCapLocal extends MyCapService {
   async execute(request: MyCapRequest): Promise<MyCapResult> {
-    // Concrete implementation.
+    // Local provider behavior.
     return { output: request.input.toUpperCase() }
   }
 }
@@ -115,11 +108,11 @@ export function apply(ctx: Context) {
 }
 ```
 
-### 第三步：编写消费者 (tool)
+### 第三步：编写消费方
 
 ```ts ignore-check
 // packages/my-cap/tool-my-cap/src/index.ts
-import type { Context } from 'cordis'
+import type { Context } from '@deepseek-ai/cordis'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 
 export const name = 'tool-my-cap'
@@ -132,9 +125,13 @@ export function apply(ctx: Context) {
     parameters: {
       input: { type: 'string', required: true },
     },
+    output: {
+      schema: { type: 'string' },
+      render: (_args, value) => [{ type: 'text', text: value }],
+    },
     async execute(args) {
       const result = await ctx.myCap.execute({ input: args.input })
-      return [{ type: 'text', text: result.output }]
+      return result.output
     },
   }))
 }
@@ -149,10 +146,10 @@ export function apply(ctx: Context) {
 
 ## 设计要点
 
-- **不要预防性拆分** — 只有当你确实需要可替换实现时才拆三件套。一个简单的 tool 插件不需要拆分。
-- **接口定义 Request/Result 类型** — 实现和消费者只依赖接口包。
-- **Explicit > Implicit** — 实现中的默认值处理应该是显式的 `resolve(request): Spec` 步骤，不是隐藏在 `run()` 中的 `?? default`。
+- **不要预防性拆分**：只有角色需要独立演进时，才使用不同包。简单的工具插件无需拆分。
+- **Service Definition 拥有 Request/Result 类型**：Service Provider 和 Consumer 只依赖 Service Definition 包。
+- **显式优于隐式**：实现应通过显式的 `resolve(request): Spec` 步骤处理默认值，而不是在 `run()` 中隐藏 `?? default`。
 
 ## 下一步
 
-- [LLM 适配器](./llm-adapter.md) — 实现一个 LLM 后端（最常见的 seam 扩展）
+- [LLM（大语言模型）适配器](./llm-adapter.md)：实现一个 LLM 提供方

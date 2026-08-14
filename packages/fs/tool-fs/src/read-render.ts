@@ -37,9 +37,9 @@ export interface FileTextLine {
 export interface WindowResult {
   /** Returned lines, already numbered. */
   lines: FileTextLine[]
-  /** Total line count in the file, unless `truncatedByBytes` stopped scanning early. */
+  /** Exact total line count in the file. */
   totalLines: number
-  /** Whether selected output hit the byte cap before EOF or the requested limit. */
+  /** Whether selected output hit the byte cap. */
   truncatedByBytes: boolean
 }
 
@@ -49,9 +49,9 @@ export interface FileReadOutcome {
   offset: number
   /** Returned lines, already numbered. */
   lines: FileTextLine[]
-  /** Total line count in the file, unless `truncatedByBytes` stopped scanning early. */
+  /** Exact total line count in the file. */
   totalLines: number
-  /** Whether selected output hit the byte cap before EOF or the requested limit. */
+  /** Whether selected output hit the byte cap. */
   truncatedByBytes?: true
 }
 
@@ -60,11 +60,10 @@ interface WindowAccumulator {
   totalLines: number
   outputBytes: number
   truncatedByBytes: boolean
-  done: boolean
 }
 
 function newAccumulator(): WindowAccumulator {
-  return { lines: [], totalLines: 0, outputBytes: 0, truncatedByBytes: false, done: false }
+  return { lines: [], totalLines: 0, outputBytes: 0, truncatedByBytes: false }
 }
 
 function truncateLine(line: string, maxLineLength: number): string {
@@ -77,13 +76,12 @@ function lineByteSize(line: string, currentLineCount: number): number {
 
 function consumeLine(acc: WindowAccumulator, rawLine: string, request: ReadWindow): void {
   acc.totalLines += 1
-  if (acc.totalLines < request.offset || acc.lines.length >= request.limit) return
+  if (acc.truncatedByBytes || acc.totalLines < request.offset || acc.lines.length >= request.limit) return
 
   const text = truncateLine(rawLine, request.maxLineLength)
   const bytes = lineByteSize(text, acc.lines.length)
   if (acc.outputBytes + bytes > request.maxBytes) {
     acc.truncatedByBytes = true
-    acc.done = true
     return
   }
   acc.outputBytes += bytes
@@ -102,8 +100,9 @@ function finish(acc: WindowAccumulator, request: ReadWindow, displayPath: string
 }
 
 /**
- * Build one window from streamed or whole-file chunks, enforcing line and byte caps and throwing
- * `FS_NOT_FOUND` when the requested offset is past EOF.
+ * Build one window from streamed or whole-file chunks, enforcing line and byte caps while still
+ * scanning to an exact total line count, and throwing `FS_NOT_FOUND` when the requested offset is
+ * past EOF.
  * @param chunks - decoded text chunks in file order; chunk boundaries carry no meaning.
  * @param request - the resolved window; the caller has already applied its defaults and caps.
  * @param displayPath - the caller-facing path used in the offset-out-of-range error.
@@ -137,7 +136,6 @@ export async function buildWindow(
       appendToLineBuffer(chunk.slice(startPos, newlinePos))
       flushLine()
       startPos = newlinePos + 1
-      if (acc.done) return finish(acc, request, displayPath)
     }
     appendToLineBuffer(chunk.slice(startPos))
   }
@@ -169,4 +167,106 @@ export function formatReadOutput(displayPath: string, outcome: FileReadOutcome):
 <content>
 ${body}
 </content>`
+}
+
+/**
+ * Lowercased file-extension to syntax-highlighting language hint. Keys are the
+ * extension without its dot; a UI treats an absent key as plain text. The map is
+ * intentionally small — common source, config, and markup extensions a
+ * line-numbered code view benefits from highlighting — not an exhaustive registry.
+ */
+const LANG_BY_EXTENSION: Readonly<Record<string, string>> = {
+  ts: 'ts', tsx: 'tsx', mts: 'ts', cts: 'ts',
+  js: 'js', jsx: 'jsx', mjs: 'js', cjs: 'js',
+  json: 'json', jsonc: 'json',
+  py: 'py', rb: 'rb', go: 'go', rs: 'rs', java: 'java',
+  c: 'c', h: 'c', cc: 'cpp', cpp: 'cpp', hpp: 'cpp', cxx: 'cpp',
+  cs: 'cs', kt: 'kotlin', swift: 'swift', php: 'php',
+  sh: 'sh', bash: 'sh', zsh: 'sh',
+  yaml: 'yaml', yml: 'yaml', toml: 'toml', ini: 'ini',
+  md: 'md', markdown: 'md', mdx: 'mdx',
+  html: 'html', htm: 'html', css: 'css', scss: 'scss', less: 'less',
+  sql: 'sql', xml: 'xml', lua: 'lua',
+}
+
+/**
+ * Derive a syntax-highlighting language hint from a read path's file extension.
+ * Pure and case-insensitive on the extension; a dotfile with no extension
+ * (`.gitignore`) and an unknown extension both yield `undefined`.
+ * @param path - the model-facing path the read reported.
+ * @returns the language hint for {@link LANG_BY_EXTENSION}, or `undefined` when the extension maps to none.
+ */
+export function langFromPath(path: string): string | undefined {
+  const base = path.slice(Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\')) + 1)
+  const dot = base.lastIndexOf('.')
+  // A leading dot is a dotfile (no extension), not an empty extension.
+  if (dot <= 0) return undefined
+  const ext = base.slice(dot + 1).toLowerCase()
+  // Own-property check only: a filename whose extension is an Object.prototype
+  // key (`foo.constructor`, `foo.__proto__`) must map to no language, not to the
+  // inherited member — otherwise a function would reach `lang` and fail the
+  // tool-output JSON validation.
+  return Object.hasOwn(LANG_BY_EXTENSION, ext) ? LANG_BY_EXTENSION[ext] : undefined
+}
+
+/**
+ * The `read` tool's private `tool/result` `meta` payload: the structured
+ * line-numbered window a capable UI renders as a code view. Attached opaquely (as
+ * `unknown`) on the tool result and persisted with the session log — it must be
+ * JSON-serializable (the session validates this at `append`), so `presentResult`
+ * reproduces the read card on replay when the raw structured output is no longer
+ * on the wire. The producing tool owns and narrows this opaque shape.
+ */
+export interface FsReadMeta {
+  /** The read file's model-facing path. */
+  path: string
+  /** The 1-based first line the window requested, kept even when `lines` is empty. */
+  offset: number
+  /** The returned window's lines, each keeping its file line number. */
+  lines: FileTextLine[]
+  /** Exact total line count in the file. */
+  totalLines: number
+  /** Syntax-highlighting language hint from the extension, or omitted for plain text. */
+  lang?: string
+}
+
+/**
+ * Whether `value` is a valid {@link FileTextLine} (defensive narrowing from
+ * opaque `meta`). `number` must be a 1-based integer line number, since a card
+ * rendered from a zero, fractional, or non-finite line number would violate the
+ * 1-based numbering contract the read window promises.
+ */
+function isFileTextLine(value: unknown): value is FileTextLine {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return false
+  const { number, text } = value as Record<string, unknown>
+  return typeof number === 'number' && Number.isInteger(number) && number >= 1 && typeof text === 'string'
+}
+
+/**
+ * Narrow opaque live or replayed result metadata to a structured read window.
+ * Malformed metadata returns `undefined` so presentation can fall back to the
+ * generic text card instead of throwing during replay. Beyond shape, the
+ * semantic contract of a read window is enforced against replayed JSON that is
+ * well-typed but out of range: `offset` must be a 1-based integer, `totalLines`
+ * must be a non-negative integer, each line number must be a 1-based integer no
+ * less than `offset`, the line numbers must strictly increase, and no line number
+ * may exceed `totalLines`. Any violation declines to the generic fallback rather
+ * than emitting a card that misnumbers or overcounts.
+ * @param meta - result metadata.
+ * @returns the validated read window, or `undefined` for absent, malformed, or semantically invalid data.
+ */
+export function readMetaFromMeta(meta: unknown): FsReadMeta | undefined {
+  if (typeof meta !== 'object' || meta === null || Array.isArray(meta)) return undefined
+  const { path, offset, lines, totalLines, lang } = meta as Record<string, unknown>
+  if (typeof path !== 'string' || typeof totalLines !== 'number' || typeof offset !== 'number') return undefined
+  if (!Number.isInteger(offset) || offset < 1) return undefined
+  if (!Number.isInteger(totalLines) || totalLines < 0) return undefined
+  if (!Array.isArray(lines) || !lines.every(isFileTextLine)) return undefined
+  if (lang !== undefined && typeof lang !== 'string') return undefined
+  let previous = offset - 1
+  for (const { number } of lines) {
+    if (number <= previous || number > totalLines) return undefined
+    previous = number
+  }
+  return { path, offset, lines, totalLines, ...lang === undefined ? {} : { lang } }
 }

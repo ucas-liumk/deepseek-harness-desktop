@@ -1,41 +1,72 @@
 /**
- * AST walkers for the Cordis catalog generator: locate the Cordis module merge
- * in a source file, enumerate its `interface Events` members, and resolve the
- * `interface Context` service keys to their service classes.
+ * AST helpers shared by the Cordis generators: locate the Cordis module merge
+ * in a source file and enumerate the `interface Context` keys it declares.
+ * The vendored core API projector consumes the merge body; the per-subsystem
+ * region generator's exhaustiveness backstop consumes the key scan.
  */
 
+import { globSync, readFileSync } from 'node:fs'
+import { resolve, sep } from 'node:path'
 import ts from 'typescript'
-import { parseJsDoc, pointer, rawJsDoc } from './jsdoc.ts'
 
-/** The body of the cordis module merge in `sf`: `declare module 'cordis'`
- * (harness packages) or `declare module './context.ts'` (vendor core), or
- * null when the file has neither. */
-export function cordisModuleBody(sf: ts.SourceFile): ts.ModuleBlock | null {
-  for (const stmt of sf.statements) {
-    if (!ts.isModuleDeclaration(stmt) || !ts.isStringLiteral(stmt.name)) continue
-    if (stmt.name.text !== 'cordis' && stmt.name.text !== './context.ts') continue
-    if (stmt.body && ts.isModuleBlock(stmt.body)) return stmt.body
-  }
-  return null
-}
+/** Cheap textual prefilter for a cordis module merge, quote-style agnostic
+ * (the AST match below reads `stmt.name.text` and never sees the quotes). */
+const MERGE_HEAD = /declare module ['"](?:@deepseek-ai\/cordis|\.\/context\.ts)['"]/
 
-/** Every `interface Events` method member of a cordis module merge, with the
- * event name resolved from its (possibly string-literal) property name. */
-export function eventMembers(body: ts.ModuleBlock, sf: ts.SourceFile): { name: string; member: ts.MethodSignature }[] {
-  const out: { name: string; member: ts.MethodSignature }[] = []
-  for (const stmt of body.statements) {
-    if (!ts.isInterfaceDeclaration(stmt) || stmt.name.text !== 'Events') continue
-    for (const member of stmt.members) {
-      if (!ts.isMethodSignature(member)) continue
-      const name = ts.isStringLiteral(member.name) ? member.name.text : member.name.getText(sf)
-      out.push({ name, member })
-    }
+/**
+ * Parse every file matching `patterns` (repo-relative, sorted, `/`-normalized)
+ * that textually contains a cordis module merge, yielding one entry per merge
+ * BLOCK — a file may legally hold several `declare module '@deepseek-ai/cordis'` blocks
+ * (the Typert analyzer reads them all), so the exhaustiveness scan must too.
+ * Files without a merge are skipped.
+ * @param scanRoot - Repository root the patterns are resolved against.
+ * @param patterns - Glob(s) selecting the TypeScript files to scan.
+ * @returns One entry per cordis module block, in path then source order.
+ */
+export function contextMergeFiles(
+  scanRoot: string,
+  patterns: string | readonly string[],
+): { rel: string; sf: ts.SourceFile; text: string; body: ts.ModuleBlock }[] {
+  const out: { rel: string; sf: ts.SourceFile; text: string; body: ts.ModuleBlock }[] = []
+  const rels = [...new Set(globSync(patterns as string | string[], { cwd: scanRoot }).map(s => s.split(sep).join('/')))].sort()
+  for (const rel of rels) {
+    const abs = resolve(scanRoot, rel)
+    const text = readFileSync(abs, 'utf8')
+    if (!MERGE_HEAD.test(text)) continue
+    const sf = ts.createSourceFile(abs, text, ts.ScriptTarget.Latest, true)
+    for (const body of cordisModuleBodies(sf)) out.push({ rel, sf, text, body })
   }
   return out
 }
 
-/** The `ctx.<key> → type name` map declared by a merge's `interface Context`. */
-function contextKeyMap(body: ts.ModuleBlock, sf: ts.SourceFile): Map<string, string> {
+/** Every cordis module-merge body in `sf`: `declare module '@deepseek-ai/cordis'` (harness
+ * packages) or `declare module './context.ts'` (vendor core), in source order.
+ * Module-local: consumers walk blocks through {@link contextMergeFiles}. */
+function cordisModuleBodies(sf: ts.SourceFile): ts.ModuleBlock[] {
+  const bodies: ts.ModuleBlock[] = []
+  for (const stmt of sf.statements) {
+    if (!ts.isModuleDeclaration(stmt) || !ts.isStringLiteral(stmt.name)) continue
+    if (stmt.name.text !== '@deepseek-ai/cordis' && stmt.name.text !== './context.ts') continue
+    if (stmt.body && ts.isModuleBlock(stmt.body)) bodies.push(stmt.body)
+  }
+  return bodies
+}
+
+/** The FIRST cordis module-merge body in `sf`, or null without one — for the
+ * vendor core-API renderer whose input files carry exactly one merge; the
+ * exhaustiveness scan uses {@link cordisModuleBodies} to read them all. */
+export function cordisModuleBody(sf: ts.SourceFile): ts.ModuleBlock | null {
+  return cordisModuleBodies(sf)[0] ?? null
+}
+
+/**
+ * Every `key: Type` property a `declare module '@deepseek-ai/cordis'` Context merge
+ * declares in one module body.
+ * @param body - The cordis module augmentation block.
+ * @param sf - Owning source file (for text extraction).
+ * @returns key → declared type-name text, in declaration order.
+ */
+export function contextKeyMap(body: ts.ModuleBlock, sf: ts.SourceFile): Map<string, string> {
   const keyToType = new Map<string, string>()
   for (const stmt of body.statements) {
     if (!ts.isInterfaceDeclaration(stmt) || stmt.name.text !== 'Context') continue
@@ -47,45 +78,25 @@ function contextKeyMap(body: ts.ModuleBlock, sf: ts.SourceFile): Map<string, str
   return keyToType
 }
 
-/** One `ctx.<key>` service class resolved from a Context merge. */
-export interface ServiceClass {
-  key: string
-  type: string
-  cls: ts.ClassDeclaration
-  abstract: boolean
-  /** Class-level JSDoc prose (empty string when missing — also reported). */
-  doc: string
-}
-
 /**
- * Resolve each `ctx.<key>` of a merge to the service class declared in the
- * same file. A key whose type is not a class here (a Pick-mixin member, e.g.
- * timer helpers) is skipped. A class without JSDoc prose is reported into
- * `violations` (named `where` by the caller's gate).
- *
- * @param body — the cordis module merge body.
- * @param sf — the source file containing the merge.
- * @param rel — repo-relative path of `sf`, for violation pointers.
- * @param violations — sink for JSDoc-completeness violations.
- * @returns the resolved service classes, in Context-declaration order.
+ * Every event name a `declare module '@deepseek-ai/cordis'` Events merge declares in one
+ * module body. Names are the literal member keys (`'agent/created'`), read
+ * from method and property members alike so a declaration form the projector
+ * would reject still enters the exhaustiveness scan.
+ * @param body - The cordis module augmentation block.
+ * @param sf - Owning source file (for computed-name text extraction).
+ * @returns Declared event names, in declaration order.
  */
-export function serviceClasses(
-  body: ts.ModuleBlock,
-  sf: ts.SourceFile,
-  rel: string,
-  violations: string[],
-): ServiceClass[] {
-  const text = sf.getFullText()
-  const out: ServiceClass[] = []
-  for (const [key, type] of contextKeyMap(body, sf)) {
-    const cls = sf.statements.find(
-      (s): s is ts.ClassDeclaration => ts.isClassDeclaration(s) && s.name?.text === type,
-    )
-    if (!cls) continue // a Pick-mixin member, not a class here
-    const abstract = cls.modifiers?.some(m => m.kind === ts.SyntaxKind.AbstractKeyword) ?? false
-    const doc = parseJsDoc(rawJsDoc(text, cls)).doc
-    if (!doc) violations.push(`service ctx.${key} (${pointer(rel, sf, cls)}): class ${type} has no JSDoc.`)
-    out.push({ key, type, cls, abstract, doc })
+export function eventNameList(body: ts.ModuleBlock, sf: ts.SourceFile): string[] {
+  const names: string[] = []
+  for (const stmt of body.statements) {
+    if (!ts.isInterfaceDeclaration(stmt) || stmt.name.text !== 'Events') continue
+    for (const member of stmt.members) {
+      if (!member.name) continue
+      names.push(ts.isStringLiteral(member.name) || ts.isIdentifier(member.name)
+        ? member.name.text
+        : member.name.getText(sf))
+    }
   }
-  return out
+  return names
 }

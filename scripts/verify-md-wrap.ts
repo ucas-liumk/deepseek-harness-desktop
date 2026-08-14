@@ -10,7 +10,7 @@ import { readFileSync } from 'node:fs'
 import { relative, resolve } from 'node:path'
 import type { Nodes } from 'mdast'
 import { parseMarkdown, visitMarkdown } from './markdown.ts'
-import { uniqueRepoFiles } from './repo-files.ts'
+import { isArchivedAgentNotePath, uniqueRepoFiles } from './repo-files.ts'
 
 const root = resolve(import.meta.dirname, '..')
 
@@ -69,7 +69,7 @@ function findViolations(absPath: string): Violation[] {
   return out
 }
 
-const files = uniqueRepoFiles(root, PATTERNS)
+const files = uniqueRepoFiles(root, PATTERNS, isArchivedAgentNotePath)
 const all = files.flatMap(file => findViolations(file.abs))
 const checked = files.length
 

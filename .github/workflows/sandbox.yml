@@ -1,15 +1,15 @@
-# Sandbox CI: the keyless real-kernel confinement proofs. A separate workflow
-# from ci.yml because the axis is different — these jobs fan out over
-# OS×runner (kernel capabilities), not node versions. The Landlock launcher
-# arrives from the registry with `pnpm install` (the npm package family
-# `node-addon-landlock-run`, built and released from its own repository), so
-# these legs exercise the true consumer path — nothing is compiled here.
+# Sandbox CI: the keyless real-kernel confinement proofs. This master-only
+# reference stays outside the pull-request verdict; rationale lives in
+# .agents/notes/implemented/process/2026-07-21-serial-cross-platform-ci-reference.md.
+# A separate workflow from ci.yml because the axis is different — these jobs
+# fan out over OS×runner (kernel capabilities), not node versions. The Landlock
+# launcher is built from native/landlock-run on each Landlock leg and installed
+# from the same tarballs the main-repository release workflow publishes.
 name: Sandbox
 
 on:
   push:
-    branches: [main, master]
-  pull_request:
+    branches: [master]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -18,13 +18,18 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  # CI runs must never report to the production telemetry endpoint baked
+  # into apps/cli/cordis.yml (AppCLIEntry disables the row when set).
+  DSH_TELEMETRY_DISABLED: '1'
+
 jobs:
   # Keyless real-kernel sandbox proofs (sandbox Agent Note § Testing): each ladder
   # rung is only provable on a host where it enforces, so this job fans out
   # an OS×runner matrix — bwrap and Landlock on Linux (separate legs: the
   # Landlock files force the bwrap rung off, so each leg proves exactly one
   # rung; Landlock twice, once per architecture, each confining through the
-  # registry-installed launcher), Seatbelt on macOS (sandbox-exec ships with
+  # locally built launcher), Seatbelt on macOS (sandbox-exec ships with
   # the OS). One node
   # version only: kernel confinement does not vary by node, and ci.yml's
   # node matrix already covers the node axis.
@@ -53,12 +58,11 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      - uses: pnpm/action-setup@v4
+
       - uses: actions/setup-node@v6
         with:
           node-version: 24
-
-      - name: Enable corepack (pnpm)
-        run: corepack enable
 
       - name: Install (immutable)
         run: pnpm install --frozen-lockfile
@@ -74,6 +78,14 @@ jobs:
           sudo apt-get install -yq bubblewrap
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 \
             || echo "apparmor userns knob absent — the functional probe decides"
+
+      - name: Build Landlock launcher for this architecture
+        if: matrix.runner == 'landlock'
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -yq musl-tools
+          pnpm --dir native/landlock-run run build:ts
+          pnpm --dir native/landlock-run run build:native
 
       # The unit suite runs on ubuntu in `checks`; this is the one darwin leg
       # in the workflow, so run it here too — the platform-dependent unit
@@ -93,21 +105,17 @@ jobs:
           set -u +e -o pipefail
           out=$(pnpm exec vitest run --config vitest.e2e.config.ts \
             packages/sandbox/sandbox-local/tests/${{ matrix.runner }}.e2e.ts \
-            packages/bash/bash-sandbox/tests/${{ matrix.runner }}.e2e.ts 2>&1); status=$?
+            packages/shell/bash-sandbox/tests/${{ matrix.runner }}.e2e.ts 2>&1); status=$?
           echo "$out"
           [ "$status" -eq 0 ]
           # Both platform files must have RUN — a self-skip (runner missing on
           # the very platform that exists to prove it) is a failure, not a pass.
           echo "$out" | grep -qE 'Test Files[[:space:]]+2 passed \(2\)'
 
-      # Publish-path rehearsal, Landlock legs only (the pack gates need built
-      # lib/). The e2e packs the workspace closure, installs the tarballs
-      # into a throwaway consumer — npm pulling `node-addon-landlock-run`
-      # and its platform package from the registry, the true consumer path —
-      # and confines through the INSTALLED launcher, asserting it executable
-      # apart (a mode-stripped binary must not masquerade as a non-enforcing
-      # kernel). Same no-silent-skip guard as above.
-      - name: Build packages (lib/ for the pack rehearsal)
+      # Publish-path rehearsal, Landlock legs only. Build the launcher on its
+      # native architecture, then install the local native and harness tarballs
+      # together so registry state cannot mask source/package drift.
+      - name: Build packages for the pack rehearsal
         if: matrix.runner == 'landlock'
         run: pnpm run build
 

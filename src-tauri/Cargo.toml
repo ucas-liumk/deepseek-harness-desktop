@@ -1,0 +1,26 @@
+[package]
+name = "deepseek-harness-desktop"
+version = "0.1.0-rc.8"
+description = "Unofficial lightweight desktop shell for DeepSeek Harness"
+authors = ["ucas-liumk"]
+edition = "2021"
+
+[lib]
+name = "deepseek_harness_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.6.3", features = [] }
+
+[dependencies]
+getrandom = "0.3"
+serde_json = "1"
+tauri = { version = "2.11.5", features = [] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_System_JobObjects",
+  "Win32_System_Threading",
+] }

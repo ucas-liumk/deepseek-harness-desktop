@@ -27,10 +27,16 @@
       "path": "../../core/tools"
     },
     {
+      "path": "../../core/system-prompt"
+    },
+    {
       "path": "../subagent"
     },
     {
-      "path": "../../tasks/tasks"
+      "path": "../../jobs/jobs"
+    },
+    {
+      "path": "../../runtime-diagnostics/invariants"
     }
   ]
 }

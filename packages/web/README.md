@@ -1,16 +1,18 @@
-# web/ - web capability family
+# web/ — web capability family
 
-The web access capability seam: an abstract web interface, search/fetch provider implementations, and the model-facing web tools. All **product** packages.
+English | [中文](README.zh.md)
+
+This family provides provider-neutral web search and fetch operations plus the model-facing tools that consume them.
 
 | Package | Role | ctx key |
 |---|---|---|
-| `web/` | Abstract web seam (search/fetch provider registries + selection + vocabulary + `WebError`) | `ctx.web` |
-| `web-search-exa/` | Exa-backed `WebSearchProvider` | (registers on `ctx.web`) |
-| `web-search-perplexity/` | Perplexity-backed `WebSearchProvider` | (registers on `ctx.web`) |
-| `web-search-deepseek/` | DeepSeek-backed `WebSearchProvider` using native `web_search` through the Anthropic-compatible API | (registers on `ctx.web`) |
-| `web-fetch-local/` | Anonymous public HTTP(S) `WebFetchProvider` | (registers on `ctx.web`) |
-| `tool-web/` | Model-facing `web_search`/`web_fetch` tool schemas | (registers on `ctx.tools`) |
+| [`web/`](web/README.md) | Defines web provider registration, selection, and shared errors | `ctx.web` |
+| [`web-search-exa/`](web-search-exa/README.md) | Provides web search through Exa | registers on `ctx.web` |
+| [`web-search-perplexity/`](web-search-perplexity/README.md) | Provides web search through Perplexity | registers on `ctx.web` |
+| [`web-search-deepseek/`](web-search-deepseek/README.md) | Provides native DeepSeek web search | registers on `ctx.web` |
+| [`web-fetch-http/`](web-fetch-http/README.md) | Fetches public HTTP and HTTPS resources | registers on `ctx.web` |
+| [`tool-web/`](tool-web/README.md) | Exposes web search and fetch to the model | registers on `ctx.tools` |
 
-The interface lives at `web/web/`. Unlike bash/fs, the seam spans **two capabilities** (search and fetch) with potentially multiple providers each: `ctx.web` is one web-access middle layer with one provider-selection policy, one abort/error vocabulary, and one product-facing "how this harness reaches the web" config surface. Providers register **capabilities**, not tools; `tool-web` is the only owner of model-facing names, schemas, prompt guidance, and presentation. A search provider swap does not change how the model asks for a query, and a fetch implementation swap does not change how the model asks for a URL.
+The [web capability decision](../../.agents/notes/implemented/architecture/2026-06-24-web-capability-seam.md) records why search and fetch share one provider-selection service.
 
-See the [web capability seam Agent Note](../../.agents/notes/implemented/architecture/2026-06-24-web-capability-seam.md) for the design rationale, including why search and fetch are deliberately one seam and why `web_fetch`'s SSRF protection is deferred.
+The subsystem reference — search/fetch requests and results, availability, `WebError` — is [docs/subsystems/web.md](../../docs/subsystems/web.md); rationale (including deferred SSRF protection) in the [web capability seam Agent Note](../../.agents/notes/implemented/architecture/2026-06-24-web-capability-seam.md).

@@ -65,4 +65,22 @@ describe('parseCodexConfig', () => {
     const { config } = parseCodexConfig({ PreToolUse: [{ matcher: '^Bash$', hooks: [{ type: 'command', command: 'b.sh' }] }] })
     expect(config.PreToolUse![0]!.matcher).toBe('^Bash$')
   })
+
+  it('rejects an invalid regex matcher with its event name', () => {
+    expect(() => parseCodexConfig({
+      PreToolUse: [{ matcher: '[', hooks: [{ type: 'command', command: 's.sh' }] }],
+    })).toThrow('invalid codex regex matcher "[" on event "PreToolUse"')
+  })
+
+  it('discards matcher fields on events without matcher subjects before validation', () => {
+    const { config } = parseCodexConfig({
+      UserPromptSubmit: [{ matcher: '[', hooks: [{ type: 'command', command: 'prompt.sh' }] }],
+      Stop: [{ matcher: '(', hooks: [{ type: 'command', command: 'stop.sh' }] }],
+    })
+
+    expect(config).toEqual({
+      UserPromptSubmit: [{ hooks: [{ command: 'prompt.sh' }] }],
+      Stop: [{ hooks: [{ command: 'stop.sh' }] }],
+    })
+  })
 })

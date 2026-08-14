@@ -1,10 +1,14 @@
 # context/ — request-context extensions
 
-Product plugins that add model-visible request context without defining a tool or service. `workspace-context` is included by the default `dsh-agent-spine-demo` bundle and can be disabled through bundle config; `time-context` is opt-in.
+English | [中文](README.zh.md)
+
+Product plugins that add model-visible request context without defining a tool. `agent-instructions` is included by the default `dsh-agent-spine-demo` bundle and can be disabled through bundle config; `time-context`, `tmux-context`, and `session-reference` are opt-in.
 
 | Package | Role | ctx key |
 |---|---|---|
-| `time-context/` | Durable per-step current time and elapsed-time context | (none) |
-| `workspace-context/` | `AGENTS.md`/`CLAUDE.md` workspace context loader | (listens on `agent/session-prefix` + `tools/post-execute`) |
+| [`session-reference/`](session-reference/README.md) | Bounded snapshots of other sessions | `ctx.sessionReferenceResolver` |
+| [`time-context/`](time-context/README.md) | Current-time and elapsed-time context | — |
+| [`tmux-context/`](tmux-context/README.md) | tmux location context | — |
+| [`agent-instructions/`](agent-instructions/README.md) | Workspace-instruction context | — |
 
-The [`workspace-context` decision record](../../.agents/notes/implemented/feature/2026-06-24-workspace-context.md) explains its per-agent/session isolation and lifecycle split.
+Session references are documented in [docs/subsystems/session-reference.md](../../docs/subsystems/session-reference.md); the [`agent-instructions` decision record](../../.agents/notes/implemented/feature/2026-06-24-workspace-context.md) owns its per-agent/session isolation and lifecycle split.

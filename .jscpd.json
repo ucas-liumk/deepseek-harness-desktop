@@ -2,8 +2,8 @@
   "minTokens": 60,
   "minLines": 6,
   "mode": "mild",
-  "format": ["typescript"],
-  "pattern": "**/*.ts",
+  "format": ["typescript", "tsx"],
+  "pattern": "**/*.{ts,tsx}",
   "ignore": ["**/tests/**", "**/tsdown.config.ts"],
   "ignorePattern": [
     "(?s)/\\* jscpd:ignore-start \\*/.*?/\\* jscpd:ignore-end \\*/"

@@ -1,5 +1,5 @@
 /**
- * Bridge for unmodified Codex command hooks on harness interception seams. It
+ * Bridge for unmodified Codex command hooks on harness interception points. It
  * supports five points (SessionStart, prompt/tool pre/post, Stop), regex-only
  * matchers, snake_case payloads without a trailing newline, no hook environment
  * or command substitution, and no pre-tool approval or rewrite path; only
@@ -13,10 +13,12 @@
 // point; a cross-package facade for imports alone would add indirection.
 /* jscpd:ignore-start */
 import { readFileSync } from 'node:fs'
-import type { Context } from 'cordis'
-import z from 'schemastery'
-import type { Agent, ContinuationDecision, HookContext, PromptDecision } from '@deepseek-ai/dsh-agent'
+import type { Context } from '@deepseek-ai/cordis'
+import z from '@deepseek-ai/schemastery'
+import type { Agent, PreStepDecision } from '@deepseek-ai/dsh-agent'
+import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { ContentBlock, MessageSource } from '@deepseek-ai/dsh-llm'
+import type { UserMessage } from '@deepseek-ai/dsh-session'
 import type {} from '@deepseek-ai/dsh-session-persistence'
 import type { PostToolDecision, PreToolDecision, ToolExecution, ToolExecutionResult } from '@deepseek-ai/dsh-tools'
 import {
@@ -36,7 +38,7 @@ import { parseCodexConfig, type CodexHookConfig } from './config.ts'
 /* jscpd:ignore-end */
 
 export const name = 'hooks-codex'
-export const inject = ['bash']
+export const inject = ['shell']
 
 /** Plugin config: where the Codex hooks.json lives + the model name for payloads. */
 export interface Config {
@@ -44,7 +46,7 @@ export interface Config {
    * Path to a Codex `hooks.json`. Process-level: read once at load, a relative
    * path resolves against the process launch cwd.
    * TODO(per-session-hook-config): per-session project-local discovery from each
-   * `session/new.cwd` is not yet implemented.
+   * `session/new.cwd`.
    */
   configPath: string
   /** The model name stamped on every payload (Codex includes `model` on each event). */
@@ -102,11 +104,22 @@ export function apply(ctx: Context, config: Config): void {
   const detached = createDetachedRuns()
   ctx.effect(() => () => detached.drain(), 'hooks-codex: drain detached hook runs')
 
+  /**
+   * Run and fold one configured Codex hook point.
+   *
+   * A supplied turn records the hook invocation/result pair inside that open turn.
+   * Detached lifecycle points omit it.
+   */
   async function runPoint(
     point: string,
     matchQuery: string,
     payload: unknown,
-    opts: { agent?: Agent; turn?: number; signal?: AbortSignal; plainStdoutAsContext?: boolean },
+    opts: {
+      agent?: Agent
+      turn?: number
+      readonly signal: AbortSignal
+      plainStdoutAsContext?: boolean
+    },
   ): Promise<MergedHookOutcome> {
     const groups: MatcherGroup[] = parsed[point] ?? []
     const outputs: HookOutput[] = []
@@ -125,11 +138,11 @@ export function apply(ctx: Context, config: Config): void {
             ...group.matcher !== undefined ? { matcher: group.matcher } : {},
           })
         }
-        const { output, durationMs } = await runHook(ctx.bash, hook, {
+        const { output, durationMs } = await runHook(ctx.shell, hook, {
           payload,
           defaultTimeoutMs,
           ...workdir !== undefined ? { cwd: workdir } : {},
-          ...opts.signal ? { signal: opts.signal } : {},
+          signal: opts.signal,
           trailingNewline: false, // Codex writes stdin without a trailing newline.
           // Discard a `hookSpecificOutput` block naming a different event.
           expectedEventName: point,
@@ -143,7 +156,7 @@ export function apply(ctx: Context, config: Config): void {
         }
         outputs.push(output)
         // Execution and decision mapping remain in each bridge so dialect
-        // differences stay explicit at their owning seam.
+        // differences stay explicit at their owning extension point.
         /* jscpd:ignore-start */
         if (output.systemMessage !== undefined) {
           ctx.logger.warn(`hooks-codex: ${point} hook emitted a systemMessage, which is not yet surfaced (ignored)`)
@@ -156,54 +169,62 @@ export function apply(ctx: Context, config: Config): void {
     return mergeHookOutputs(outputs)
   }
 
-  // TODO(hook-continue-false): `merged.stop` is logged but needs a run-level halt seam.
+  // TODO(hook-continue-false): `merged.stop` is logged but needs a run-level halt mechanism.
 
-  function contextFrom(merged: MergedHookOutcome): HookContext | undefined {
+  function contextFrom(merged: MergedHookOutcome): UserMessage | undefined {
     if (merged.additionalContext.length === 0) return undefined
     const content: ContentBlock[] = merged.additionalContext.map(text => ({ type: 'text', text }))
-    return { content, source: PLUGIN_SOURCE }
+    return createUserMessage({ content, source: PLUGIN_SOURCE })
   }
 
-  /** Prepend one context without flattening downstream provenance or metadata. */
-  function prependContext(ours: HookContext, theirs: HookContext[] | undefined): HookContext[] {
+  /** Prepend one context without flattening source fields or other downstream metadata. */
+  function prependContext(ours: UserMessage, theirs: UserMessage[] | undefined): UserMessage[] {
     return [ours, ...theirs ?? []]
   }
 
   // SessionStart injects plain stdout when its detached hook resolves; a slow
   // hook may miss the first request.
   // TODO(session-start-gating): add a startup gate before promising first-turn delivery.
-  ctx.on('agent/session-start', (agent, source) => {
+  ctx.on('agent/session-start', ({ agent, source }) => {
     detached.track(runPoint('SessionStart', source, { ...base(ctx, agent, 'SessionStart', model), source }, { agent, plainStdoutAsContext: true, signal: detached.signal })
       .then((merged) => {
         const context = contextFrom(merged)
-        if (context) agent.inject(context.content, { source: context.source })
+        if (context) agent.inject(context)
       })
       .catch((error: unknown) => { ctx.logger.warn(`hooks-codex: SessionStart hook failed: ${String(error)}`) }))
     /* jscpd:ignore-end */
   })
 
-  // UserPromptSubmit → PromptDecision. Codex supports block, not allow or ask.
-  ctx.on('agent/prompt-submit', async (agent, content, _source, next): Promise<PromptDecision> => {
-    const turn = lastTurn(agent)
-    const merged = await runPoint('UserPromptSubmit', '', { ...turnBase(ctx, agent, 'UserPromptSubmit', model), prompt: blocksToText(content) }, { agent, turn, plainStdoutAsContext: true })
+  // UserPromptSubmit → PreStepDecision. Codex supports reject, not rewrite or ask.
+  ctx.on('agent/pre-step', async ({ agent, messages, turn, signal }, next): Promise<PreStepDecision> => {
+    if (messages.length === 0) return next()
+    const payload = {
+      ...base(ctx, agent, 'UserPromptSubmit', model),
+      turn_id: String(turn),
+      prompt: blocksToText(messages.flatMap(message => message.content)),
+    }
+    const merged = await runPoint('UserPromptSubmit', '', payload, {
+      agent, turn, plainStdoutAsContext: true, signal,
+    })
     /* jscpd:ignore-start */
-    if (merged.decision === 'deny') return { kind: 'block', reason: merged.reason ?? 'blocked by UserPromptSubmit hook' }
-    // Context alone is not a veto: DELEGATE so a later prompt-submit listener can
-    // still block/rewrite, then fold our context onto its decision.
+    if (merged.decision === 'deny') {
+      return { kind: 'reject' }
+    }
+    // Context alone is not a veto: DELEGATE so a later pre-step listener can
+    // still reject/rewrite, then fold our context onto its decision.
     const downstream = await next()
     const ours = contextFrom(merged)
-    if (!ours || downstream.kind !== 'allow') return downstream
+    if (!ours || downstream.kind !== 'enter') return downstream
     return {
-      kind: 'allow',
-      ...downstream.content !== undefined ? { content: downstream.content } : {},
-      additionalContexts: prependContext(ours, downstream.additionalContexts),
+      kind: 'enter',
+      messages: [...downstream.messages, ours],
     }
   })
 
   // PreToolUse → PreToolDecision. Codex blocks only (no allow/ask honored).
   ctx.on('tools/pre-execute', async (exec, next): Promise<PreToolDecision> => {
     const turn = lastTurn(exec.agent)
-    const merged = await runPoint('PreToolUse', exec.name, preToolPayload(ctx, exec, model), { ...exec.agent ? { agent: exec.agent } : {}, turn, ...exec.signal ? { signal: exec.signal } : {} })
+    const merged = await runPoint('PreToolUse', exec.name, preToolPayload(ctx, exec, model), { ...exec.agent ? { agent: exec.agent } : {}, turn, signal: exec.signal })
     /* jscpd:ignore-end */
     if (merged.decision === 'deny') return { kind: 'deny', reason: merged.reason ?? 'blocked by PreToolUse hook' }
     return next()
@@ -213,7 +234,7 @@ export function apply(ctx: Context, config: Config): void {
   ctx.on('tools/post-execute', async (exec, result, next): Promise<PostToolDecision> => {
     const turn = lastTurn(exec.agent)
     /* jscpd:ignore-start */
-    const merged = await runPoint('PostToolUse', exec.name, postToolPayload(ctx, exec, result, model), { ...exec.agent ? { agent: exec.agent } : {}, turn, ...exec.signal ? { signal: exec.signal } : {} })
+    const merged = await runPoint('PostToolUse', exec.name, postToolPayload(ctx, exec, result, model), { ...exec.agent ? { agent: exec.agent } : {}, turn, signal: exec.signal })
     const context = contextFrom(merged)
     if (merged.decision === 'deny') {
       return { kind: 'block', feedback: [{ type: 'text', text: merged.reason ?? 'blocked by PostToolUse hook' }], ...context ? { additionalContexts: [context] } : {} }
@@ -226,27 +247,26 @@ export function apply(ctx: Context, config: Config): void {
       return { ...downstream, additionalContexts: prependContext(context, downstream.additionalContexts) }
     }
     return {
-      kind: 'accept',
-      ...downstream.content !== undefined ? { content: downstream.content } : {},
+      ...downstream,
       additionalContexts: prependContext(context, downstream.additionalContexts),
     }
   })
 
-  // Stop → ContinuationDecision. A blocking Stop hook forces continuation.
+  // A blocking Stop hook steers at the stopping boundary, which makes the
+  // machine observe pending input and run another step.
   // TODO(stop-loop-guard): Codex supplies `stop_hook_active` so a Stop hook can
   // avoid continuing the same turn indefinitely. It is always false here, so an
   // unconditionally blocking hook force-continues every step until it self-limits.
-  ctx.on('agent/turn-continuation', async (agent, turn, _default, next): Promise<ContinuationDecision> => {
-    const merged = await runPoint('Stop', '', { ...turnBase(ctx, agent, 'Stop', model), stop_hook_active: false, last_assistant_message: null }, { agent, turn })
+  ctx.on('agent/turn-stopping', async ({ agent, turn, signal }): Promise<void> => {
+    const merged = await runPoint('Stop', '', { ...turnBase(ctx, agent, 'Stop', model), stop_hook_active: false, last_assistant_message: null }, { agent, turn, signal })
     /* jscpd:ignore-end */
     if (merged.decision === 'deny') {
       // A blocking Stop hook forces continuation; a block with no reason (exit 2,
       // empty stderr) still forces it — fall back to a generic steering line
       // rather than letting the turn stop.
       const text = merged.reason ?? 'continue: blocked by Stop hook'
-      return { action: 'continue', reason: { content: [{ type: 'text', text }], source: PLUGIN_SOURCE } }
+      agent.steer(createUserMessage({ content: [{ type: 'text', text }], source: PLUGIN_SOURCE }))
     }
-    return next()
   })
 }
 
@@ -259,9 +279,7 @@ export function apply(ctx: Context, config: Config): void {
 function lastTurn(agent: Agent | undefined): number {
   if (!agent) return 0
   const last = [...agent.session.events].findLast(e => e.type === 'turn/start')
-  /* v8 ignore next -- the `: 0` arm is a defensive fallback: when an agent is
-     present, lastTurn is only called from the mid-turn seams, which always run
-     inside an open turn, so `last` is always a turn/start here. */
+  /* v8 ignore next -- agent-present turnBase callers are tool/stop extension points inside an open turn. */
   return last?.type === 'turn/start' ? last.data.turn : 0
 }
 

@@ -1,6 +1,14 @@
+import { readFile } from 'node:fs/promises'
 import { afterEach, describe, expect, it } from 'vitest'
-import { Context } from 'cordis'
-import LlmService, { CallId } from '@deepseek-ai/dsh-llm'
+import { Context } from '@deepseek-ai/cordis'
+import { AttachmentId, AttachmentStore } from '@deepseek-ai/dsh-attachment'
+import type {
+  ImageAttachmentLimits,
+  ImageAttachmentRef,
+  SaveImageAttachment,
+  StoredImageAttachment,
+} from '@deepseek-ai/dsh-attachment'
+import LlmRuntime, { createUserMessage, CallId } from '@deepseek-ai/dsh-llm'
 import type { Message, ToolSchema } from '@deepseek-ai/dsh-llm'
 import * as LlmPiAi from '@deepseek-ai/dsh-llm-pi-ai'
 import type { PiAiReplayState } from '../src/replay.ts'
@@ -17,6 +25,10 @@ interface ProviderCase {
 
 const openAIBaseURL = process.env.DSH_PI_AI_OPENAI_BASE_URL
 const azureOpenAIKey = process.env.AZURE_OPENAI_API_KEY
+// Strictly ANTHROPIC_*: the DeepSeek endpoint does not serve the anthropic-messages
+// protocol, so falling back to DEEPSEEK_API_KEY turns the keyless skip into a 404.
+const anthropicApiKey = process.env.ANTHROPIC_API_KEY
+const anthropicBaseURL = process.env.DSH_PI_AI_ANTHROPIC_BASE_URL
 
 const providerCases: ProviderCase[] = [
   {
@@ -32,24 +44,52 @@ const providerCases: ProviderCase[] = [
     provider: 'anthropic',
     api: 'anthropic-messages',
     model: process.env.DSH_PI_AI_ANTHROPIC_MODEL ?? 'claude-opus-4-8',
-    ...process.env.ANTHROPIC_API_KEY ? { apiKey: process.env.ANTHROPIC_API_KEY } : {},
+    ...anthropicApiKey === undefined ? {} : { apiKey: anthropicApiKey },
+    ...anthropicBaseURL === undefined ? {} : { baseURL: anthropicBaseURL },
   },
 ]
 
 const contexts: Context[] = []
 
-async function harness(): Promise<Context> {
+async function harness(image?: StoredImageAttachment): Promise<Context> {
   const ctx = new Context()
   contexts.push(ctx)
-  await ctx.plugin(LlmService)
+  await ctx.plugin(LlmRuntime)
   await ctx.plugin(LlmPiAi, {
-    providers: providerCases.map(profile => ({
-      provider: profile.provider,
+    providers: Object.fromEntries(providerCases.map(profile => [profile.provider, {
       ...profile.apiKey === undefined ? {} : { apiKey: profile.apiKey },
       ...profile.baseURL === undefined ? {} : { baseURL: profile.baseURL },
       ...profile.headers === undefined ? {} : { headers: profile.headers },
-    })),
+    }])),
   })
+  if (image !== undefined) {
+    const fixture = image
+    class E2eAttachmentStore extends AttachmentStore {
+      readonly imageLimits: ImageAttachmentLimits = {
+        maxImageBytes: fixture.data.byteLength,
+        maxImagesPerMessage: 1,
+        maxMessageImageBytes: fixture.data.byteLength,
+        maxImagePixels: fixture.ref.width * fixture.ref.height,
+        mediaTypes: [fixture.ref.mediaType],
+      }
+
+      validateImage(_input: SaveImageAttachment): Promise<void> {
+        return Promise.reject(new Error('e2e attachment fixture is read-only'))
+      }
+
+      saveImage(_input: SaveImageAttachment): Promise<ImageAttachmentRef> {
+        return Promise.reject(new Error('e2e attachment fixture is read-only'))
+      }
+
+      readImage(ref: ImageAttachmentRef): Promise<StoredImageAttachment> {
+        if (ref.attachmentId !== fixture.ref.attachmentId) {
+          return Promise.reject(new Error('unknown e2e attachment fixture'))
+        }
+        return Promise.resolve(fixture)
+      }
+    }
+    await ctx.plugin(E2eAttachmentStore)
+  }
   return ctx
 }
 
@@ -58,7 +98,10 @@ afterEach(async () => {
 })
 
 function ask(text: string): Message[] {
-  return [{ role: 'user', content: [{ type: 'text', text }] }]
+  return [createUserMessage({
+    content: [{ type: 'text', text }],
+    source: { kind: 'plugin', plugin: 'test' },
+  })]
 }
 
 function textOf(result: AssembledResult): string {
@@ -70,13 +113,15 @@ function textOf(result: AssembledResult): string {
 
 function expectFinish(result: AssembledResult, expected: 'stop' | 'tool-calls'): void {
   if (result.finish.kind === 'error') {
-    throw new Error(`provider request failed (${result.finish.code ?? 'unknown'}): ${result.finish.message}`)
+    throw new Error(`provider request failed (${result.finish.failure.code}): ${result.finish.failure.message}`)
   }
   expect(result.finish.kind).toBe(expected)
 }
 
 function expectNativeReplay(result: AssembledResult, profile: ProviderCase): PiAiReplayState {
-  const replayState = result.message.provenance?.replayState
+  const replayState = result.message.source.kind === 'model'
+    ? result.message.source.replayState
+    : undefined
   expect(replayState).toMatchObject({
     kind: 'pi-ai',
     version: 1,
@@ -141,14 +186,14 @@ for (const profile of providerCases) {
           messages: [
             ...prompt,
             first.message,
-            {
-              role: 'user',
+            createUserMessage({
               content: [{
                 type: 'tool-result',
                 toolCallId: CallId(call!.id),
                 content: [{ type: 'text', text: 'The code blue means ocean.' }],
               }],
-            },
+              source: { kind: 'plugin', plugin: 'test' },
+            }),
           ],
           tools: [lookupTool],
           maxTokens: 2048,
@@ -158,6 +203,41 @@ for (const profile of providerCases) {
         expect(textOf(second).toLowerCase()).toContain('ocean')
         expect(expectNativeReplay(second, profile).stopReason).toBe('stop')
       })
+
+      if (profile.provider === 'anthropic') {
+        it('sends a real image through the authenticated Anthropic visual path', async () => {
+          const data = new Uint8Array(await readFile(
+            new URL('../../../../assets/community-wecom-survey.png', import.meta.url),
+          ))
+          const ref: ImageAttachmentRef = {
+            attachmentId: AttachmentId(`sha256:${'a'.repeat(64)}`),
+            mediaType: 'image/png',
+            bytes: data.byteLength,
+            width: 256,
+            height: 256,
+            name: 'qr-code.png',
+          }
+          const ctx = await harness({ ref, data })
+          const result = await assemble(ctx, {
+            provider: profile.provider,
+            model: profile.model,
+            messages: [createUserMessage({
+              content: [
+                {
+                  type: 'text',
+                  text: 'What type of machine-readable symbol is shown in the attached image? Reply with exactly: QR code',
+                },
+                { type: 'image', attachment: ref },
+              ],
+              source: { kind: 'plugin', plugin: 'test' },
+            })],
+            maxTokens: 256,
+          })
+
+          expectFinish(result, 'stop')
+          expect(textOf(result).toLowerCase()).toContain('qr code')
+        })
+      }
     },
   )
 }

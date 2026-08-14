@@ -8,15 +8,18 @@ import { resolve, sep } from 'node:path'
 
 export const agentNoteRoot = resolve(import.meta.dirname, '../.agents/notes')
 
-/** The closed set of Agent Note lifecycles (top-level folders under .agents/notes/). */
-const LIFECYCLES = ['proposed', 'implemented', 'rejected'] as const
+/** The closed set of active Agent Note lifecycles (top-level folders under .agents/notes/). */
+const AGENT_NOTE_LIFECYCLES = ['proposed', 'implemented', 'rejected'] as const
 
 /**
  * The closed set of Agent Note classes (nested folder under each lifecycle). Adding a
  * class is a deliberate act: extend this list AND the README's Classification
  * section. The gate rejects any folder not listed here.
  */
-const CLASSES = ['feature', 'bug-fix', 'simplification', 'architecture', 'process', 'testing'] as const
+export const AGENT_NOTE_CLASSES = ['feature', 'bug-fix', 'simplification', 'architecture', 'process', 'testing'] as const
+
+/** Historical implemented notes live outside the active lifecycle tree. */
+const AGENT_NOTE_ARCHIVE = 'archived'
 
 /** Non-Agent Note Markdown allowed to sit directly at a lifecycle root. */
 const ROOT_ALLOWLIST = new Set(['AGENTS.md', 'CLAUDE.md'])
@@ -45,11 +48,13 @@ export function walkAgentNoteTree(): { notes: AgentNote[]; errors: string[] } {
       errors.push('structure: INDEX.md — centralized Agent Note indexes are forbidden; browse the lifecycle/class tree or search the repository')
       continue
     }
-    if (entry.isDirectory() && !(LIFECYCLES as readonly string[]).includes(entry.name)) {
-      errors.push(`structure: ${entry.name}/ — unknown lifecycle folder (allowed: ${LIFECYCLES.join(', ')})`)
+    if (entry.isDirectory()
+      && entry.name !== AGENT_NOTE_ARCHIVE
+      && !(AGENT_NOTE_LIFECYCLES as readonly string[]).includes(entry.name)) {
+      errors.push(`structure: ${entry.name}/ — unknown lifecycle folder (allowed: ${AGENT_NOTE_LIFECYCLES.join(', ')}, plus ${AGENT_NOTE_ARCHIVE}/)`)
     }
   }
-  for (const lifecycle of LIFECYCLES) {
+  for (const lifecycle of AGENT_NOTE_LIFECYCLES) {
     for (const match of globSync(`${lifecycle}/**/*.md`, { cwd: agentNoteRoot }).map(path => path.split(sep).join('/')).sort()) {
       const segs = match.split('/')
       // Allowlisted file directly at the lifecycle root (e.g. implemented/AGENTS.md).
@@ -63,8 +68,8 @@ export function walkAgentNoteTree(): { notes: AgentNote[]; errors: string[] } {
         errors.push(`structure: ${match} — expected {lifecycle}/{class}/file.md (got depth ${segs.length})`)
         continue
       }
-      if (!(CLASSES as readonly string[]).includes(cls)) {
-        errors.push(`structure: ${match} — unknown class folder "${cls}" (allowed: ${CLASSES.join(', ')})`)
+      if (!(AGENT_NOTE_CLASSES as readonly string[]).includes(cls)) {
+        errors.push(`structure: ${match} — unknown class folder "${cls}" (allowed: ${AGENT_NOTE_CLASSES.join(', ')})`)
         continue
       }
       if (!/^\d{4}-\d{2}-\d{2}-.+\.md$/.test(base)) {

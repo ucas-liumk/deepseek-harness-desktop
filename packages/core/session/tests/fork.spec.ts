@@ -1,8 +1,16 @@
 import { describe, expect, it } from 'vitest'
-import { Context } from 'cordis'
-import { CallId } from '@deepseek-ai/dsh-llm'
+import { Context } from '@deepseek-ai/cordis'
+import { createUserMessage, CallId , createMessage } from '@deepseek-ai/dsh-llm'
 import SessionStore, { Session, SessionForkError, SessionId } from '@deepseek-ai/dsh-session'
 import type { SessionEvent, TurnEndReason } from '@deepseek-ai/dsh-session'
+
+declare module '@deepseek-ai/dsh-session/types' {
+  interface SessionEventMap {
+    'test/log-only': { value: string }
+    /** Stands in for a plugin's open/close bracket (`compaction/start`). */
+    'test/bracket-open': { id: string }
+  }
+}
 
 async function setup(): Promise<{ ctx: Context; sessions: SessionStore }> {
   const ctx = new Context()
@@ -16,20 +24,20 @@ function appendClosedTurn(
   text = `hello ${turn}`,
   reason: TurnEndReason = { kind: 'completed' },
 ): void {
-  session.append('turn/start', { turn, trigger: { kind: 'message', source: { kind: 'user' } } })
-  session.append('user/message', {
+  session.append('turn/start', { turn })
+  session.append('user/message', createUserMessage({
     content: [{ type: 'text', text }],
     source: { kind: 'user' },
-  }, { surfaceOp: 'append' })
+  }), { surfaceOp: 'append' })
   session.append('turn/end', { turn, reason })
 }
 
 function appendOpenTurn(session: Session, turn: number): void {
-  session.append('turn/start', { turn, trigger: { kind: 'message', source: { kind: 'user' } } })
-  session.append('user/message', {
+  session.append('turn/start', { turn })
+  session.append('user/message', createUserMessage({
     content: [{ type: 'text', text: `open ${turn}` }],
     source: { kind: 'user' },
-  }, { surfaceOp: 'append' })
+  }), { surfaceOp: 'append' })
 }
 
 function firstUserMessage(events: readonly SessionEvent[]): SessionEvent<'user/message'> {
@@ -44,6 +52,14 @@ function lastSeq(session: Session): number {
   return event.seq
 }
 
+/** A seeded child's constructor seed: its log minus the end-seed marker. */
+function inherited(session: Session): readonly SessionEvent[] {
+  const events = session.events
+  const last = events.at(-1)
+  if (last?.type !== 'session/end-seed') throw new Error('seeded child is missing its end-seed marker')
+  return events.slice(0, -1)
+}
+
 describe('SessionStore.fork', () => {
   it('forks an empty live session as an empty child with lineage metadata', async () => {
     const { ctx, sessions } = await setup()
@@ -51,7 +67,7 @@ describe('SessionStore.fork', () => {
 
     const child = sessions.fork(source, undefined, SessionId('empty-child'))
 
-    expect(child.events).toEqual([])
+    expect(inherited(child)).toEqual([])
     expect(child.header).toMatchObject({
       id: SessionId('empty-child'),
       cwd: '/workspace',
@@ -67,7 +83,7 @@ describe('SessionStore.fork', () => {
 
     const child = sessions.fork(SessionId('parent'), undefined, SessionId('child'))
 
-    expect(child.events).toEqual(source.events)
+    expect(inherited(child)).toEqual(source.events)
     expect(child.events).not.toBe(source.events)
     expect(child.events[1]).not.toBe(source.events[1])
     expect(() => {
@@ -83,6 +99,21 @@ describe('SessionStore.fork', () => {
     })
   })
 
+  it('includes stable log-only events appended after a closed turn', async () => {
+    const { ctx, sessions } = await setup()
+    const source = ctx.sessions.create(SessionId('log-only-parent'))
+    appendClosedTurn(source, 1, 'hello')
+    source.append('test/log-only', { value: 'after execution' })
+
+    const child = sessions.fork(source, undefined, SessionId('log-only-child'))
+
+    expect(inherited(child)).toEqual(source.events)
+    expect(inherited(child).at(-1)).toMatchObject({
+      type: 'test/log-only',
+      data: { value: 'after execution' },
+    })
+  })
+
   it('forks from an earlier turn boundary even when the source currently has an open tail', async () => {
     const { ctx, sessions } = await setup()
     const source = ctx.sessions.create(SessionId('parent'), { meta: { cwd: '/workspace' } })
@@ -93,31 +124,57 @@ describe('SessionStore.fork', () => {
 
     const child = sessions.fork(source, firstBoundary, SessionId('child-from-first'))
 
-    expect(child.events).toEqual(source.events.slice(0, firstBoundary + 1))
+    expect(inherited(child)).toEqual(source.events.slice(0, firstBoundary + 1))
     expect(child.header.seedLength).toBe(firstBoundary + 1)
-    expect(child.deriveMessages()).toEqual([{ role: 'user', content: [{ type: 'text', text: 'first' }] }])
+    expect(child.deriveMessages()).toEqual([{
+      id: expect.any(String) as unknown,
+      role: 'user',
+      content: [{ type: 'text', text: 'first' }],
+      source: { kind: 'user' },
+    }])
   })
 
   it('accepts every turn/end reason as an explicit fork boundary', async () => {
     const { ctx, sessions } = await setup()
     const reasons: TurnEndReason[] = [
       { kind: 'completed' },
-      { kind: 'aborted', reason: 'cancelled by user' },
-      { kind: 'error', step: 1, message: 'model failed', code: 'MODEL' },
-      { kind: 'disposed' },
+      { kind: 'aborted', reason: { kind: 'user' } },
+      { kind: 'error', error: { message: 'model failed', code: 'UNKNOWN' } },
+      { kind: 'aborted', reason: { kind: 'disposed' } },
       { kind: 'max-tokens' },
       { kind: 'interrupted' },
     ]
 
-    for (const reason of reasons) {
-      const source = ctx.sessions.create(SessionId(`parent-${reason.kind}`))
+    for (const [index, reason] of reasons.entries()) {
+      const source = ctx.sessions.create(SessionId(`parent-${index}`))
       appendClosedTurn(source, 1, reason.kind, reason)
 
-      const child = sessions.fork(source, lastSeq(source), SessionId(`child-${reason.kind}`))
+      const child = sessions.fork(source, lastSeq(source), SessionId(`child-${index}`))
 
-      expect(child.events.at(-1)?.type).toBe('turn/end')
+      expect(inherited(child).at(-1)?.type).toBe('turn/end')
       expect(child.header.seedLength).toBe(source.events.length)
     }
+  })
+
+  it('marks a bracket the child inherited from a still-running parent', async () => {
+    // The constructor placement's central claim, unreachable from the
+    // persistence load path.
+    const { ctx, sessions } = await setup()
+    const parent = ctx.sessions.create(SessionId('bracket-parent'), { meta: { cwd: '/workspace' } })
+    appendClosedTurn(parent, 1, 'work')
+    const open = parent.append('test/bracket-open', { id: 'op-1' })
+
+    const child = sessions.fork(parent, undefined, SessionId('bracket-child'))
+
+    // Parent: no end-seed event follows the bracket, so its owner treats it as live.
+    expect(parent.events.at(-1)).toBe(open)
+    expect(parent.events.some(event => event.type === 'session/end-seed')).toBe(false)
+    // Child: the same bracket is before end-seed, so it belongs to the seed.
+    const boundary = child.events.at(-1)
+    expect(boundary).toMatchObject({ type: 'session/end-seed' })
+    expect(boundary!.seq).toBeGreaterThan(open.seq)
+    expect(child.firstLiveSeq).toBe(open.seq + 1)
+    expect(inherited(child).at(-1)).toMatchObject({ type: 'test/bracket-open', data: { id: 'op-1' } })
   })
 
   it('rejects invalid boundaries before creating a child', async () => {
@@ -160,7 +217,7 @@ describe('SessionStore.fork', () => {
 
   it('rejects a detached Session object that is not live in ctx.sessions', async () => {
     const { sessions } = await setup()
-    const detached = new Session(SessionId('detached'))
+    const detached = Session.create(SessionId('detached'))
 
     expect(() => sessions.fork(detached))
       .toThrow(new SessionForkError('session "detached" not found', 'SESSION_NOT_FOUND'))
@@ -169,7 +226,7 @@ describe('SessionStore.fork', () => {
   it('rejects a stale Session object whose id is live on a different instance', async () => {
     const { ctx, sessions } = await setup()
     ctx.sessions.create(SessionId('same-id'))
-    const stale = new Session(SessionId('same-id'))
+    const stale = Session.create(SessionId('same-id'))
 
     expect(() => sessions.fork(stale))
       .toThrow(new SessionForkError('session "same-id" is not the live store instance', 'SESSION_NOT_LIVE'))
@@ -179,33 +236,52 @@ describe('SessionStore.fork', () => {
     const { ctx, sessions } = await setup()
     const cases: [string, (session: Session) => number][] = [
       ['turn/start', (session) => {
-        session.append('turn/start', { turn: 1, trigger: { kind: 'message', source: { kind: 'user' } } })
+        session.append('turn/start', { turn: 1 })
         return lastSeq(session)
       }],
       ['step/start', (session) => {
-        session.append('turn/start', { turn: 1, trigger: { kind: 'message', source: { kind: 'user' } } })
+        session.append('turn/start', { turn: 1 })
         session.append('step/start', { turn: 1, step: 1 })
         return lastSeq(session)
       }],
       ['user/message', (session) => {
-        session.append('turn/start', { turn: 1, trigger: { kind: 'message', source: { kind: 'user' } } })
-        session.append('user/message', { content: [{ type: 'text', text: 'open' }], source: { kind: 'user' } }, { surfaceOp: 'append' })
+        session.append('turn/start', { turn: 1 })
+        session.append('user/message', createUserMessage({
+          content: [{ type: 'text', text: 'open' }], source: { kind: 'user' },
+        }), { surfaceOp: 'append' })
         return lastSeq(session)
       }],
       ['assistant/message', (session) => {
-        session.append('turn/start', { turn: 1, trigger: { kind: 'message', source: { kind: 'user' } } })
+        session.append('turn/start', { turn: 1 })
         session.append('step/start', { turn: 1, step: 1 })
-        session.append('assistant/message', { provenance: { provider: 'mock', model: 'mock' }, turn: 1, step: 1, content: [{ type: 'text', text: 'partial' }] }, { surfaceOp: 'append' })
+        session.append('assistant/message', {
+          turn: 1, step: 1,
+          message: createMessage({
+            role: 'assistant',
+            content: [{ type: 'text', text: 'partial' }],
+            source: {
+              kind: 'model',
+              ...{ provider: 'mock', model: 'mock' },
+            },
+          }),
+        }, { surfaceOp: 'append' })
         return lastSeq(session)
       }],
       ['tool/call', (session) => {
         const callId = CallId('call-open')
-        session.append('turn/start', { turn: 1, trigger: { kind: 'message', source: { kind: 'user' } } })
+        session.append('turn/start', { turn: 1 })
         session.append('step/start', { turn: 1, step: 1 })
-        session.append('assistant/message', { provenance: { provider: 'mock', model: 'mock' },
+        session.append('assistant/message', {
           turn: 1,
           step: 1,
-          content: [{ type: 'tool-call', id: callId, name: 'bash', arguments: '{}' }],
+          message: createMessage({
+            role: 'assistant',
+            content: [{ type: 'tool-call', id: callId, name: 'bash', arguments: '{}' }],
+            source: {
+              kind: 'model',
+              ...{ provider: 'mock', model: 'mock' },
+            },
+          }),
         }, { surfaceOp: 'append' })
         session.append('tool/call', { turn: 1, step: 1, callId, name: 'bash', arguments: '{}' })
         return lastSeq(session)
@@ -217,7 +293,7 @@ describe('SessionStore.fork', () => {
       const boundary = build(source)
 
       expect(() => sessions.fork(source, boundary))
-        .toThrow(new SessionForkError(`fork boundary ${boundary} in session "open-${lastType}" must be turn/end, got ${lastType}`, 'OPEN_TURN'))
+        .toThrow(new SessionForkError(`fork boundary ${boundary} in session "open-${lastType}" ends inside open turn 1`, 'OPEN_TURN'))
     }
   })
 
@@ -234,7 +310,7 @@ describe('SessionStore.fork', () => {
   it('rejects a duplicate child session id before validating the boundary', async () => {
     const { ctx, sessions } = await setup()
     const source = ctx.sessions.create(SessionId('open-parent'))
-    source.append('turn/start', { turn: 1, trigger: { kind: 'message', source: { kind: 'user' } } })
+    source.append('turn/start', { turn: 1 })
     ctx.sessions.create(SessionId('child'))
 
     expect(() => sessions.fork(source, undefined, SessionId('child')))

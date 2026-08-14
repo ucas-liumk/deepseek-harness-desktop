@@ -2,17 +2,54 @@
  * Serialize harness messages into DeepSeek chat completions. User text is joined; assistant text
  * becomes `content`, tool calls become `tool_calls`, and tool results become separate tool messages.
  * Assistant reasoning is replayed as `reasoning_content` only on tool-call turns, as required by
- * thinking-mode passback. Unknown declaration-merged block types are skipped rather than rejected.
+ * thinking-mode passback. Core image blocks are rejected explicitly because this wire route is text-only;
+ * unknown declaration-merged block types retain the adapter's documented extension fallback.
  * @module dsh-llm-deepseek/serialize
  */
 
+import { contentHasImage, LlmError } from '@deepseek-ai/dsh-llm'
 import type { ContentBlock, GenerateOptions, Message } from '@deepseek-ai/dsh-llm'
 import type { WireMessage, WireRequest, WireTool } from './types.ts'
 
 /** Adapter-level request defaults (from plugin config). */
 export interface RequestDefaults {
   thinking?: 'enabled' | 'disabled' | undefined
-  reasoningEffort?: 'high' | 'max' | undefined
+  reasoningEffort?: 'off' | 'high' | 'max' | undefined
+}
+
+interface ResolvedThinking {
+  thinking?: 'enabled' | 'disabled'
+  reasoningEffort?: 'high' | 'max'
+}
+
+/** Validate the adapter-owned effort before resolving its DeepSeek wire fields. */
+function reasoningEffort(effort: NonNullable<GenerateOptions['reasoningEffort']>): 'off' | 'high' | 'max' {
+  if (effort === 'off' || effort === 'high' || effort === 'max') {
+    return effort as 'off' | 'high' | 'max'
+  }
+  throw new LlmError(
+    `DeepSeek does not support reasoning effort "${effort}"`,
+    'UNSUPPORTED_REASONING_EFFORT',
+  )
+}
+
+/** Resolve one legal thinking/effort pair without exposing `off` as a wire effort. */
+function resolveThinking(options: GenerateOptions, defaults: RequestDefaults): ResolvedThinking {
+  if (options.purpose === 'session-title') return { thinking: 'disabled' }
+  const effort = options.reasoningEffort === undefined
+    ? defaults.reasoningEffort
+    : reasoningEffort(options.reasoningEffort)
+  if (defaults.thinking === 'disabled' && effort !== undefined && effort !== 'off') {
+    throw new LlmError(
+      `DeepSeek deployment does not support reasoning effort "${effort}"`,
+      'UNSUPPORTED_REASONING_EFFORT',
+    )
+  }
+  if (effort === 'off') return { thinking: 'disabled' }
+  if (effort === 'high' || effort === 'max') {
+    return { thinking: 'enabled', reasoningEffort: effort }
+  }
+  return defaults.thinking === undefined ? {} : { thinking: defaults.thinking }
 }
 
 /** Join the text blocks of a message (used for user/tool-result content). */
@@ -21,6 +58,13 @@ function flattenText(blocks: ContentBlock[]): string {
     .filter(block => block.type === 'text')
     .map(block => block.text)
     .join('')
+}
+
+/** Reject core image content before any text-flattening path can silently erase it. */
+function assertTextOnly(blocks: readonly ContentBlock[]): void {
+  if (contentHasImage(blocks)) {
+    throw new LlmError('The DeepSeek chat-completions adapter does not support image content.', 'UNSUPPORTED_CONTENT')
+  }
 }
 
 /** Serialize one assistant message (text + reasoning + tool calls). */
@@ -40,10 +84,15 @@ function serializeAssistant(message: Message): WireMessage {
 
   return {
     role: 'assistant',
-    // Tool-call turns send "" rather than null: the live API answers both,
-    // but the official samples replay message.content verbatim (which is ""
-    // for pure tool-call responses) and some gateways reject null outright.
-    content: text.length > 0 ? text : toolCalls.length > 0 ? '' : null,
+    // Text-less turns send "" — NEVER null. Pure tool-call turns: the
+    // official samples replay message.content verbatim (which is "") and
+    // some gateways reject null outright. Reasoning-ONLY turns (the model
+    // can answer entirely in the reasoning channel, e.g. a v4-flash
+    // greeting): the live API rejects null-content/no-tool_calls assistant
+    // messages with a 400 ("content or tool_calls must be set"), and since
+    // the message sits durably in the session log, a null here bricks every
+    // later turn of that session.
+    content: text,
     // Official passback rule (guides/thinking_mode.mdx): reasoning_content
     // must return on tool-call turns; it is ignored on plain turns, so we
     // drop it there to save tokens.
@@ -63,6 +112,7 @@ function serializeAssistant(message: Message): WireMessage {
 export function serializeMessages(messages: Message[]): WireMessage[] {
   const wire: WireMessage[] = []
   for (const message of messages) {
+    assertTextOnly(message.content)
     if (message.role === 'system') {
       wire.push({ role: 'system', content: flattenText(message.content) })
       continue
@@ -98,7 +148,10 @@ export function serializeMessages(messages: Message[]): WireMessage[] {
  * @param defaults - adapter-level thinking defaults; undefined fields put nothing on the wire.
  * @returns the chat-completions request body.
  */
-export function serializeRequest(options: GenerateOptions, defaults: RequestDefaults = {}): WireRequest {
+export function serializeRequest(
+  options: GenerateOptions,
+  defaults: RequestDefaults = {},
+): WireRequest {
   const messages: WireMessage[] = []
   if (options.system !== undefined) {
     messages.push({ role: 'system', content: options.system })
@@ -113,17 +166,22 @@ export function serializeRequest(options: GenerateOptions, defaults: RequestDefa
       parameters: tool.parameters,
     },
   }))
+  // A short title budget must produce visible text; conversation and
+  // compaction calls continue to inherit the adapter's thinking defaults.
+  const resolvedThinking = resolveThinking(options, defaults)
 
   return {
     model: options.model,
     messages,
     stream: true,
     stream_options: { include_usage: true },
-    ...defaults.thinking !== undefined ? { thinking: { type: defaults.thinking } } : {},
-    ...defaults.reasoningEffort !== undefined ? { reasoning_effort: defaults.reasoningEffort } : {},
+    ...resolvedThinking.thinking !== undefined ? { thinking: { type: resolvedThinking.thinking } } : {},
+    ...resolvedThinking.reasoningEffort !== undefined
+      ? { reasoning_effort: resolvedThinking.reasoningEffort }
+      : {},
     ...tools !== undefined && tools.length > 0 ? { tools } : {},
     ...options.temperature !== undefined ? { temperature: options.temperature } : {},
-    ...options.maxTokens !== undefined ? { max_tokens: options.maxTokens } : {},
+    ...options.maxTokens === undefined ? {} : { max_tokens: options.maxTokens },
     ...options.stop !== undefined ? { stop: options.stop } : {},
   }
 }

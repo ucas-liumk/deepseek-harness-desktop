@@ -1,13 +1,18 @@
 /**
  * Find stale root-relative `packages/...` references in repo-authored prose and
- * TypeScript. A missing path is reported only when it names a real package leaf;
- * globs, placeholders, hypothetical packages, and unbuilt `lib/` output are
- * outside the check.
+ * TypeScript. A missing path is reported only when it names a real package leaf
+ * outside its own explaining group directory; globs, placeholders, hypothetical
+ * packages, and unbuilt `lib/` output are outside the check.
  */
 
-import { existsSync, readdirSync } from 'node:fs'
+import { existsSync, globSync } from 'node:fs'
 import { resolve } from 'node:path'
-import { findReferenceViolations, uniqueRepoFiles, type ReferenceViolation as Violation } from './repo-files.ts'
+import {
+  findReferenceViolations,
+  isArchivedAgentNotePath,
+  uniqueRepoFiles,
+  type ReferenceViolation as Violation,
+} from './repo-files.ts'
 
 const root = resolve(import.meta.dirname, '..')
 
@@ -26,7 +31,7 @@ const PATTERNS = [
 
 /** Paths excluded from the scan: built output and vendored upstream source. */
 const isExcluded = (p: string): boolean =>
-  p.includes('/lib/') || p.endsWith('.d.ts') || p.startsWith('vendor/')
+  isArchivedAgentNotePath(p) || p.includes('/lib/') || p.endsWith('.d.ts') || p.startsWith('vendor/')
 
 /**
  * Directory names of every real package, `packages/<group>/<pkg>`. A broken
@@ -36,12 +41,8 @@ const isExcluded = (p: string): boolean =>
  */
 function realPackageNames(): Set<string> {
   const names = new Set<string>()
-  const pkgRoot = resolve(root, 'packages')
-  for (const group of readdirSync(pkgRoot, { withFileTypes: true })) {
-    if (!group.isDirectory()) continue
-    for (const pkg of readdirSync(resolve(pkgRoot, group.name), { withFileTypes: true })) {
-      if (pkg.isDirectory()) names.add(pkg.name)
-    }
+  for (const pkg of globSync('packages/*/*', { cwd: root, withFileTypes: true })) {
+    if (pkg.isDirectory()) names.add(pkg.name)
   }
   return names
 }
@@ -65,7 +66,15 @@ function isDriftedPackageReference(ref: string): boolean {
   const libAt = parts.indexOf('lib')
   if (libAt === 3 && existsSync(resolve(root, parts.slice(0, 3).join('/')))) return false
   // A missing reference is drift only when a path segment names a live package.
-  return ref.split('/').slice(1).some(segment => packageNames.has(segment))
+  // A leading segment that is itself an existing group directory is explained by
+  // the group, not by a relocated leaf sharing its name (`client` is both the
+  // client-modules group and the sdk leaf), so only later segments count.
+  const segments = ref.split('/').slice(1)
+  const [group] = segments
+  const scanned = group !== undefined && segments.length > 1 && existsSync(resolve(root, 'packages', group))
+    ? segments.slice(1)
+    : segments
+  return scanned.some(segment => packageNames.has(segment))
 }
 
 /** Find missing package references whose path names a live package; bare paths, typos, and illustrative skeletons do not count. */

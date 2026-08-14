@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { BlockAssembler, LlmError } from '@deepseek-ai/dsh-llm'
+import { BlockAssembler, EMPTY_RESPONSE_CODE, LlmError } from '@deepseek-ai/dsh-llm'
 import type { StreamChunk } from '@deepseek-ai/dsh-llm'
 import { DONE } from '../src/sse.ts'
 import { mapFinishReason, mapUsage, translate } from '../src/translate.ts'
@@ -203,7 +203,50 @@ describe('translate: finish and usage handling', () => {
 
   it('handles chunks with no choices at all', async () => {
     const chunks = await collect(translate(feed({}, DONE)))
-    expect(chunks).toEqual([{ type: 'finish', reason: { kind: 'stop' } }])
+    expect(chunks).toEqual([{
+      type: 'finish',
+      reason: {
+        kind: 'error',
+        failure: { message: 'model returned a completed response with no content', code: EMPTY_RESPONSE_CODE },
+      },
+    }])
+  })
+
+  it('classifies an explicit stop with no opened blocks as EMPTY_RESPONSE, after usage', async () => {
+    const chunks = await collect(translate(feed(
+      firstChunk,
+      { choices: [{ delta: {}, finish_reason: 'stop' }], usage: { prompt_tokens: 7, completion_tokens: 0 } },
+      DONE,
+    )))
+    expect(chunks).toEqual([
+      { type: 'usage', usage: { inputTokens: 7, outputTokens: 0 } },
+      {
+        type: 'finish',
+        reason: {
+          kind: 'error',
+          failure: { message: 'model returned a completed response with no content', code: EMPTY_RESPONSE_CODE },
+        },
+      },
+    ])
+  })
+
+  it('keeps a reasoning-only stream a successful stop (any opened block counts)', async () => {
+    const chunks = await collect(translate(feed(
+      firstChunk,
+      { choices: [{ delta: { content: null, reasoning_content: 'mull' } }] },
+      { choices: [{ delta: {}, finish_reason: 'stop' }] },
+      DONE,
+    )))
+    expect(chunks.at(-1)).toEqual({ type: 'finish', reason: { kind: 'stop' } })
+  })
+
+  it('leaves non-stop finishes unclassified even with no opened blocks', async () => {
+    const chunks = await collect(translate(feed(
+      firstChunk,
+      { choices: [{ delta: {}, finish_reason: 'length' }] },
+      DONE,
+    )))
+    expect(chunks.at(-1)).toEqual({ type: 'finish', reason: { kind: 'max-tokens' } })
   })
 })
 
@@ -232,8 +275,7 @@ describe('mapFinishReason', () => {
     (wire) => {
       expect(mapFinishReason(wire)).toEqual({
         kind: 'error',
-        message: `model stopped: ${wire}`,
-        code: wire.toUpperCase(),
+        failure: { message: `model stopped: ${wire}`, code: wire.toUpperCase() },
       })
     },
   )

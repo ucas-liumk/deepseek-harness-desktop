@@ -3,8 +3,9 @@
  * peer in its dependency graph. With auto peer installation disabled, a missing
  * root peer can otherwise fail only when Cordis loads the packaged plugin.
  */
-import { readFile, readdir } from 'node:fs/promises'
-import { join, resolve } from 'node:path'
+import { globSync } from 'node:fs'
+import { readFile } from 'node:fs/promises'
+import { resolve } from 'node:path'
 import { parseArgs } from 'node:util'
 
 interface PackageManifest {
@@ -72,26 +73,15 @@ if (failures.length > 0) {
 console.log(`verify-runtime-closure: ${queue.length} workspace packages form a closed runtime dependency graph.`)
 
 async function loadWorkspacePackages(): Promise<Map<string, WorkspacePackage>> {
-  const paths: string[] = []
-  for (const group of await childDirectories(join(root, 'packages'))) {
-    for (const packageDir of await childDirectories(join(root, 'packages', group))) {
-      paths.push(join(root, 'packages', group, packageDir, 'package.json'))
-    }
-  }
-  for (const packageDir of await childDirectories(join(root, 'vendor'))) {
-    paths.push(join(root, 'vendor', packageDir, 'package.json'))
-  }
+  const paths = globSync(['packages/*/*/package.json', 'vendor/*/package.json'], { cwd: root })
+    .sort()
+    .map(relative => resolve(root, relative))
   const result = new Map<string, WorkspacePackage>()
   for (const path of paths) {
     const manifest = await loadManifest(path)
     if (manifest.name !== undefined) result.set(manifest.name, { path, manifest })
   }
   return result
-}
-
-async function childDirectories(path: string): Promise<string[]> {
-  const entries = await readdir(path, { withFileTypes: true })
-  return entries.filter(entry => entry.isDirectory()).map(entry => entry.name).sort()
 }
 
 async function loadManifest(path: string): Promise<PackageManifest> {

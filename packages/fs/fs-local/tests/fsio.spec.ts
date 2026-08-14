@@ -2,11 +2,11 @@
  * Cordis-free tests for the raw local-filesystem I/O: path resolution, probe,
  * whole-file/streamed text reads, binary/UTF-8 rejection, atomic-write temp
  * safety, literal edit matching, and line-ending handling. Line WINDOWING is
- * policy and lives in `dsh-fs-policy`, so it is not tested here.
+ * policy and lives in `dsh-fs-observation-policy`, so it is not tested here.
  */
 
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import { chmod, mkdtemp, readFile, rm, stat, symlink, unlink, writeFile, mkdir, readdir, realpath } from 'node:fs/promises'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { chmod, mkdtemp, readFile, rename, rm, stat, symlink, unlink, writeFile, mkdir, readdir, realpath } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createServer } from 'node:net'
@@ -16,6 +16,7 @@ import {
   probe,
   probeNoFollow,
   readForEdit,
+  readTextForDiff,
   readWholeText,
   resolveLocalTarget,
   restoreLineEndings,
@@ -23,6 +24,7 @@ import {
   writeFileAtomic,
 } from '../src/fsio.ts'
 import type { LocalTarget } from '../src/fsio.ts'
+import { copyFileDaclWin32, readFileDaclWin32 } from '../src/win32.ts'
 import { FsError, FsTargetKey } from '@deepseek-ai/dsh-fs'
 
 let dir: string
@@ -315,6 +317,261 @@ describe('readWholeText', () => {
   })
 })
 
+describe('readTextForDiff', () => {
+  it('returns normalized text only when the opened file is strictly below the limit', async () => {
+    const file = join(dir, 'basis.txt')
+    await writeFile(file, 'a\r\nb')
+    expect(await readTextForDiff(file, 5)).toBe('a\nb')
+    expect(await readTextForDiff(file, 4)).toBeNull()
+  })
+
+  it('bounds the actual opened file rather than trusting an earlier path size', async () => {
+    const file = join(dir, 'replaced.txt')
+    await writeFile(file, 'tiny')
+    const earlierSize = (await stat(file)).size
+    await writeFile(file, '123456789')
+    expect(earlierSize).toBeLessThan(8)
+    expect(await readTextForDiff(file, 8)).toBeNull()
+  })
+
+  it('returns null when the opened file shrinks after descriptor stat', async () => {
+    const file = join(dir, 'shrinking.txt')
+    await writeFile(file, 'abcdef')
+    vi.resetModules()
+    vi.doMock('node:fs/promises', async (importOriginal) => {
+      const actual = await importOriginal<typeof import('node:fs/promises')>()
+      return {
+        ...actual,
+        async open(...args: Parameters<typeof actual.open>) {
+          const handle = await actual.open(...args)
+          return {
+            close: handle.close.bind(handle),
+            read: handle.read.bind(handle),
+            async stat(...statArgs: Parameters<typeof handle.stat>) {
+              const info = await handle.stat(...statArgs)
+              await writeFile(file, 'abc')
+              return info
+            },
+          }
+        },
+      }
+    })
+
+    try {
+      const { readTextForDiff: isolatedReadTextForDiff } = await import('../src/fsio.ts')
+      expect(await isolatedReadTextForDiff(file, 8)).toBeNull()
+    } finally {
+      vi.doUnmock('node:fs/promises')
+      vi.resetModules()
+    }
+  })
+
+  it('returns null when the opened file grows after descriptor stat', async () => {
+    const file = join(dir, 'growing.txt')
+    await writeFile(file, 'abcdef')
+    vi.resetModules()
+    vi.doMock('node:fs/promises', async (importOriginal) => {
+      const actual = await importOriginal<typeof import('node:fs/promises')>()
+      return {
+        ...actual,
+        async open(...args: Parameters<typeof actual.open>) {
+          const handle = await actual.open(...args)
+          return {
+            close: handle.close.bind(handle),
+            read: handle.read.bind(handle),
+            async stat(...statArgs: Parameters<typeof handle.stat>) {
+              const info = await handle.stat(...statArgs)
+              await writeFile(file, 'abcdef-grown')
+              return info
+            },
+          }
+        },
+      }
+    })
+
+    try {
+      const { readTextForDiff: isolatedReadTextForDiff } = await import('../src/fsio.ts')
+      expect(await isolatedReadTextForDiff(file, 32)).toBeNull()
+    } finally {
+      vi.doUnmock('node:fs/promises')
+      vi.resetModules()
+    }
+  })
+
+  it('returns null when the file vanishes before the basis open (deletion race)', async () => {
+    expect(await readTextForDiff(join(dir, 'deleted-after-preflight.txt'), 32)).toBeNull()
+  })
+
+  it('returns null when the opened descriptor is no longer a regular file', async () => {
+    const file = join(dir, 'swapped.txt')
+    await writeFile(file, 'abcdef')
+    vi.resetModules()
+    vi.doMock('node:fs/promises', async (importOriginal) => {
+      const actual = await importOriginal<typeof import('node:fs/promises')>()
+      return {
+        ...actual,
+        async open(...args: Parameters<typeof actual.open>) {
+          const handle = await actual.open(...args)
+          return {
+            close: handle.close.bind(handle),
+            read: handle.read.bind(handle),
+            async stat(...statArgs: Parameters<typeof handle.stat>) {
+              const info = await handle.stat(...statArgs)
+              return Object.assign(info, { isFile: () => false })
+            },
+          }
+        },
+      }
+    })
+
+    try {
+      const { readTextForDiff: isolatedReadTextForDiff } = await import('../src/fsio.ts')
+      expect(await isolatedReadTextForDiff(file, 32)).toBeNull()
+    } finally {
+      vi.doUnmock('node:fs/promises')
+      vi.resetModules()
+    }
+  })
+
+  it('propagates a non-errno fault instead of masking it as a null basis', async () => {
+    const file = join(dir, 'faulted.txt')
+    await writeFile(file, 'abcdef')
+    vi.resetModules()
+    vi.doMock('node:fs/promises', async (importOriginal) => {
+      const actual = await importOriginal<typeof import('node:fs/promises')>()
+      return {
+        ...actual,
+        async open() {
+          throw new TypeError('forged programming fault')
+        },
+      }
+    })
+
+    try {
+      const { readTextForDiff: isolatedReadTextForDiff } = await import('../src/fsio.ts')
+      await expect(isolatedReadTextForDiff(file, 32)).rejects.toThrow('forged programming fault')
+    } finally {
+      vi.doUnmock('node:fs/promises')
+      vi.resetModules()
+    }
+  })
+
+  it('returns null for binary and invalid UTF-8 without blocking the caller write', async () => {
+    await writeFile(join(dir, 'bin'), Buffer.from([0x68, 0x00, 0x69]))
+    await writeFile(join(dir, 'bad'), Buffer.from([0x68, 0xff, 0x69]))
+    expect(await readTextForDiff(join(dir, 'bin'), 8)).toBeNull()
+    expect(await readTextForDiff(join(dir, 'bad'), 8)).toBeNull()
+  })
+
+  it('honors a pre-aborted signal', async () => {
+    const file = join(dir, 'basis.txt')
+    await writeFile(file, 'text')
+    await expect(readTextForDiff(file, 8, AbortSignal.abort())).rejects.toMatchObject({ code: 'FS_ABORTED' })
+  })
+
+  it.each(['open', 'stat'] as const)('observes cancellation immediately after %s', async (stage) => {
+    const file = join(dir, 'basis.txt')
+    await writeFile(file, 'text')
+    const reached = Promise.withResolvers<undefined>()
+    const release = Promise.withResolvers<undefined>()
+    let statCalls = 0
+    const allocate = vi.spyOn(Buffer, 'allocUnsafe')
+    vi.resetModules()
+    vi.doMock('node:fs/promises', async (importOriginal) => {
+      const actual = await importOriginal<typeof import('node:fs/promises')>()
+      return {
+        ...actual,
+        async open(...args: Parameters<typeof actual.open>) {
+          const handle = await actual.open(...args)
+          if (stage === 'open') {
+            reached.resolve(undefined)
+            await release.promise
+          }
+          return {
+            close: handle.close.bind(handle),
+            read: handle.read.bind(handle),
+            async stat(...statArgs: Parameters<typeof handle.stat>) {
+              statCalls += 1
+              const info = await handle.stat(...statArgs)
+              if (stage === 'stat') {
+                reached.resolve(undefined)
+                await release.promise
+              }
+              return info
+            },
+          }
+        },
+      }
+    })
+
+    try {
+      const { readTextForDiff: isolatedReadTextForDiff } = await import('../src/fsio.ts')
+      const controller = new AbortController()
+      const pending = isolatedReadTextForDiff(file, 8, controller.signal)
+      await reached.promise
+      const allocationCalls = allocate.mock.calls.length
+      controller.abort()
+      release.resolve(undefined)
+      await expect(pending).rejects.toMatchObject({ code: 'FS_ABORTED' })
+      expect(statCalls).toBe(stage === 'open' ? 0 : 1)
+      expect(allocate).toHaveBeenCalledTimes(allocationCalls)
+    } finally {
+      release.resolve(undefined)
+      allocate.mockRestore()
+      vi.doUnmock('node:fs/promises')
+      vi.resetModules()
+    }
+  })
+
+  it('bounds descriptor reads and observes cancellation before the next chunk', async () => {
+    const file = join(dir, 'large-basis.txt')
+    const fileBytes = 200 * 1024
+    await writeFile(file, 'x'.repeat(fileBytes))
+    const firstRead = Promise.withResolvers<undefined>()
+    const releaseFirstRead = Promise.withResolvers<undefined>()
+    const readLengths: number[] = []
+    vi.resetModules()
+    vi.doMock('node:fs/promises', async (importOriginal) => {
+      const actual = await importOriginal<typeof import('node:fs/promises')>()
+      return {
+        ...actual,
+        async open(...args: Parameters<typeof actual.open>) {
+          const handle = await actual.open(...args)
+          return {
+            stat: handle.stat.bind(handle),
+            close: handle.close.bind(handle),
+            async read(buffer: Buffer, offset: number, length: number, position: number | null) {
+              readLengths.push(length)
+              const result = await handle.read(buffer, offset, length, position)
+              if (readLengths.length === 1) {
+                firstRead.resolve(undefined)
+                await releaseFirstRead.promise
+              }
+              return result
+            },
+          }
+        },
+      }
+    })
+
+    try {
+      const { readTextForDiff: isolatedReadTextForDiff } = await import('../src/fsio.ts')
+      const controller = new AbortController()
+      const pending = isolatedReadTextForDiff(file, fileBytes + 1, controller.signal)
+      await firstRead.promise
+      expect(readLengths).toEqual([64 * 1024])
+      controller.abort()
+      releaseFirstRead.resolve(undefined)
+      await expect(pending).rejects.toMatchObject({ code: 'FS_ABORTED' })
+      expect(readLengths).toHaveLength(1)
+    } finally {
+      releaseFirstRead.resolve(undefined)
+      vi.doUnmock('node:fs/promises')
+      vi.resetModules()
+    }
+  })
+})
+
 describe('streamWholeText', () => {
   it('streams the whole file as decoded text', async () => {
     const file = join(dir, 'a.txt')
@@ -367,24 +624,206 @@ describe('streamWholeText', () => {
   })
 })
 
+// Windows drives only the read-only attribute through `chmod` and reports synthetic `stat` mode
+// bits, so mode assertions are POSIX-only; native DACL preservation is asserted separately.
+const posixModes = process.platform !== 'win32'
+
+function daclAcePolicy(descriptor: Buffer): string[] {
+  const daclOffset = descriptor.readUInt32LE(16)
+  if (daclOffset === 0) return []
+  const aceCount = descriptor.readUInt16LE(daclOffset + 4)
+  const policy: string[] = []
+  const seen = new Set<string>()
+  let offset = daclOffset + 8
+  for (let index = 0; index < aceCount; index++) {
+    const size = descriptor.readUInt16LE(offset + 2)
+    const ace = Buffer.from(descriptor.subarray(offset, offset + size))
+    // INHERITED_ACE records which parent ACE produced this entry, not the entry's access policy.
+    ace.writeUInt8(ace.readUInt8(1) & ~0x10, 1)
+    const key = ace.toString('hex')
+    if (!seen.has(key)) {
+      seen.add(key)
+      policy.push(key)
+    }
+    offset += size
+  }
+  return policy
+}
+
 describe('writeFileAtomic — temp-file safety', () => {
   it('writes through a private staging dir and owner-only temp file', async () => {
     const file = join(dir, 'a.txt')
+    await writeFile(file, 'old')
+    if (posixModes) await chmod(file, 0o640)
     let inspected = false
     await writeFileAtomic(file, 'hello', 0o640, undefined, {
       inspectTemp: async ({ stagingDir, tempPath }) => {
         inspected = true
-        expect((await stat(stagingDir)).mode & 0o777).toBe(0o700)
-        expect((await stat(tempPath)).mode & 0o777).toBe(0o600)
+        const [staging, temp] = await Promise.all([stat(stagingDir), stat(tempPath)])
+        expect(staging.isDirectory()).toBe(true)
+        expect(temp.isFile()).toBe(true)
+        if (posixModes) {
+          expect(staging.mode & 0o777).toBe(0o700)
+          expect(temp.mode & 0o777).toBe(0o600)
+        }
       },
     })
     expect(inspected).toBe(true)
     expect(await readFile(file, 'utf8')).toBe('hello')
-    expect((await stat(file)).mode & 0o777).toBe(0o640)
+    if (posixModes) expect((await stat(file)).mode & 0o777).toBe(0o640)
     expect((await readdir(dir)).filter(n => n.includes('.tmp'))).toEqual([])
   })
 
-  it('creates new files owner-only by default', async () => {
+  it.skipIf(process.platform !== 'win32')('protects staged content with the existing target DACL and preserves it after replacement', async () => {
+    const file = join(dir, 'protected.txt')
+    await writeFile(file, 'old')
+    await copyFileDaclWin32(file, file)
+    const expectedDacl = await readFileDaclWin32(file)
+
+    await writeFileAtomic(file, 'new', (await stat(file)).mode, undefined, {
+      inspectTemp: async ({ tempPath }) => {
+        expect(await readFileDaclWin32(tempPath)).toEqual(expectedDacl)
+      },
+    })
+
+    expect(await readFile(file, 'utf8')).toBe('new')
+    expect(daclAcePolicy(await readFileDaclWin32(file))).toEqual(daclAcePolicy(expectedDacl))
+  })
+
+  it('copies a Windows target DACL before content and publishes through secure replacement', async () => {
+    const file = join(dir, 'a.txt')
+    await writeFile(file, 'old')
+    const calls: string[] = []
+
+    await writeFileAtomic(file, 'new', 0o666, undefined, {
+      platform: 'win32',
+      copyFileDacl: async (source, temp) => {
+        calls.push(`copy:${source}`)
+        expect(await readFile(temp, 'utf8')).toBe('')
+      },
+      replaceFile: async (target, temp) => {
+        calls.push(`replace:${target}`)
+        await rename(temp, target)
+      },
+    })
+
+    expect(calls).toEqual([`copy:${file}`, `replace:${file}`])
+    expect(await readFile(file, 'utf8')).toBe('new')
+  })
+
+  it('creates a new Windows file through directory inheritance without replacement calls', async () => {
+    const file = join(dir, 'new.txt')
+    const unexpected = async (): Promise<void> => { throw new Error('unexpected native replacement call') }
+
+    await writeFileAtomic(file, 'new', undefined, undefined, {
+      platform: 'win32',
+      copyFileDacl: unexpected,
+      replaceFile: unexpected,
+    })
+
+    expect(await readFile(file, 'utf8')).toBe('new')
+  })
+
+  it('recreates a vanished Windows target with the already-protected temp', async () => {
+    const file = join(dir, 'a.txt')
+    await writeFile(file, 'old')
+    const missing = Object.assign(new Error('target vanished'), { code: 'ENOENT' })
+
+    await writeFileAtomic(file, 'new', 0o666, undefined, {
+      platform: 'win32',
+      copyFileDacl: () => Promise.resolve(),
+      replaceFile: async () => { throw missing },
+    })
+
+    expect(await readFile(file, 'utf8')).toBe('new')
+  })
+
+  it('surfaces a Windows secure-replacement failure and cleans the staging directory', async () => {
+    const file = join(dir, 'a.txt')
+    await writeFile(file, 'old')
+    const denied = Object.assign(new Error('replace denied'), { code: 'EACCES' })
+
+    await expect(writeFileAtomic(file, 'new', 0o666, undefined, {
+      platform: 'win32',
+      copyFileDacl: () => Promise.resolve(),
+      replaceFile: async () => { throw denied },
+    })).rejects.toBe(denied)
+    expect(await readFile(file, 'utf8')).toBe('old')
+    expect((await readdir(dir)).filter(name => name.includes('.tmp'))).toEqual([])
+  })
+
+  it('maps a non-collision guarded-create publication failure and cleans staging', async () => {
+    const file = join(dir, 'a.txt')
+    const denied = Object.assign(new Error('link denied'), { code: 'EACCES' })
+
+    await expect(writeFileAtomic(file, 'ours', undefined, undefined, {
+      linkFile: async () => { throw denied },
+    }, { displayPath: file })).rejects.toMatchObject({ code: 'FS_IO_ERROR', cause: denied })
+    await expect(stat(file)).rejects.toMatchObject({ code: 'ENOENT' })
+    expect((await readdir(dir)).filter(name => name.includes('.tmp'))).toEqual([])
+  })
+
+  it('maps a guarded-create target-inspection failure and cleans staging', async () => {
+    const file = join(dir, 'a.txt')
+    const linkFailure = Object.assign(new Error('link failed'), { code: 'EIO' })
+    const inspectionFailure = Object.assign(new Error('inspection denied'), { code: 'EACCES' })
+
+    await expect(writeFileAtomic(file, 'ours', undefined, undefined, {
+      linkFile: async () => { throw linkFailure },
+      inspectPublicationTarget: async () => { throw inspectionFailure },
+    }, { displayPath: file })).rejects.toMatchObject({ code: 'FS_IO_ERROR', cause: inspectionFailure })
+    await expect(stat(file)).rejects.toMatchObject({ code: 'ENOENT' })
+    expect((await readdir(dir)).filter(name => name.includes('.tmp'))).toEqual([])
+  })
+
+  it('rejects a guarded-create collision that vanishes before inspection', async () => {
+    const file = join(dir, 'a.txt')
+    const collision = Object.assign(new Error('target existed'), { code: 'EEXIST' })
+
+    await expect(writeFileAtomic(file, 'ours', undefined, undefined, {
+      linkFile: async () => { throw collision },
+    }, { displayPath: file })).rejects.toMatchObject({
+      code: 'FS_NOT_OBSERVED',
+      message: `cannot overwrite existing "${file}" without reading it first`,
+      cause: collision,
+    })
+    await expect(stat(file)).rejects.toMatchObject({ code: 'ENOENT' })
+    expect((await readdir(dir)).filter(name => name.includes('.tmp'))).toEqual([])
+  })
+
+  it('uses the display path and target type when guarded publication finds a competitor', async () => {
+    const file = join(dir, 'a.txt')
+    const displayPath = join(dir, 'linked-workspace', 'a.txt')
+
+    await expect(writeFileAtomic(file, 'ours', undefined, undefined, {
+      inspectTemp: async () => { await writeFile(file, 'competitor') },
+    }, { displayPath })).rejects.toMatchObject({
+      code: 'FS_NOT_OBSERVED',
+      message: `cannot overwrite existing "${displayPath}" without reading it first`,
+    })
+    expect(await readFile(file, 'utf8')).toBe('competitor')
+
+    await rm(file)
+    await expect(writeFileAtomic(file, 'ours', undefined, undefined, {
+      inspectTemp: async () => { await mkdir(file) },
+    }, { displayPath })).rejects.toMatchObject({
+      code: 'FS_NOT_REGULAR_FILE',
+      message: `cannot write "${displayPath}": not a regular file`,
+    })
+    expect((await stat(file)).isDirectory()).toBe(true)
+  })
+
+  it('does not turn post-commit staging cleanup failure into a failed guarded write', async () => {
+    const file = join(dir, 'a.txt')
+    const cleanupFailure = new Error('staging cleanup failed')
+
+    await expect(writeFileAtomic(file, 'ours', undefined, undefined, {
+      removeStagingDir: async () => { throw cleanupFailure },
+    }, { displayPath: file })).resolves.toBeUndefined()
+    expect(await readFile(file, 'utf8')).toBe('ours')
+  })
+
+  it.skipIf(!posixModes)('creates new files owner-only by default', async () => {
     const file = join(dir, 'a.txt')
     await writeFileAtomic(file, 'hello', undefined, undefined)
     expect((await stat(file)).mode & 0o777).toBe(0o600)

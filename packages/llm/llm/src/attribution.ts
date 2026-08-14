@@ -27,7 +27,7 @@ export interface AppIdentity {
   product: string
   /** Product version; sourced from package metadata, never hand-copied. */
   version: string
-  /** Public home URL of the app, used as the `User-Agent` comment. */
+  /** Repository home URL of the app, used as the `User-Agent` comment. */
   url: string
 }
 
@@ -40,9 +40,7 @@ export interface AppIdentity {
 export const APP_IDENTITY: AppIdentity = {
   product: 'deepseek-harness',
   version,
-  // FIXME: create the public deepseek-ai/deepseek-harness-sdk repository this
-  // URL promises before the first release ships attribution pointing at it.
-  url: 'https://github.com/deepseek-ai/deepseek-harness-sdk',
+  url: 'https://github.com/deepseek-ai/deepseek-harness',
 }
 
 /**

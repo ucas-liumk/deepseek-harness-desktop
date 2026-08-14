@@ -1,7 +1,7 @@
 /** One-shot session-lineage and event-relationship tracing helpers. */
 
-import { foldSurface } from '@deepseek-ai/dsh-session'
-import type { SessionEvent, SessionId, SurfaceEventType } from '@deepseek-ai/dsh-session'
+import { foldSurface, isSurfaceEvent, snapshotSessionEvent } from '@deepseek-ai/dsh-session'
+import type { SessionEvent, SessionId, SurfaceEvent, SurfaceEventType } from '@deepseek-ai/dsh-session'
 import { SessionQueryError } from './config.ts'
 import type {
   SessionEventRecord,
@@ -15,6 +15,7 @@ interface EventLogAnalysis {
   records: SessionEventRecord[]
   replacedBy: Map<number, number>
   replacedEventSeqs: Map<number, number[]>
+  currentSeqs: number[]
 }
 
 /**
@@ -31,11 +32,35 @@ export function eventRecords(
 }
 
 /**
+ * Fold and return the current model surface after validating the whole log.
+ * @param sessionId - owner used in query diagnostics.
+ * @param events - detached raw event log from one corpus observation.
+ * @returns detached current surface events in folded order.
+ */
+export function currentSurfaceEvents(
+  sessionId: SessionId,
+  events: readonly SessionEvent[],
+): SurfaceEvent[] {
+  const analysis = analyzeEventLog(sessionId, events)
+  return analysis.currentSeqs.map((seq) => {
+    const event = events[seq]
+    /* v8 ignore next 6 -- analyzeEventLog validated contiguous seqs and foldSurface returned only surface-event seqs. */
+    if (event === undefined || event.seq !== seq || !isSurfaceEvent(event)) {
+      throw new SessionQueryError(
+        `invalid session surface: current node ${seq} is not a surface event`,
+        'SESSION_QUERY_INVALID_SURFACE',
+      )
+    }
+    return snapshotSessionEvent(event)
+  })
+}
+
+/**
  * Trace one target after one canonical surface fold and whole-log validation.
  * @param sessionId - owner of the event log.
  * @param events - detached raw event log.
  * @param seq - target event seq.
- * @returns direct surface and provenance relationships.
+ * @returns direct surface replacements and relationships to cited source events.
  */
 export function traceEvent(
   sessionId: SessionId,
@@ -66,7 +91,7 @@ export function traceEvent(
   }
 
   // The target check above proves the parallel record exists at this index.
-  // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+  // oxlint-disable-next-line typescript/no-non-null-assertion
   const targetRecord = analysis.records[seq]!
   const replacedBy = analysis.replacedBy.get(seq)
   return {
@@ -184,6 +209,7 @@ function analyzeEventLog(
     })),
     replacedBy,
     replacedEventSeqs,
+    currentSeqs: [...folded.nodes],
   }
 }
 
@@ -199,7 +225,7 @@ function buildDescendants(
   const stack = [{ sessionId, descendants }]
   while (stack.length > 0) {
     // The length guard proves a frame exists.
-    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+    // oxlint-disable-next-line typescript/no-non-null-assertion
     const frame = stack.pop()!
     const nodes: SessionLineageNode[] = []
     for (const child of childrenByParent.get(frame.sessionId) ?? []) {
@@ -209,7 +235,7 @@ function buildDescendants(
     }
     for (let index = nodes.length - 1; index >= 0; index -= 1) {
       // The loop bounds prove this indexed node exists.
-      // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
+      // oxlint-disable-next-line typescript/no-non-null-assertion
       const node = nodes[index]!
       stack.push({ sessionId: node.session.header.id, descendants: node.descendants })
     }

@@ -72,10 +72,10 @@ describe('BlockAssembler', () => {
   it('mustGet throws when an index is missing from the partials map (invariant violation)', () => {
     const assembler = new BlockAssembler()
     // Force the invariant violation: manually corrupt the data structures.
-    /* eslint-disable */
+    /* oxlint-disable */
     const hack = assembler as any
     hack.order.push(99)
-    /* eslint-enable */
+    /* oxlint-enable */
     expect(() => assembler.blocks()).toThrow('BlockAssembler invariant violated')
   })
 

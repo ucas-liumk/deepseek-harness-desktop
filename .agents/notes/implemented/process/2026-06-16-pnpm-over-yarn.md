@@ -2,11 +2,13 @@
 
 Status: implemented
 
+English | [中文](2026-06-16-pnpm-over-yarn.zh.md)
+
 ## Problem
 
 The repo shipped on **Yarn 4** with the `node-modules` linker — a deliberately conservative choice that behaves like npm's flat layout while giving us Yarn's workspaces and `yarn constraints`. It worked. But Yarn 4's Plug'n'Play heritage makes the `node-modules` linker the off-the-beaten-path mode, and the broader JS ecosystem — tooling defaults, CI actions, Corepack examples, contributor familiarity — increasingly centers on pnpm. For a repo that is built primarily by agents and read by occasional human contributors, "the package manager most tools and people expect" has real value: fewer surprises, better-trodden failure paths, more copy-pasteable answers.
 
-The switching cost is at its lowest right now. Nothing publishes from this repo yet (every package is `private: true`); dev/test/demo all run **unbuilt** via tsx, so the package manager only has to (a) resolve and link `node_modules`, (b) run the workspace scripts, and (c) enforce the workspace constraints. The one Yarn-specific asset is `yarn.config.cjs` (the `@yarnpkg/types` constraints engine), which is small and mechanical to re-express. This mirrors the reasoning in [the tsdown decision](2026-06-11-tsdown-over-dumble.md): swap a load-bearing tool for the healthier-ecosystem option while the blast radius is still small.
+The switching cost is at its lowest right now. Nothing publishes from this repo yet (every package is `private: true`); development, tests, and source-mode demos run through their declared TypeScript launchers, while artifact checks build explicitly. The package manager therefore only has to (a) resolve and link `node_modules`, (b) run the workspace scripts, and (c) enforce the workspace constraints. The one Yarn-specific asset is `yarn.config.cjs` (the `@yarnpkg/types` constraints engine), which is small and mechanical to re-express. This mirrors the reasoning in [the tsdown decision](../../archived/process/2026-06-11-tsdown-over-dumble.md): swap a load-bearing tool for the healthier-ecosystem option while the blast radius is still small.
 
 ## Decision
 
@@ -38,4 +40,4 @@ Performance (measured at migration time on the dev NFS filesystem; single-digit-
 
 On a fast local disk pnpm's content-addressed store typically wins on cold/warm installs and, especially, on **disk footprint** across multiple checkouts (one global store hardlinked into every `node_modules` vs Yarn copying ~279 MB per worktree — some devs regularly keep ~10 or more worktrees for this repo). That dedup advantage did **not** show in the migration-time numbers above because the test store and `node_modules` sat on different filesystems, defeating hardlinks; on a single-filesystem dev box or CI cache it applies. The honest summary: install speed on our NFS dev filesystem is a wash within noise; the move is justified by ecosystem alignment, phantom-dependency safety, and cross-checkout disk dedup — not by a raw install-time win.
 
-All quality gates (constraints, typecheck, lint, doc-sync, test:coverage at 100%, build, knip, publint, echo-agent demo smoke) pass unchanged on pnpm, which is the correctness proof that the linker swap introduced no phantom-dependency breakage.
+All quality gates (constraints, typecheck, lint, doc-sync, test:coverage at 100%, build, knip, publint, and built application smokes) pass on pnpm, which is the correctness proof that the linker swap introduces no phantom-dependency breakage.

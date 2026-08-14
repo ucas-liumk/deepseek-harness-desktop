@@ -1,0 +1,156 @@
+:root {
+  color: #16181d;
+  background: #f7f8fa;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-synthesis: none;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  min-width: 320px;
+  min-height: 100vh;
+  margin: 0;
+}
+
+.startup {
+  display: grid;
+  min-height: 100vh;
+  place-content: center;
+  justify-items: center;
+  padding: 32px;
+  text-align: center;
+}
+
+.mark {
+  display: grid;
+  width: 56px;
+  height: 56px;
+  margin-bottom: 20px;
+  place-items: center;
+  border-radius: 16px;
+  color: white;
+  background: #17181c;
+  font-size: 15px;
+  font-weight: 750;
+  letter-spacing: 0.08em;
+}
+
+h1 {
+  margin: 0;
+  font-size: 24px;
+  letter-spacing: -0.02em;
+}
+
+.disclaimer {
+  margin: 8px 0 0;
+  color: #626773;
+  font-size: 12px;
+}
+
+#status {
+  min-height: 24px;
+  margin: 18px 0 0;
+  color: #626773;
+  font-size: 14px;
+}
+
+.spinner {
+  width: 20px;
+  height: 20px;
+  margin-top: 24px;
+  border: 2px solid #d6d9df;
+  border-top-color: #30343b;
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+
+.failed .spinner {
+  display: none;
+}
+
+#error-detail {
+  overflow: auto;
+  width: min(620px, calc(100vw - 64px));
+  max-height: 240px;
+  margin: 18px 0 0;
+  padding: 14px;
+  border: 1px solid #e0c9c9;
+  border-radius: 10px;
+  color: #7a2828;
+  background: #fff8f8;
+  font: 12px/1.5 ui-monospace, SFMono-Regular, Consolas, monospace;
+  text-align: left;
+  white-space: pre-wrap;
+}
+
+button {
+  margin-top: 18px;
+  padding: 8px 18px;
+  border: 1px solid #c7cad1;
+  border-radius: 8px;
+  color: inherit;
+  background: transparent;
+  font: inherit;
+  cursor: pointer;
+}
+
+button:hover {
+  background: #eceef2;
+}
+
+button:focus-visible {
+  outline: 2px solid #3c73dd;
+  outline-offset: 2px;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .spinner {
+    animation: none;
+    border-top-color: #d6d9df;
+  }
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    color: #f2f3f5;
+    background: #17181c;
+  }
+
+  .mark {
+    color: #17181c;
+    background: #f2f3f5;
+  }
+
+  #status,
+  .disclaimer {
+    color: #aeb3bd;
+  }
+
+  .spinner {
+    border-color: #3a3d45;
+    border-top-color: #e5e7eb;
+  }
+
+  #error-detail {
+    border-color: #623737;
+    color: #ffcaca;
+    background: #281b1b;
+  }
+
+  button {
+    border-color: #50545e;
+  }
+
+  button:hover {
+    background: #292b31;
+  }
+}

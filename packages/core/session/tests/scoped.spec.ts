@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { Context } from 'cordis'
+import { Context } from '@deepseek-ai/cordis'
 import { createScope, scopeOf } from '@deepseek-ai/dsh-scope'
 import type { Scope, ScopeKey } from '@deepseek-ai/dsh-scope'
 import SessionStore from '@deepseek-ai/dsh-session'
@@ -40,7 +40,7 @@ describe('session dispatch carriers', () => {
     otherScope.ctx.on('session/created', session => void heard.push(`other-created:${session.id}`))
 
     const session = scope.ctx.sessions.create()
-    session.append('turn/start', { turn: 1, trigger: { kind: 'message', source: { kind: 'user' } } })
+    session.append('turn/start', { turn: 1 })
 
     expect(heard).toEqual([
       `owner-created:${session.id}`,
@@ -57,7 +57,7 @@ describe('session dispatch carriers', () => {
     scope.ctx.on('session/event', (_s, event) => void heard.push(`owner:${event.type}`))
 
     const bare = ctx.sessions.create()
-    bare.append('turn/start', { turn: 1, trigger: { kind: 'message', source: { kind: 'user' } } })
+    bare.append('turn/start', { turn: 1 })
     expect(heard).toEqual(['global:turn/start'])
   })
 
@@ -80,6 +80,24 @@ describe('session dispatch carriers', () => {
 })
 
 describe('sessions.flush()', () => {
+  it('allows an ordinary flush with no listeners', async () => {
+    const ctx = await mount()
+    const session = ctx.sessions.create()
+
+    await expect(ctx.sessions.flush(session)).resolves.toBe(false)
+  })
+
+  it('reports a participating listener after it succeeds', async () => {
+    const ctx = await mount()
+    const session = ctx.sessions.create()
+    const flushed: Session[] = []
+    ctx.on('session/flush', current => void flushed.push(current))
+
+    await expect(ctx.sessions.flush(session)).resolves.toBe(true)
+
+    expect(flushed).toEqual([session])
+  })
+
   it('dispatches session/flush with the owning carrier and awaits all listeners', async () => {
     const ctx = await mount()
     const scope = await mintScope(ctx, 'owner')

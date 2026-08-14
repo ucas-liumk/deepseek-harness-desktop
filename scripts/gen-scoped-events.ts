@@ -1,6 +1,6 @@
 /**
- * Generate the dev-invariants scoped-event resolver map from the
- * repository TypeScript Program.
+ * Generate dsh-scope's invariant resolver map from the repository TypeScript
+ * Program.
  *
  * A scoped event declares `this: Scoped<Base>`. Real `scopeTarget(base, key)`
  * calls establish the routing-key type for that base. The generator searches
@@ -20,7 +20,7 @@ import { pointer, rawJsDoc } from './jsdoc.ts'
 import { TypeScriptProject } from './ts-project.ts'
 
 const root = resolve(import.meta.dirname, '..')
-const OUT = 'packages/support/invariants/src/scoped-events.generated.ts'
+const OUT = 'packages/core/scope/src/scoped-events.generated.ts'
 const SCOPE_DOC_MARKER = 'Scope-filtered dispatch'
 
 interface ScopeTargetContract {
@@ -39,7 +39,6 @@ interface SubjectCandidate {
 interface ScopedEventResolver {
   event: string
   candidate: SubjectCandidate | null
-  ownerPackage: string
 }
 
 interface ScopeTag {
@@ -54,7 +53,6 @@ class ScopedEventGenerator {
   private readonly scopeTargetDeclaration: ts.FunctionDeclaration
   private readonly scopedSymbol: ts.Symbol
   private readonly violations: string[] = []
-  private readonly packageNames = new Map<string, string>()
 
   constructor(private readonly project: TypeScriptProject) {
     this.checker = project.checker
@@ -81,44 +79,25 @@ class ScopedEventGenerator {
         + this.violations.map(violation => `  - ${violation}`).join('\n'),
       )
     }
-    const ownerImports = [...new Set(resolvers.map(resolver => resolver.ownerPackage))]
-      .sort()
-      .map(packageName => `import type {} from ${quote(packageName)}`)
     return [
       '/**',
-      ' * Generated scoped-event routing-subject resolvers for dsh-invariants.',
+      ' * Generated scoped-event routing-subject resolvers for dsh-scope invariants.',
       ' * Do not edit by hand; run `pnpm run gen-scoped-events`.',
       ' *',
-      ' * @module @deepseek-ai/dsh-invariants/scoped-events.generated',
+      ' * @module @deepseek-ai/dsh-scope/scoped-events.generated',
       ' */',
-      '',
-      "import type { Events } from 'cordis'",
-      "import type { Scoped } from '@deepseek-ai/dsh-scope'",
-      ...ownerImports,
-      '',
-      'type ScopedEventName = {',
-      '  [K in keyof Events]: ThisParameterType<Events[K]> extends Scoped<object> ? K : never',
-      '}[keyof Events]',
       '',
       'type ScopedSubjectResolver = (args: readonly unknown[]) => unknown',
       '',
-      'function adapt<K extends ScopedEventName>(',
-      '  resolver: (args: Parameters<Events[K]>) => unknown,',
-      '): ScopedSubjectResolver {',
-      '  return args => resolver(args as Parameters<Events[K]>)',
-      '}',
-      '',
-      'const scopedSubjectResolvers = Object.freeze({',
+      'const scopedSubjectResolvers: Readonly<Record<string, ScopedSubjectResolver | null>> = Object.freeze({',
       ...resolvers.map(({ event, candidate }) => {
         if (candidate === null) return `  '${event}': null,`
         const subject = candidate.property === undefined
           ? `args[${candidate.parameter}]`
-          : `args[${candidate.parameter}].${candidate.property}`
-        return `  '${event}': adapt<'${event}'>(args => ${subject}),`
+          : `(args[${candidate.parameter}] as Record<string, unknown>)[${quote(candidate.property)}]`
+        return `  '${event}': args => ${subject},`
       }),
-      '} as const satisfies Readonly<Record<ScopedEventName, ScopedSubjectResolver | null>>)',
-      '',
-      'const scopedSubjectResolverIndex: Readonly<Record<string, ScopedSubjectResolver | null>> = scopedSubjectResolvers',
+      '})',
       '',
       '/**',
       ' * Resolve the routing key named by one scoped event payload. A null',
@@ -129,7 +108,7 @@ class ScopedEventGenerator {
       ' *   or undefined when the event is not scope-filtered.',
       ' */',
       'export function scopedSubjectResolverFor(event: string): ScopedSubjectResolver | null | undefined {',
-      '  return scopedSubjectResolverIndex[event]',
+      '  return scopedSubjectResolvers[event]',
       '}',
       '',
     ].join('\n')
@@ -186,7 +165,6 @@ class ScopedEventGenerator {
     const resolvers: ScopedEventResolver[] = []
     for (const sourceFile of this.packageSources) {
       const rel = this.project.relativePath(sourceFile)
-      const ownerPackage = this.packageName(packageRootFor(rel))
       const visit = (node: ts.Node): void => {
         if (ts.isInterfaceDeclaration(node) && node.name.text === 'Events' && isCordisModuleInterface(node)) {
           for (const member of node.members) {
@@ -232,7 +210,7 @@ class ScopedEventGenerator {
                   + 'add @dshScopeScan unsupported only when the key is intentionally absent from the payload',
                 )
               }
-              resolvers.push({ event, candidate: null, ownerPackage })
+              resolvers.push({ event, candidate: null })
               continue
             }
             if (tag.unsupported) {
@@ -241,7 +219,7 @@ class ScopedEventGenerator {
               )
               continue
             }
-            resolvers.push({ event, candidate: candidates[0] ?? null, ownerPackage })
+            resolvers.push({ event, candidate: candidates[0] ?? null })
           }
         }
         ts.forEachChild(node, visit)
@@ -311,19 +289,6 @@ class ScopedEventGenerator {
     return dedupeCandidates(candidates)
   }
 
-  /** Read and cache one workspace package name. */
-  private packageName(packageRoot: string): string {
-    const cached = this.packageNames.get(packageRoot)
-    if (cached) return cached
-    const manifest: unknown = JSON.parse(readFileSync(resolve(root, packageRoot, 'package.json'), 'utf8'))
-    const name: unknown = typeof manifest === 'object' && manifest !== null
-      ? Reflect.get(manifest, 'name')
-      : undefined
-    if (typeof name !== 'string') throw new Error(`gen-scoped-events: ${packageRoot}/package.json has no name`)
-    this.packageNames.set(packageRoot, name)
-    return name
-  }
-
   /** Compare exact Program type identities after removing null and undefined. */
   private typesEquivalent(left: ts.Type, right: ts.Type): boolean {
     const normalizedLeft = this.normalizedType(left)
@@ -344,14 +309,14 @@ class ScopedEventGenerator {
   }
 }
 
-/** Return whether an Events interface is inside declare module 'cordis'. */
+/** Return whether an Events interface is inside declare module '@deepseek-ai/cordis'. */
 function isCordisModuleInterface(node: ts.InterfaceDeclaration): boolean {
   const block = node.parent
   const declaration = block.parent
   return ts.isModuleBlock(block)
     && ts.isModuleDeclaration(declaration)
     && ts.isStringLiteral(declaration.name)
-    && declaration.name.text === 'cordis'
+    && declaration.name.text === '@deepseek-ai/cordis'
 }
 
 /** Return whether a parameter is the explicit TypeScript this receiver. */
@@ -398,13 +363,6 @@ function dedupeCandidates(candidates: readonly SubjectCandidate[]): SubjectCandi
   })
 }
 
-/** Return the workspace package root owning one package source file. */
-function packageRootFor(relativePath: string): string {
-  const match = /^(packages\/[^/]+\/[^/]+)\/src\//.exec(relativePath)
-  if (!match?.[1]) throw new Error(`gen-scoped-events: cannot derive package root from ${relativePath}`)
-  return match[1]
-}
-
 /** Quote a generated property key as a single-quoted TypeScript string. */
 function quote(value: string): string {
   return `'${value.replaceAll('\\', '\\\\').replaceAll("'", "\\'")}'`
@@ -412,14 +370,14 @@ function quote(value: string): string {
 
 /**
  * Render the generated scoped-event resolver module for one repository root.
- * @param projectRoot - repository root carrying tsconfig.json.
+ * @param projectRoot - repository root carrying tsconfig.host.json.
  * @returns complete generated TypeScript source.
  */
 export function renderScopedEvents(projectRoot: string = root): string {
   return new ScopedEventGenerator(new TypeScriptProject(projectRoot)).render()
 }
 
-/** Generate or freshness-check the fixed invariants source file. */
+/** Generate or freshness-check the fixed dsh-scope source file. */
 function main(): void {
   const content = renderScopedEvents()
   const output = resolve(root, OUT)

@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 /**
  * Bump, stage, and commit a release in one command:
- * `pnpm release:commit <major|minor|patch|x.y.z>`. The tag stays manual —
- * create it from the merged release commit.
+ * `pnpm release:commit <major|minor|patch|x.y.z>`. The namespaced tag stays
+ * manual — create it from the merged release commit.
  */
 
 import path from 'node:path';
@@ -35,8 +35,8 @@ run('git', [
   'add',
   'package.json',
   'packages/*/package.json',
-  'pnpm-lock.yaml',
+  '../../pnpm-lock.yaml',
 ]);
-run('git', ['commit', '-m', `release: ${version}`]);
+run('git', ['commit', '-m', `release(landlock-run): ${version}`]);
 
-console.log(`Committed release ${version}. Create the tag manually: git tag v${version}`);
+console.log(`Committed release ${version}. Create the tag manually: git tag landlock-run-v${version}`);

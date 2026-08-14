@@ -7,7 +7,7 @@
 import { structuredPatch } from 'diff'
 import type { FileDiff } from '@deepseek-ai/dsh-tools'
 
-/** Context lines shown on each side of an applied hunk (matches claude-agent-acp). */
+/** Context lines shown on each side of an applied hunk. */
 export const DIFF_CONTEXT = 3
 
 /**
@@ -15,8 +15,7 @@ export const DIFF_CONTEXT = 3
  * contextual-diff hunks. Attached opaquely (as `unknown`) on the tool result and
  * persisted with the session log — it must be JSON-serializable (the session
  * validates this at `append`), so `presentResult` reproduces the diff card on
- * replay. The producing tool owns this shape; the bridge only sees the opaque
- * `meta` and the tool narrows it back via {@link diffsFromMeta}.
+ * replay. The producing tool owns and narrows this opaque shape.
  */
 export type FsDiffMeta = { diffs: FileDiff[] }
 

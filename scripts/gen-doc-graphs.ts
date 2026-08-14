@@ -8,7 +8,9 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { dirname, relative, resolve } from 'node:path'
 import ts from 'typescript'
-import { collectEvents, collectServices } from './gen-cordis-catalog.ts'
+import { projectCordisCatalog } from '@deepseek-ai/dsh-typert-generator'
+import { CORDIS_CATALOG_POLICY } from './gen-cordis-catalog.ts'
+import type { EventEntry, ServiceEntry } from '@deepseek-ai/dsh-typert-generator'
 import {
   collectPackageGraph,
   escapeMermaidLabel as escLabel,
@@ -46,9 +48,13 @@ interface EventRelation {
   listeners: Set<string>
 }
 
-interface PackageSource {
+/** One scanned package source file and its owning package short name. */
+export interface PackageSource {
+  /** Repository-relative path. */
   rel: string
+  /** Package short name from the `packages/<group>/<pkg>/src` path. */
   pkg: string
+  /** The bound program source file. */
   sourceFile: ts.SourceFile
 }
 
@@ -56,10 +62,16 @@ type EventReceiverKind = 'context' | 'agent-dispatch' | 'events-service'
 
 const GROUP_ORDER = [
   'util',
+  'attachment',
   'llm',
   'core',
+  'typert',
+  'goal',
+  'process',
   'bash',
+  'pty',
   'sandbox',
+  'e2b',
   'fs',
   'skill',
   'compact',
@@ -69,22 +81,37 @@ const GROUP_ORDER = [
   'web',
   'spill',
   'todo',
+  'plan',
   'cordis',
   'hooks',
   'session-persistence',
   'session-query',
+  'session-title',
+  'telemetry',
+  'storage',
+  'workspace',
   'support',
+  'acp',
   'ui',
 ]
 
 const SERVICE_ROLES: ServiceRole[] = [
+  {
+    key: 'attachments',
+    pkg: 'attachment',
+    title: 'Durable binary attachment storage',
+    mode: 'seam',
+    implementations: ['attachment-local'],
+    consumers: ['host-runtime', 'llm-pi-ai'],
+    note: 'The host commits accepted images before session events; provider adapters resolve authorized durable references into provider-native content.',
+  },
   {
     key: 'llm',
     pkg: 'llm',
     title: 'LLM adapter registry',
     mode: 'seam',
     implementations: ['llm-deepseek', 'llm-pi-ai', 'llm-replay'],
-    consumers: ['agent-loop', 'compact-basic'],
+    consumers: ['agent-loop', 'compaction-basic'],
     note: 'Adapters register provider implementations; the loop and compaction call the provider-neutral stream service.',
   },
   {
@@ -92,15 +119,15 @@ const SERVICE_ROLES: ServiceRole[] = [
     pkg: 'token-meter',
     title: 'Replay token measurement',
     mode: 'core',
-    consumers: ['compact-basic'],
+    consumers: ['compaction-basic'],
     note: 'Owns isolated per-session replay folds; pressure consumers share immutable revisioned measurements.',
   },
   {
-    key: 'toolResultPrune',
-    pkg: 'compact-tool-result-prune',
+    key: 'toolResultPruner',
+    pkg: 'compaction-tool-result-pruner',
     title: 'Model-free tool-result pruning',
     mode: 'core',
-    consumers: ['compact-basic'],
+    consumers: ['compaction-basic'],
     note: 'Rewrites oversized current tool results through replayable single-node surface replacements before summary compaction.',
   },
   {
@@ -108,8 +135,31 @@ const SERVICE_ROLES: ServiceRole[] = [
     pkg: 'session',
     title: 'In-memory session store',
     mode: 'core',
-    consumers: ['agent-loop', 'agent', 'cli-demo', 'session-persistence', 'session-query', 'subagent-inprocess', 'invariants'],
+    consumers: ['agent-loop', 'agent', 'session-persistence', 'session-query', 'session-query-sqlite', 'subagent-inprocess', 'invariants', 'message-feedback'],
     note: 'Owns append-only Session instances and emits the durable session event feed.',
+  },
+  {
+    key: 'invariants',
+    pkg: 'invariants',
+    title: 'Package-owned invariant registry',
+    mode: 'core',
+    consumers: ['session', 'agent', 'scope', 'agent-loop'],
+    note: 'Companion subpaths register owner-local checks; the service owns selection, uniqueness, child fibers, and package-attributed failures.',
+  },
+  {
+    key: 'typert',
+    pkg: 'typert-registry',
+    title: 'Runtime type registry',
+    mode: 'core',
+    consumers: ['typert-loader', 'api-gateway'],
+    note: 'Plugins register live zod contributions directly or through dsh-typert-loader; the API gateway consumes invocation descriptors and providers, while other runtime consumers query schemas and reflection metadata at their own edges.',
+  },
+  {
+    key: 'typertGateway',
+    pkg: 'api-gateway',
+    title: 'Typert Host invocation gateway',
+    mode: 'core',
+    note: 'Associates generated Remote descriptors with live Cordis services, resolves registered identities, and exposes unary calls through the shared Connection RPC carrier.',
   },
   {
     key: 'sessionPersistence',
@@ -117,22 +167,98 @@ const SERVICE_ROLES: ServiceRole[] = [
     title: 'Durable session persistence seam',
     mode: 'seam',
     implementations: ['session-persistence-jsonl', 'session-persistence-sqlite'],
-    consumers: ['agent-loop', 'tool-bash', 'hooks-claude', 'hooks-codex', 'acp', 'session-query'],
+    consumers: ['agent-loop', 'tool-bash', 'hooks-claude-code', 'hooks-codex', 'session-query', 'session-query-sqlite', 'message-feedback'],
     note: 'Backends persist the same SessionEvent vocabulary; apps choose a backend at composition time.',
+  },
+  {
+    key: 'settings',
+    pkg: 'settings',
+    title: 'User-settings seam',
+    mode: 'seam',
+    implementations: ['settings-file'],
+    consumers: ['llm-deepseek', 'llm-pi-ai', 'apiproxy'],
+    note: 'Plugins register namespace schemas and resolve layered values; providers store the raw document. The LLM adapters register their entry config as the composition base under the user section; the web gateway serves redacted layered descriptors and writes the user layer.',
+  },
+  {
+    key: 'credentials',
+    pkg: 'credentials',
+    title: 'Credential seam',
+    mode: 'seam',
+    implementations: ['credentials-local'],
+    consumers: ['llm-deepseek', 'llm-pi-ai', 'apiproxy'],
+    note: 'Configuration carries references to secrets; providers own the values. Consumers resolve per operation, so a rotated credential reaches the very next request; the web gateway exposes value-free views and write-only storage.',
+  },
+  {
+    key: 'sessionTelemetry',
+    pkg: 'session-telemetry',
+    title: 'Session telemetry seam',
+    mode: 'seam',
+    implementations: ['session-telemetry-otel'],
+    consumers: [],
+    note: 'The seam captures, redacts, and hands session records to one backend; nothing else consumes the service — its output leaves the process.',
+  },
+  {
+    key: 'storage',
+    pkg: 'storage',
+    title: 'Non-session storage hub',
+    mode: 'seam',
+    implementations: ['storage-json', 'storage-sqlite'],
+    consumers: ['storage-domain'],
+    note: 'Backends register side by side under names; data forms (domain first) mount on the hub and translate typed operations into opaque KV-unit primitives.',
+  },
+  {
+    key: 'storageDomain',
+    pkg: 'storage-domain',
+    title: 'Domain data facility',
+    mode: 'core',
+    consumers: ['workspace', 'message-feedback'],
+    note: 'Waits for every configured backend, then publishes the domain form as one lifecycle-bound service for typed durable state.',
+  },
+  {
+    key: 'messageFeedback',
+    pkg: 'message-feedback',
+    title: 'Lifecycle-bound message feedback',
+    mode: 'core',
+    note: 'Owns local per-assistant-message feedback, lifecycle and target validation, per-item compare-and-set, and the Host unary Remote contract without entering Session history or telemetry.',
+  },
+  {
+    key: 'workspaceRegistry',
+    pkg: 'workspace',
+    title: 'Workspace entity registry',
+    mode: 'core',
+    consumers: ['apiproxy'],
+    note: 'Owns WorkspaceId-branded records over the domain facility; stable sessionIds accounts drive Host RPC and GUI projections.',
   },
   {
     key: 'sessionQuery',
     pkg: 'session-query',
-    title: 'Exact session-history reads and traces',
+    title: 'Session reads, traces, filters, and search',
     mode: 'seam',
-    note: 'Resolves live and optional persisted logs into one logical corpus for exact reads and relationship traces.',
+    implementations: ['session-query-sqlite'],
+    consumers: ['session-reference', 'tool-session-query'],
+    note: 'The interface supplies exact reads, filters, and traces; its concrete backend adds full-text reconciliation, ranking, snippets, and cursor generations, while the model consumer owns workspace authority and cursor-free rendering.',
+  },
+  {
+    key: 'sessionReferenceResolver',
+    pkg: 'session-reference',
+    title: 'Cross-session snapshot preparation',
+    mode: 'core',
+    note: 'Projects bounded current-surface conversation snapshots into durable untrusted message context; host adapters own mention syntax.',
+  },
+  {
+    key: 'sessionTitle',
+    pkg: 'session-title',
+    title: 'Log-backed session titles',
+    mode: 'seam',
+    implementations: ['session-title-first-prompt-llm', 'session-title-all-prompts-llm'],
+    note: 'Owns the deterministic fallback, latest-title fold, and sole optional asynchronous provider registration.',
   },
   {
     key: 'systemPrompt',
     pkg: 'system-prompt',
     title: 'System prompt assembly registry',
     mode: 'core',
-    consumers: ['agent-loop', 'tools', 'tool-fs', 'tool-web'],
+    consumers: ['agent-loop', 'tools', 'tool-fs', 'tool-terminal', 'tool-web'],
     note: 'Collects prompt sections and model-facing tool schemas for each step.',
   },
   {
@@ -140,24 +266,60 @@ const SERVICE_ROLES: ServiceRole[] = [
     pkg: 'tools',
     title: 'Tool registry and guarded execution pipeline',
     mode: 'core',
-    consumers: ['agent-loop', 'tool-ask-user', 'tool-bash', 'tool-cordis', 'tool-fs', 'tool-skill', 'tool-subagent', 'tool-todo', 'tool-web', 'acp'],
+    consumers: ['agent-loop', 'tool-ask-user', 'tool-bash', 'tool-cordis', 'tool-fs', 'tool-terminal', 'tool-skill', 'tool-subagent', 'tool-todo', 'tool-web'],
     note: 'Registers capabilities, owns Code Mode transport, and routes calls through pre-policy, monotonic guards, around dispatch, post-policy, and final-result observation.',
   },
   {
-    key: 'userInteraction',
-    pkg: 'user-interaction',
+    key: 'userQuestions',
+    pkg: 'user-questions',
     title: 'Human question/answer seam',
     mode: 'seam',
-    implementations: ['stdio-demo', 'acp'],
-    consumers: ['tool-ask-user', 'stdio-demo', 'acp'],
-    note: 'UI front doors provide the active human-answer provider; tool-ask-user pauses a tool call on the provider-neutral ask() promise.',
+    consumers: ['tool-ask-user'],
+    note: 'UI front ends provide the active human-answer provider; tool-ask-user pauses a tool call on the provider-neutral ask() promise.',
+  },
+  {
+    key: 'planMode',
+    pkg: 'plan-mode',
+    title: 'Plan collaboration state',
+    mode: 'core',
+    note: 'Folds logged plan/mode state, flushes user selections at turn boundaries, renders deployment-owned guidance, registers /plan, and keeps the plan-exit schema stable across transitions.',
+  },
+  {
+    key: 'agentPresets',
+    pkg: 'agent-presets',
+    title: 'Per-session agent composition',
+    mode: 'core',
+    note: 'Discovers preset directories over trusted and user-authored roots and mounts one preset cordis.yml under an agent scope during creation, rejecting a row that never activates or that publishes into the root service realm.',
+  },
+  {
+    key: 'commands',
+    pkg: 'commands',
+    title: 'Human command registry',
+    mode: 'core',
+    note: 'Plugins register direct human commands without sending invocations to the model.',
+  },
+  {
+    key: 'sessionProjections',
+    pkg: 'session-projection',
+    title: 'Session projection units',
+    mode: 'core',
+    consumers: ['tool-todo', 'session-title', 'host-apiproxy'],
+    note: 'Domains register state-driven fold units; the eager drive keeps per-session watermark states and api-proxy serves baselines and pushes changed values.',
+  },
+  {
+    key: 'sessionProjectionCache',
+    pkg: 'session-projection-cache',
+    title: 'Persisted projection cache',
+    mode: 'core',
+    consumers: ['host-apiproxy'],
+    note: 'Durably checkpoints projection unit states per session (throttled + turn/end/detach mandatory points) and serves the cold-read ladder: cache row + persistence tail replay, so listings never load full logs.',
   },
   {
     key: 'skills',
     pkg: 'skill',
     title: 'Skill provider registry',
     mode: 'seam',
-    implementations: ['skill-local'],
+    implementations: ['skill-badge', 'skill-filesystem'],
     consumers: ['tool-skill'],
     note: 'Merges provider skill catalogs; tool-skill renders the session-prefix catalog and loads complete skill bodies.',
   },
@@ -166,8 +328,16 @@ const SERVICE_ROLES: ServiceRole[] = [
     pkg: 'agent',
     title: 'Agent service',
     mode: 'core',
-    consumers: ['agent-loop', 'acp', 'cli-demo', 'subagent-inprocess', 'stdio-demo', 'invariants'],
+    consumers: ['agent-loop', 'acp', 'subagent-inprocess'],
     note: 'Owns live Agent handles, the create/resume factory seam, and process-local initiator propagation.',
+  },
+  {
+    key: 'agentDefaultModel',
+    pkg: 'agent-default-model',
+    title: 'Default Agent model selection',
+    mode: 'core',
+    consumers: ['headless', 'host-apiproxy'],
+    note: 'Layers the default ModelSelection through settings so direct and Host-backed Agent entry points share one state owner.',
   },
   {
     key: 'agentLoop',
@@ -178,20 +348,54 @@ const SERVICE_ROLES: ServiceRole[] = [
     note: 'The one concrete loop plugin; extension packages depend on dsh-agent events and services, not on this package.',
   },
   {
-    key: 'bash',
-    pkg: 'bash',
-    title: 'Bash executor seam',
-    mode: 'seam',
-    implementations: ['bash-local', 'bash-sandbox'],
-    consumers: ['tool-bash', 'hooks-claude', 'hooks-codex'],
-    note: 'The model-facing bash tools and hook bridges consume this seam; sandboxed or remote executors replace bash-local without touching them.',
+    key: 'goals',
+    pkg: 'goal',
+    title: 'Same-session goal domain',
+    mode: 'core',
+    note: 'Folds revisioned objective state from the session log and keeps live continuation activation process-local.',
   },
   {
-    key: 'bashEnv',
-    pkg: 'tool-bash',
+    key: 'e2b',
+    pkg: 'e2b',
+    title: 'E2B sandbox lifecycle owner',
+    mode: 'core',
+    consumers: ['fs-e2b', 'subprocess-e2b'],
+    note: 'Owns one shared E2B SDK handle, remote working directory, and final sandbox disposition so both fundamental E2B providers inhabit the same Linux runtime.',
+  },
+  {
+    key: 'subprocess',
+    pkg: 'subprocess',
+    title: 'Subprocess seam',
+    mode: 'seam',
+    implementations: ['subprocess-local', 'subprocess-e2b'],
+    consumers: ['bash-local', 'bash-sandbox', 'terminal-bash', 'lsp-stdio', 'subagent-acp', 'subagent-codex', 'subagent-claude-code'],
+    note: 'The bash executors, the PTY shell backend, the LSP host, and the out-of-process ACP, Codex, and Claude Code subagent backends spawn through ctx.subprocess; the service owns process coordinates, tree/session lifetime, stdio dispositions, terminal mechanics, and kill escalation.',
+  },
+  {
+    key: 'shell',
+    pkg: 'shell',
+    title: 'Bash executor seam',
+    mode: 'seam',
+    implementations: ['bash-local', 'bash-sandbox', 'pwsh-local'],
+    consumers: ['tool-bash', 'tool-pwsh', 'hooks-claude-code', 'hooks-codex'],
+    note: 'The model-facing shell tools and hook bridges consume this seam; sandboxed, remote, or PowerShell executors replace bash-local without touching them.',
+  },
+  {
+    key: 'shellEnv',
+    pkg: 'shell-env',
     title: 'Managed bash environment registry',
     mode: 'core',
-    note: 'Plugins declare effect-scoped DSH_* facts; tool-bash collects one trusted snapshot per execution and the executor rebuilds the namespace.',
+    consumers: ['tool-bash', 'tool-pwsh'],
+    note: 'Plugins declare effect-scoped DSH_* facts; each shell tool collects one trusted snapshot per execution and its executor rebuilds the namespace.',
+  },
+  {
+    key: 'terminals',
+    pkg: 'terminal',
+    title: 'Persistent PTY session registry',
+    mode: 'seam',
+    implementations: ['terminal-bash'],
+    consumers: ['tool-terminal'],
+    note: 'The registry owns exact-Agent session identity and cleanup; backends own terminal mechanics, while tool-terminal exposes the owner-scoped model tools.',
   },
   {
     key: 'sandbox',
@@ -199,7 +403,7 @@ const SERVICE_ROLES: ServiceRole[] = [
     title: 'Process-sandbox seam',
     mode: 'seam',
     implementations: ['sandbox-local'],
-    consumers: ['bash-sandbox'],
+    consumers: ['bash-sandbox', 'terminal-bash'],
     note: 'Consumers hand over the exact argv they are about to spawn; same-world backends wrap it under a per-call policy and report enforcement.',
   },
   {
@@ -208,7 +412,7 @@ const SERVICE_ROLES: ServiceRole[] = [
     title: 'Sandbox policy home',
     mode: 'core',
     implementations: [],
-    consumers: ['bash-sandbox', 'fs-sandbox'],
+    consumers: ['bash-sandbox', 'fs-sandbox', 'terminal-bash'],
     note: 'The one home for the deployment default mode + workspace root; only the sandboxed executor and provider read the service (the tool layers use the pure `sandbox/mode` fold it also exports). Both enforcing families read it so bash and fs cannot confine to different roots.',
   },
   {
@@ -221,12 +425,11 @@ const SERVICE_ROLES: ServiceRole[] = [
     note: 'One-shot permission decisions dispatched over the `approval/request` waterfall; answerers are listeners (the ACP bridge for its own agents), absence fails closed to `unavailable`.',
   },
   {
-    key: 'permission',
-    pkg: 'permission',
+    key: 'permissionPresets',
+    pkg: 'permission-presets',
     title: 'Permission presets',
     mode: 'core',
     implementations: [],
-    consumers: ['acp'],
     note: 'User-facing preset table (`workspace-write`/`danger-full-access`) bundling the sandbox-mode and approval-policy knobs; a switch writes one `permission/preset` event through to both knob events.',
   },
   {
@@ -243,43 +446,44 @@ const SERVICE_ROLES: ServiceRole[] = [
     pkg: 'fs',
     title: 'Filesystem provider seam',
     mode: 'seam',
-    implementations: ['fs-local', 'fs-sandbox'],
+    implementations: ['fs-local', 'fs-sandbox', 'fs-e2b'],
     consumers: ['tool-fs'],
-    companions: ['fs-policy'],
-    note: 'tool-fs executes read/write/edit through ctx.fs; fs-sandbox fences mutations by the shared sandbox mode; fs-policy contributes observed-state checks through the fs/* event gate.',
+    companions: ['fs-observation-policy'],
+    note: 'tool-fs executes read/write/edit through ctx.fs; fs-sandbox fences mutations by the shared sandbox mode; fs-observation-policy contributes observed-state checks through the fs/* event gate.',
   },
   {
-    key: 'compact',
-    pkg: 'compact',
+    key: 'compaction',
+    pkg: 'compaction',
     title: 'Compaction seam',
     mode: 'seam',
-    implementations: ['compact-basic'],
-    consumers: ['compact-basic'],
-    note: 'The basic backend consumes post-step pressure and request-error recovery events; a model-facing compact tool remains deferred.',
+    implementations: ['compaction-basic'],
+    consumers: ['compaction-basic'],
+    note: 'The basic backend consumes post-step pressure and request-error recovery events; there is no model-facing compact tool.',
   },
   {
     key: 'subagents',
     pkg: 'subagent',
-    title: 'Subagent provider registry',
+    title: 'Subagent provider and continuation service',
     mode: 'seam',
-    implementations: ['subagent-spawn', 'subagent-fork', 'subagent-acp'],
-    consumers: ['tool-subagent'],
-    note: 'Providers implement transports; tool-subagent exposes one configured provider as a model-facing tool name.',
+    implementations: ['subagent-spawn-in-process', 'subagent-fork-in-process', 'subagent-acp', 'subagent-codex', 'subagent-claude-code', 'subagent-dsh-sdk'],
+    consumers: ['tool-subagent', 'tool-subagent-control', 'tool-ralph'],
+    note: 'Providers implement transports; the service also owns optional Activation-based continuation orchestration, tool-subagent selects one-shot or continuable delegation, tool-subagent-control delivers follow-ups, and tool-ralph requires one fresh structured-output route.',
   },
   {
-    key: 'tasks',
-    pkg: 'tasks',
-    title: 'Background task registry',
-    mode: 'core',
-    consumers: ['tool-bash', 'tool-subagent', 'tool-tasks'],
-    note: 'Producers (tool-bash background commands, tool-subagent background delegations) register running work; tool-tasks is the model-facing control surface that reads, lists, and kills it.',
+    key: 'jobs',
+    pkg: 'jobs',
+    title: 'Background job registry',
+    mode: 'seam',
+    implementations: ['jobs-local'],
+    consumers: ['tool-bash', 'tool-terminal', 'tool-subagent', 'tool-jobs'],
+    note: 'Producers (background bash, PTY sends, and subagent delegations) register running work; tool-jobs is the model-facing controller that reads, lists, and kills it; jobs-local is the process-local registry.',
   },
   {
     key: 'web',
     pkg: 'web',
     title: 'Web access provider registry',
     mode: 'seam',
-    implementations: ['web-search-exa', 'web-search-perplexity', 'web-search-deepseek', 'web-fetch-local'],
+    implementations: ['web-search-exa', 'web-search-perplexity', 'web-search-deepseek', 'web-fetch-http'],
     consumers: ['tool-web'],
     note: 'Search and fetch providers register into one ctx.web seam; tool-web owns the stable model-facing names.',
   },
@@ -293,13 +497,71 @@ const SERVICE_ROLES: ServiceRole[] = [
     note: 'The backend saves oversized tool text and returns a model-facing locator plus retrieval hint; spill-policy is the tools/post-execute consumer that decides when to spill.',
   },
   {
-    key: 'workflows',
+    key: 'directoryPicker',
+    pkg: 'directory-picker',
+    title: 'Workspace-directory picking seam',
+    mode: 'seam',
+    implementations: ['directory-picker-native', 'directory-picker-browse'],
+    consumers: ['apiproxy'],
+    note: 'Discriminated interaction capability: the native backend opens one OS chooser on the host display, the browse backend serves listing/creation primitives for the in-app browser; dual-face backends fill ui-workspace directory-flow slots from their browser halves (no wire advertisement).',
+  },
+  {
+    key: 'webServer',
+    pkg: 'webserver',
+    title: 'HTTP route registration',
+    mode: 'core',
+    consumers: ['connection', 'modules', 'hmr'],
+    note: 'Plain node:http carrier: named-route registry, index transform taps, and the static dist fallback; web-transport plugins register their own routes.',
+  },
+  {
+    key: 'clientModules',
+    pkg: 'modules',
+    title: 'Client plugin graph host',
+    mode: 'core',
+    consumers: ['hmr'],
+    note: 'Composes the __DSH_BOOT__ entry graph from an incremental dsh.client scan, serves plugin bundles, and notifies rebuilt/graph-changed subscribers.',
+  },
+  {
+    key: 'workflowEngine',
     pkg: 'workflow',
     title: 'Workflow script engine',
     mode: 'seam',
-    implementations: ['workflow-workerthread'],
-    consumers: ['tool-workflow'],
-    note: 'One engine per context (bash shape, no named-provider registry); the worker-thread engine fans agent() calls out through ctx.subagents.',
+    implementations: ['workflow-worker-thread'],
+    consumers: ['tool-workflow', 'tool-ralph'],
+    note: 'One engine per context, as in bash, with no named-provider registry; the general workflow and fixed Ralph consumers start runs whose agent() calls fan out through ctx.subagents.',
+  },
+  {
+    key: 'lsp',
+    pkg: 'lsp',
+    title: 'Language-server navigation seam',
+    mode: 'seam',
+    implementations: ['lsp-local'],
+    consumers: ['tool-lsp'],
+    note: 'Provider registration and selection plus normalized query execution over exactly four operations; the seam offers no protocol escape hatch, so a backend translates into the normalized request and result.',
+  },
+  {
+    key: 'apiProxy',
+    pkg: 'apiproxy',
+    title: 'Host API dispatch',
+    mode: 'core',
+    consumers: ['connection'],
+    note: 'The transport-agnostic host gateway face: it dispatches browser API calls, and each open host stream subscribes to the events it forwards rather than being pushed to through a broadcast verb.',
+  },
+  {
+    key: 'dynamicCordisRunner',
+    pkg: 'cordis-host-runner',
+    title: 'Dynamic Cordis package host runner',
+    mode: 'core',
+    consumers: ['tool-cordis'],
+    note: 'Owns the in-memory definition registry, the vm sandbox for host halves, and the request-run round trip; browser pages reach the same service over the wire through its remote namespace.',
+  },
+  {
+    key: 'cordisInspect',
+    pkg: 'cordis-host-runner',
+    title: 'Dynamic Cordis inspect registry',
+    mode: 'core',
+    consumers: ['tool-cordis'],
+    note: 'Registers host inspect providers, mirrors the client provider manifest, and routes client queries through the dynamic Cordis transport.',
   },
 ]
 
@@ -350,8 +612,8 @@ function tableCell(value: string): string {
   return value.replace(/\|/g, '\\|').replace(/\n/g, '<br>')
 }
 
-function assertServiceRolesComplete(): void {
-  const discovered = new Set(collectServices().map(service => service.key))
+function assertServiceRolesComplete(services: readonly ServiceEntry[]): void {
+  const discovered = new Set(services.map(service => service.key))
   const classified = new Set(SERVICE_ROLES.map(role => role.key))
   const missing = [...discovered].filter(key => !classified.has(key)).sort()
   const stale = [...classified].filter(key => !discovered.has(key)).sort()
@@ -363,8 +625,8 @@ function assertServiceRolesComplete(): void {
   }
 }
 
-function renderCapabilitySeams(pkgs: Pkg[]): string {
-  assertServiceRolesComplete()
+function renderCapabilitySeams(pkgs: Pkg[], services: readonly ServiceEntry[]): string {
+  assertServiceRolesComplete(services)
   const pkgsByShort = new Map(pkgs.map(pkg => [pkg.short, pkg]))
   const maintenance = 'hybrid: services are discovered from Cordis declarations; interface/implementation/consumer roles are classified in `scripts/gen-doc-graphs.ts` with a completeness guard'
   const nodes = new Map<string, string>()
@@ -417,7 +679,8 @@ function parseExampleCordis(rel: string): ExamplePlugin[] {
     if (current?.name) plugins.push({ id: current.id, name: current.name })
   }
   for (const line of text.split('\n')) {
-    const id = /^-\s+id:\s+(.+?)\s*$/.exec(line)
+    // Top-level rows (`- id:`) and bundle-patch insert rows (`    - id:`).
+    const id = /^\s*-\s+id:\s+(.+?)\s*$/.exec(line)
     if (id?.[1] !== undefined) {
       flush()
       current = { id: stripYamlScalar(id[1]) }
@@ -436,73 +699,40 @@ function stripYamlScalar(value: string): string {
 
 const APP_EXAMPLES = [
   {
-    id: 'echo',
-    rel: 'examples/echo-agent/composition.md',
-    title: 'Echo Agent App Composition',
-    label: 'examples/echo-agent',
-    config: 'examples/echo-agent/cordis.yml',
-    summary: 'The echo demo swaps in a local mock LLM and teaching echo tool, then loads the stdio app package for the shared spine and terminal front door.',
-  },
-  {
-    id: 'repl',
-    rel: 'examples/repl-agent/composition.md',
-    title: 'REPL Agent App Composition',
-    label: 'examples/repl-agent',
-    config: 'examples/repl-agent/cordis.yml',
-    summary: 'The REPL agent demo adds the real DeepSeek adapter, filesystem tools, todo_write, tool-result pruning, compaction, and both subagent transports on top of the stdio app package.',
-  },
-  {
-    id: 'tui',
-    rel: 'examples/tui-agent/composition.md',
-    title: 'TUI Agent App Composition',
-    label: 'examples/tui-agent',
-    config: 'examples/tui-agent/cordis.yml',
-    summary: 'The TUI agent reuses the repl-agent backend and tool composition while fixing the shared terminal app to the full-screen dsh-tui front door.',
+    id: 'dsh_base',
+    rel: 'apps/cli/composition.md',
+    title: 'DSH Base Composition',
+    label: 'packages/bundle/base/cordis.patch.yml',
+    config: 'packages/bundle/base/cordis.patch.yml',
+    summary: 'The dsh-base bundle patch every profile applies first; mode bundles (dsh-web-app, dsh-headless) and the user\'s profile layer patch over it.',
   },
   {
     id: 'headless',
     rel: 'examples/headless-agent/composition.md',
-    title: 'Headless Agent App Composition',
+    title: 'Headless Agent Snapshot Composition',
     label: 'examples/headless-agent',
     config: 'examples/headless-agent/cordis.yml',
-    summary: 'The headless demo combines the real DeepSeek adapter and coding capabilities with the one-shot app package, format-pure stdout, and one fresh persisted top-level session.',
-  },
-  {
-    id: 'cordis',
-    rel: 'examples/cordis-agent/composition.md',
-    title: 'Cordis Agent App Composition',
-    label: 'examples/cordis-agent',
-    config: 'examples/cordis-agent/cordis.yml',
-    summary: 'The self-referential demo puts @deepseek-ai/dsh-tool-cordis on the coding spine, letting the agent inspect its own runtime and mount/unmount plugins into it.',
+    summary: 'The headless snapshot composition combines the real DeepSeek adapter and coding capabilities with one explicitly configured persisted top-level agent; its JSONL driver is test-only.',
   },
   {
     id: 'acp',
     rel: 'examples/acp-agent/composition.md',
-    title: 'ACP Agent App Composition',
+    title: 'ACP Automation App Composition',
     label: 'examples/acp-agent',
     config: 'examples/acp-agent/cordis.yml',
-    summary: 'The ACP demo exposes the same agent spine over JSON-RPC stdio, with no stdout logger and no pre-created agent; clients create sessions through the ACP bridge.',
+    summary: 'The ACP demo exposes fresh baseline-prompt agent sessions to programmatic clients over JSON-RPC stdio, with no stdout logger, human UI, or pre-created agent.',
   },
 ]
 
 type AppExample = typeof APP_EXAMPLES[number]
 
-function renderAppExpansion(lines: string[], appNode: string, pluginName: string, exampleId: string): void {
+function renderAppExpansion(lines: string[], appNode: string, pluginName: string): void {
   const agentCore = nodeId('bundle', 'agent_core')
   const jsonl = nodeId('bundle', 'jsonl')
   lines.push(`  ${appNode} --> ${agentCore}["@deepseek-ai/dsh-agent-spine-demo"]`)
   lines.push(`  ${appNode} --> ${jsonl}["@deepseek-ai/dsh-session-persistence-jsonl"]`)
-  if (pluginName === '@deepseek-ai/dsh-stdio-demo') {
-    const frontDoor = exampleId === 'tui'
-      ? '@deepseek-ai/dsh-tui<br/>pre-created main agent'
-      : exampleId === 'repl'
-        ? '@deepseek-ai/dsh-stdio<br/>pre-created main agent'
-        : 'dsh-tui (TTY) / dsh-stdio (pipes)<br/>pre-created main agent'
-    lines.push(`  ${appNode} --> ${nodeId('frontdoor', 'stdio')}["${frontDoor}"]`)
-  } else if (pluginName === '@deepseek-ai/dsh-cli-demo') {
-    lines.push(`  ${appNode} --> ${nodeId('frontdoor', 'cli')}["one-shot driver<br/>format-pure stdout<br/>fresh top-level agent"]`)
-  } else if (pluginName === '@deepseek-ai/dsh-acp-demo') {
-    lines.push(`  ${appNode} --> ${nodeId('frontdoor', 'acp')}["@deepseek-ai/dsh-acp<br/>JSON-RPC stdio bridge<br/>sessions created by client"]`)
+  if (pluginName === '@deepseek-ai/dsh-acp-demo') {
+    lines.push(`  ${appNode} --> ${nodeId('entrypoint', 'acp')}["@deepseek-ai/dsh-acp<br/>automation-only JSON-RPC stdio<br/>fresh sessions created by client"]`)
   }
   lines.push(
     `  ${agentCore} --> ${nodeId('spine', 'llm')}["ctx.llm"]`,
@@ -527,8 +757,8 @@ function renderAppComposition(example: AppExample): string {
     const pluginNode = nodeId(`plugin_${example.id}`, plugin.id)
     lines.push(`  ${pluginNode}["${escLabel(plugin.id)}<br/>${escLabel(plugin.name)}"]`)
     lines.push(`  cfg --> ${pluginNode}`)
-    if (plugin.name === '@deepseek-ai/dsh-stdio-demo' || plugin.name === '@deepseek-ai/dsh-cli-demo' || plugin.name === '@deepseek-ai/dsh-acp-demo') {
-      renderAppExpansion(lines, pluginNode, plugin.name, example.id)
+    if (plugin.name === '@deepseek-ai/dsh-acp-demo') {
+      renderAppExpansion(lines, pluginNode, plugin.name)
     }
   }
   lines.push(
@@ -544,13 +774,35 @@ function renderAppComposition(example: AppExample): string {
   return lines.join('\n')
 }
 
-/** Collect event dispatch/listener relations from real cross-file receiver types. */
-class EventRelationCollector {
+type CallSiteIndex = Map<ts.SignatureDeclaration | ts.JSDocSignature, ts.CallExpression[]>
+
+/**
+ * The only method names visitSource classifies; receiver typing runs on these
+ * alone. Obligation: every method name matched by a branch inside visitSource
+ * must appear here — the prefilter drops non-members before any branch runs,
+ * so a branch for an unlisted name is silently dead.
+ */
+const EVENT_API_METHODS = new Set(['on', 'once', 'emit', 'parallel', 'serial', 'waterfall', 'dispatch'])
+
+/**
+ * Collect event dispatch/listener relations from real cross-file receiver types.
+ *
+ * TODO: the program is seeded from the host aggregate alone (ts-project.ts
+ * documents why: one program cannot hold both faces' Context merges), so a
+ * Client package enters only when a host file imports it. Client-face
+ * listeners on client-face events are therefore under-reported —
+   * `connection/reset` omits `ui-skill`/`ui-agent-preset`. Closing it needs a
+   * second Client program whose relations merge into these, not a wider seed.
+ */
+export class EventRelationCollector {
   private readonly relations = new Map<string, EventRelation>()
-  private readonly callSites = new Map<ts.SignatureDeclaration | ts.JSDocSignature, ts.CallExpression[]>()
+  private readonly fileCallSites = new Map<ts.SourceFile, CallSiteIndex>()
+  private readonly localCalleeProofs = new Map<ts.FunctionDeclaration, boolean>()
+  private globalCallSites: CallSiteIndex | null = null
   private readonly contextType: ts.Type
   private readonly agentDispatchType: ts.Type
   private readonly eventsServiceType: ts.Type
+  private readonly packageSourceFiles: ReadonlySet<ts.SourceFile>
 
   constructor(
     private readonly project: TypeScriptProject,
@@ -559,7 +811,7 @@ class EventRelationCollector {
     this.contextType = this.declaredType('vendor/cordis/src/context.ts', 'Context')
     this.agentDispatchType = this.declaredType('packages/core/agent/src/dispatch.ts', 'AgentEventDispatch')
     this.eventsServiceType = this.declaredType('vendor/cordis/src/events.ts', 'EventsService')
-    this.indexCallSites()
+    this.packageSourceFiles = new Set(sources.map(source => source.sourceFile))
   }
 
   /** Return all event relations discovered from the Program. */
@@ -579,47 +831,140 @@ class EventRelationCollector {
     return this.project.checker.getDeclaredTypeOfSymbol(symbol)
   }
 
-  /** Index resolved local function calls for narrow argument-flow recovery. */
-  private indexCallSites(): void {
+  /** Index resolved function calls in the given files for narrow argument-flow recovery. */
+  private buildCallSiteIndex(files: Iterable<ts.SourceFile>): CallSiteIndex {
+    const index: CallSiteIndex = new Map()
     const visit = (node: ts.Node): void => {
       if (ts.isCallExpression(node)) {
         const declaration = this.project.checker.getResolvedSignature(node)?.declaration
         if (declaration) {
-          const calls = this.callSites.get(declaration) ?? []
+          const calls = index.get(declaration) ?? []
           calls.push(node)
-          this.callSites.set(declaration, calls)
+          index.set(declaration, calls)
         }
       }
       ts.forEachChild(node, visit)
     }
-    for (const source of this.sources) visit(source.sourceFile)
+    for (const file of files) visit(file)
+    return index
+  }
+
+  /**
+   * Return every indexed call resolving to one local helper declaration.
+   * Fast path: when every same-file reference to the non-exported helper is
+   * provably a direct callee, module scoping confines all of its calls to that
+   * file, so only that file is indexed. Any other reference form may alias
+   * the function value outward, so the original full package-source index
+   * decides instead.
+   */
+  private callSitesFor(owner: ts.FunctionDeclaration): ts.CallExpression[] {
+    if (!this.globalCallSites && !this.provenLocalCallee(owner)) {
+      this.globalCallSites = this.buildCallSiteIndex(this.packageSourceFiles)
+    }
+    if (this.globalCallSites) return this.globalCallSites.get(owner) ?? []
+    const file = owner.getSourceFile()
+    let index = this.fileCallSites.get(file)
+    if (!index) {
+      index = this.buildCallSiteIndex([file])
+      this.fileCallSites.set(file, index)
+    }
+    return index.get(owner) ?? []
+  }
+
+  /**
+   * Prove every same-file reference to one helper is a direct callee. The
+   * proof owns its premises: an exported helper or a helper in a global
+   * script file (no import/export means program-wide scope, callable from
+   * another file with no same-file reference at all) fails immediately.
+   * Alias escapes (re-export statements, default exports, value reads)
+   * resolve back to the owner symbol at a non-callee position and fail the
+   * proof, as does anything the scan cannot positively classify.
+   */
+  private provenLocalCallee(owner: ts.FunctionDeclaration): boolean {
+    const cached = this.localCalleeProofs.get(owner)
+    if (cached !== undefined) return cached
+    if (hasExportModifier(owner) || !ts.isExternalModule(owner.getSourceFile())) {
+      this.localCalleeProofs.set(owner, false)
+      return false
+    }
+    const name = owner.name
+    const ownerSymbol = name && this.project.checker.getSymbolAtLocation(name)
+    let proven = !!ownerSymbol
+    const refersToOwner = (identifier: ts.Identifier): boolean => {
+      // Shorthand properties resolve to the property symbol; ask for the value side.
+      const local = ts.isShorthandPropertyAssignment(identifier.parent)
+        ? this.project.checker.getShorthandAssignmentValueSymbol(identifier.parent)
+        : this.project.checker.getSymbolAtLocation(identifier)
+      if (!local) return false
+      const symbol = local.flags & ts.SymbolFlags.Alias
+        ? this.project.checker.getAliasedSymbol(local)
+        : local
+      return symbol === ownerSymbol
+    }
+    const visit = (node: ts.Node): void => {
+      if (!proven) return
+      if (ts.isIdentifier(node) && node !== name && node.text === name?.text
+        && !isDirectCallee(node) && refersToOwner(node)) {
+        proven = false
+        return
+      }
+      ts.forEachChild(node, visit)
+    }
+    visit(owner.getSourceFile())
+    this.localCalleeProofs.set(owner, proven)
+    return proven
   }
 
   /** Walk one package source file and classify event API calls by receiver type. */
   private visitSource(source: PackageSource): void {
     const visit = (node: ts.Node): void => {
-      if (ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression)) {
-        const receiverKind = this.receiverKind(node.expression.expression)
-        const method = node.expression.name.text
-        if (receiverKind === 'events-service' && method === 'dispatch') {
-          const argumentList = node.arguments[1]
-          if (argumentList) {
-            for (const event of this.eventNamesFromArgumentList(argumentList, new Set())) {
-              this.addDispatcher(event, source.pkg, 'events.dispatch')
+      if (ts.isCallExpression(node)) {
+        if (this.isAgentEventEmitter(node.expression)) {
+          const event = node.arguments[2]
+          if (event) {
+            for (const name of this.finiteStringValues(event) ?? []) {
+              this.addDispatcher(name, source.pkg, 'emitAgentEvent')
             }
           }
-        } else if (receiverKind === 'context' || receiverKind === 'agent-dispatch') {
-          const eventNames = this.eventNamesFromCall(node, receiverKind)
-          if (method === 'on' || method === 'once') {
-            for (const event of eventNames) this.ensure(event).listeners.add(source.pkg)
-          } else if (method === 'emit' || method === 'parallel' || method === 'serial' || method === 'waterfall') {
-            for (const event of eventNames) this.addDispatcher(event, source.pkg, method)
+        } else if (ts.isPropertyAccessExpression(node.expression) && EVENT_API_METHODS.has(node.expression.name.text)) {
+          const receiverKind = this.receiverKind(node.expression.expression)
+          const method = node.expression.name.text
+          if (receiverKind === 'events-service' && method === 'dispatch') {
+            const argumentList = node.arguments[1]
+            if (argumentList) {
+              for (const event of this.eventNamesFromArgumentList(argumentList, new Set())) {
+                this.addDispatcher(event, source.pkg, 'events.dispatch')
+              }
+            }
+          } else if (receiverKind === 'context' || receiverKind === 'agent-dispatch') {
+            const eventNames = this.eventNamesFromCall(node, receiverKind)
+            if (method === 'on' || method === 'once') {
+              for (const event of eventNames) this.ensure(event).listeners.add(source.pkg)
+            } else if (method === 'emit' || method === 'parallel' || method === 'serial' || method === 'waterfall') {
+              for (const event of eventNames) this.addDispatcher(event, source.pkg, method)
+            }
           }
         }
       }
       ts.forEachChild(node, visit)
     }
     visit(source.sourceFile)
+  }
+
+  /** Match the exported contained-notification helper by declaration identity. */
+  private isAgentEventEmitter(expression: ts.Expression): boolean {
+    if (!ts.isIdentifier(expression)) return false
+    const local = this.project.checker.getSymbolAtLocation(expression)
+    if (!local) return false
+    const symbol = local.flags & ts.SymbolFlags.Alias
+      ? this.project.checker.getAliasedSymbol(local)
+      : local
+    const declarations = symbol.declarations ?? []
+    return declarations.some((declaration) => {
+      return ts.isFunctionDeclaration(declaration)
+        && declaration.name?.text === 'emitAgentEvent'
+        && this.project.relativePath(declaration.getSourceFile()) === 'packages/core/agent/src/dispatch.ts'
+    })
   }
 
   /** Classify a receiver using assignability to the repository's actual event API types. */
@@ -684,7 +1029,7 @@ class EventRelationCollector {
     const index = owner.parameters.indexOf(parameter)
     if (index < 0) return new Set()
     const events = new Set<string>()
-    for (const call of this.callSites.get(owner) ?? []) {
+    for (const call of this.callSitesFor(owner)) {
       const argument = call.arguments[index]
       if (argument) addAll(events, this.eventNamesFromArgumentList(argument, new Set(seen)))
     }
@@ -729,6 +1074,21 @@ class EventRelationCollector {
     methods.add(method)
     relation.dispatchers.set(pkg, methods)
   }
+}
+
+/** Return whether an identifier is the callee of a call, seen through value-preserving wrappers. */
+function isDirectCallee(identifier: ts.Identifier): boolean {
+  let current: ts.Node = identifier
+  while (
+    ts.isParenthesizedExpression(current.parent)
+    || ts.isAsExpression(current.parent)
+    || ts.isTypeAssertionExpression(current.parent)
+    || ts.isNonNullExpression(current.parent)
+    || ts.isSatisfiesExpression(current.parent)
+  ) {
+    current = current.parent
+  }
+  return ts.isCallExpression(current.parent) && current.parent.expression === current
 }
 
 /** Peel syntax-only wrappers that do not change an expression's runtime value. */
@@ -786,14 +1146,22 @@ function unionSets<T>(left: ReadonlySet<T>, right: ReadonlySet<T>): Set<T> {
   return out
 }
 
-function collectEventRelations(): Map<string, EventRelation> {
-  const project = new TypeScriptProject(root)
-  const sources = project.sourceFiles().flatMap((sourceFile): PackageSource[] => {
+/**
+ * Select the package source files of one project in deterministic order.
+ * @param project - the loaded repository TypeScript project.
+ * @returns `packages/<group>/<pkg>/src` files tagged with their package name.
+ */
+export function collectPackageSources(project: TypeScriptProject): PackageSource[] {
+  return project.sourceFiles().flatMap((sourceFile): PackageSource[] => {
     const rel = project.relativePath(sourceFile)
     const match = /^packages\/[^/]+\/([^/]+)\/src\/.+\.ts$/.exec(rel)
     return match?.[1] ? [{ rel, pkg: match[1], sourceFile }] : []
   }).sort((left, right) => left.rel.localeCompare(right.rel))
-  return new EventRelationCollector(project, sources).collect()
+}
+
+function collectEventRelations(): Map<string, EventRelation> {
+  const project = new TypeScriptProject(root)
+  return new EventRelationCollector(project, collectPackageSources(project)).collect()
 }
 
 function relationPackages(map: Map<string, Set<string>>, pkgsByShort: Map<string, Pkg>): string {
@@ -809,14 +1177,13 @@ function listenerPackages(listeners: Set<string>, pkgsByShort: Map<string, Pkg>)
   return [...listeners].sort().map(pkg => pkgLink(pkgsByShort.get(pkg), pkg)).join(', ')
 }
 
-function renderEventRelations(pkgs: Pkg[]): string {
-  const events = collectEvents()
+function renderEventRelations(pkgs: Pkg[], events: readonly EventEntry[]): string {
   const relations = collectEventRelations()
   const pkgsByShort = new Map(pkgs.map(pkg => [pkg.short, pkg]))
   const maintenance = 'generated: Cordis event declarations and producer/listener edges are resolved from the repository TypeScript Program'
   const lines = generatedHeader('Event Producer And Consumer Matrix')
   lines.push(
-    'This matrix shows which packages dispatch each harness-owned event and which packages listen to it. It is intentionally a table rather than one large graph: events are many-to-many, and dense relation data is easier to review in rows. Receiver and event-name types also cover contained dispatch sites that deliberately bypass `ctx.emit`, such as subagent lifecycle containment.',
+    'This matrix shows which packages dispatch each harness-owned event and which packages listen to it. Events are many-to-many, so the dense relation data is presented as a table rather than one large graph. Receiver and event-name types also cover contained dispatch sites that deliberately bypass `ctx.emit`, such as subagent lifecycle containment.',
     '',
     '| Event | Mode | Declared in | Dispatchers | Listeners |',
     '| --- | --- | --- | --- | --- |',
@@ -826,16 +1193,21 @@ function renderEventRelations(pkgs: Pkg[]): string {
     lines.push(`| \`${event.name}\` | \`${event.mode}\` | ${sourceLink(event.source)} | ${relationPackages(relation.dispatchers, pkgsByShort)} | ${listenerPackages(relation.listeners, pkgsByShort)} |`)
   }
   // Every declared event needs a dispatcher: zero means dead vocabulary or an
-  // unrecognized semantic dispatch shape. Listener-free extension points remain valid.
+  // unrecognized semantic dispatch form. Listener-free extension points remain
+  // valid. Client-declared events are exempt: the relation scan seeds the HOST
+  // aggregate program only (host+client cannot share one program — the cordis
+  // Context merges collide), so client dispatch sites are structurally
+  // invisible here; their rows stay in the table for the declarations' sake.
   const undispatched = [...events]
+    .filter(event => !event.source.startsWith('packages/client/'))
     .filter(event => (relations.get(event.name)?.dispatchers.size ?? 0) === 0)
     .map(event => event.name)
     .sort()
   if (undispatched.length > 0) {
     throw new Error(
       `event-producer-consumer matrix: no dispatcher found for declared event${undispatched.length > 1 ? 's' : ''} `
-      + `${undispatched.map(name => `"${name}"`).join(', ')} — dead vocabulary, or a dispatch shape the semantic scan misses `
-      + '(teach scripts/gen-doc-graphs.ts the shape)',
+      + `${undispatched.map(name => `"${name}"`).join(', ')} — dead vocabulary, or a dispatch form the semantic scan misses `
+      + '(teach scripts/gen-doc-graphs.ts that form)',
     )
   }
   const declared = new Set(events.map(event => event.name))
@@ -856,7 +1228,7 @@ function renderLifecycle(): string {
   const maintenance = 'curated Mermaid sequence; exact event signatures live in the generated Cordis catalog'
   return [
     ...generatedHeader('Agent Turn And Step Lifecycle'),
-    'This sequence is the visual companion to [architecture.md](architecture.md#loop-lifecycle-session--turn--step). It keeps durable replay facts on `session/event` and live control/status on `agent/*`.',
+    'This sequence is the visual companion to [architecture.md](architecture.md#turn-flow). It keeps durable replay facts on `session/event` and live control/status on `agent/*`.',
     '',
     '```mermaid',
     'sequenceDiagram',
@@ -868,19 +1240,24 @@ function renderLifecycle(): string {
     '  participant LLM as ctx.llm',
     '  participant Tools as ctx.tools',
     '  participant Session',
-    '  participant Persistence',
     '  participant SDK as UI or SDK listener',
-    '  User->>Agent: send(content)',
-    `  Agent-->>SDK: ${mermaidCode('agent/queued')}`,
+    '  User->>Agent: followup(content)',
+    `  Agent-->>SDK: ${mermaidCode('agent/inbox/spliced')}`,
+    `  Agent-->>SDK: ${mermaidCode('agent/inbox/inserted')} { message }`,
     '  Agent->>Driver: queued work wakes driver',
     `  Driver-->>SDK: ${mermaidCode('agent/status')} running`,
     `  Driver->>Session: ${mermaidCode('turn/start')}`,
-    `  Driver->>Hooks: ${mermaidCode('agent/prompt-submit')} waterfall`,
-    '  Hooks-->>Driver: allow, block, or add context',
-    `  Driver->>Session: ${mermaidCode('user/message')} or rejected ${mermaidCode('turn/end')}`,
-    `  Driver->>Prompt: ${mermaidCode('system-prompt/assemble')} waterfall`,
-    `  Driver-->>Driver: ${mermaidCode('agent/pre-step')} serial checkpoint`,
+    '  Note over Agent,Driver: claim pending next-step input plus one queued prompt',
+    `  Driver-->>SDK: ${mermaidCode('agent/inbox/spliced')} pure deletion`,
+    `  Driver-->>SDK: ${mermaidCode('agent/inbox/claimed')} { message, turn } per message`,
+    `  Driver->>Hooks: ${mermaidCode('agent/pre-step')} waterfall`,
+    '  Hooks-->>Driver: authoritative reject or enter(messages)',
+    '  alt proposed step rejected or pre-step failed',
+    '    Driver-->>Driver: claimed batch stays removed, the open turn spends no step',
+    '  else enter proposed step',
     `  Driver->>Session: ${mermaidCode('step/start')}`,
+    `  Driver->>Session: ${mermaidCode('user/message')} per entered message`,
+    `  Driver->>Prompt: ${mermaidCode('system-prompt/assemble')} waterfall`,
     `  Driver->>LLM: ${mermaidCode('agent/request')} waterfall, then ${mermaidCode('llm/stream')} waterfall`,
     '  LLM-->>Driver: StreamChunk*',
     `  Driver->>Session: ${mermaidCode('assistant/chunk')}*`,
@@ -888,9 +1265,8 @@ function renderLifecycle(): string {
     '  alt final adapter or terminal in-band request failure',
     `    Driver->>Session: ${mermaidCode('step/end')}`,
     `    Driver->>Hooks: ${mermaidCode('agent/request-error')} waterfall`,
-    '    Hooks-->>Driver: retry in a new step or preserve the original error',
+    '    Hooks-->>Driver: return retry action or preserve the original error',
     '  else model request succeeded',
-    `  Driver->>Hooks: ${mermaidCode('agent/step-result')} waterfall`,
     `  Driver->>Session: ${mermaidCode('assistant/message')}`,
     '  Driver->>Tools: classify pending call by executionMode',
     '  loop barriers and bounded rolling pool, reclassify before start',
@@ -904,22 +1280,29 @@ function renderLifecycle(): string {
     `      Driver->>Session: ${mermaidCode('tool/result')}`,
     '    end',
     '  end',
-    '  Driver->>Session: post-tool context and steering',
-    `  Driver->>Hooks: ${mermaidCode('agent/post-step')} serial checkpoint`,
     `  Driver->>Session: ${mermaidCode('step/end')}`,
-    `  Driver->>Hooks: ${mermaidCode('agent/turn-continuation')} waterfall`,
-    `  Driver->>Hooks: ${mermaidCode('agent/turn-stop')} serial terminal checkpoint`,
+    '  opt natural stop and next-step inbox empty',
+    `    Driver->>Hooks: ${mermaidCode('agent/turn-stopping')} serial terminal checkpoint`,
+    '  end',
+    '  opt next-step input is pending',
+    '    Driver-->>Driver: claim pending next-step input',
+    `    Driver-->>SDK: ${mermaidCode('agent/inbox/claimed')} { message, turn } per message`,
+    `    Driver->>Hooks: ${mermaidCode('agent/pre-step')} waterfall`,
+    '    Hooks-->>Driver: authoritative reject or enter(messages)',
+    '  end',
+    '  end',
     '  end',
     `  Driver->>Session: ${mermaidCode('turn/end')}`,
-    `  Driver->>Persistence: ${mermaidCode('session/flush')} parallel checkpoint`,
     `  Driver-->>SDK: ${mermaidCode('agent/status')} idle`,
     '```',
     '',
-    'The `assistant/message` edge records every successful provider call, including content-less and `max-tokens` finishes. Empty content stays out of derived history while the durable anchor retains usage and exact chunk provenance, including an explicit empty source set.',
+    'The `assistant/message` event records every successful provider call, including content-less and `max-tokens` finishes. Empty content stays out of derived history, while the durable event keeps usage and `sourceEventSeqs` listing the exact `assistant/chunk` events, including an explicit empty list.',
     '',
-    '`dsh-compact-basic` uses `agent/post-step` for pressure after those durable facts and `agent/request-error` only for canonical context overflow. Once either trigger qualifies, optional tool-result pruning runs before summary selection. Recovery works between the closed failed step and a fresh retry step, and returns retry only when pruning or summarization advances the surface replacement generation; otherwise the original request error remains authoritative.',
+    '`dsh-compaction-basic` uses `agent/pre-step` for pressure before request derivation and `agent/request-error` only for canonical context overflow. Once either trigger qualifies, optional tool-result pruning runs before summary selection. Recovery works between the closed failed step and failed turn close, and opens a fresh retry turn only when pruning or summarization advances the surface replacement generation; otherwise the original request error remains authoritative.',
     '',
-    'SDK users that need replayable transcript data should consume `session/event`; `agent/*` is the live coordination surface for queue/status, prompt interception, request shaping, steering, continuation, and errors.',
+    'The returned `agent/pre-step` decision is authoritative; listeners wrapping `next()` preserve downstream messages unless replacement is intentional. Steering and injected context pass through the same waterfall after a later claim operation takes their next-step batch.',
+    '',
+    'SDK users that need replayable transcript data should consume `session/event`; `agent/*` is the live coordination API for queue/status, prompt interception, request construction, steering, continuation, and errors.',
     '',
     ...maintenanceFooter(maintenance),
   ].join('\n')
@@ -929,7 +1312,7 @@ function renderToolPipeline(): string {
   const maintenance = 'curated Mermaid flow; exact tool schemas and event signatures live in generated catalogs'
   return [
     ...generatedHeader('Tool Execution Pipeline'),
-    'This graph shows where policy, hooks, sandboxing, filesystem guards, result rewriting, final-outcome observation, and UI rendering fit without changing the loop. The transformable extension points are the `tools/pre-execute`, `tools/execute`, and `tools/post-execute` waterfalls; monotonic guards and `tools/result` are the owner-enforced boundaries around them.',
+    'This graph shows where policy, hooks, sandboxing, filesystem guards, result rewriting, final-outcome observation, and UI rendering run without changing the loop. The `tools/pre-execute` waterfall runs first, monotonic guards run next, and the `tools/execute` and `tools/post-execute` waterfalls follow; the three waterfalls may transform a call. Definition-owned `finalizeContent` and `tools/result` run afterward.',
     '',
     '```mermaid',
     'flowchart TD',
@@ -945,8 +1328,10 @@ function renderToolPipeline(): string {
     `  fsGate["${mermaidCode('fs/write-intent')} or ${mermaidCode('fs/edit-intent')}<br/>tool-fs mutations only"]`,
     `  owned["Tool-owned session events<br/>${mermaidCode('todo/write')}, ${mermaidCode('fs/observed')}, ${mermaidCode('hook/invoked')}, ${mermaidCode('hook/result')}, ${mermaidCode('tool/code-dispatch')}"]`,
     `  post["${mermaidCode('tools/post-execute')} waterfall<br/>accept, block, replace, add context"]`,
+    '  normalized["Registry outer normalization<br/>pipeline/result snapshot throws become isError"]',
+    '  finalize["ToolDefinition.finalizeContent<br/>last content-only invariant"]',
     `  final["${mermaidCode('tools/result')} synchronous notification<br/>frozen authoritative outcome"]`,
-    '  context["Active-batch additionalContexts FIFO<br/>context/message after recorded tool results"]',
+    '  context["Active-batch additionalContexts FIFO<br/>injected user/message after recorded tool results"]',
     `  toolResult["Session event: ${mermaidCode('tool/result')}<br/>single model-facing outcome"]`,
     '  allResults["Tool batch settled<br/>recorded tool/result events complete"]',
     '  presentResult["UI completed card<br/>presentResult(args, result)"]',
@@ -956,54 +1341,32 @@ function renderToolPipeline(): string {
     '  pre -->|allow| guards',
     '  guards -->|allow| around',
     '  guards -->|deny| denied',
+    '  guards -.->|throw| normalized',
     '  around --> toolBody',
     '  pre -->|deny| denied',
     '  pre -->|ask| approval',
     '  approval -->|allowed-once| guards',
     '  approval -->|rejected, cancelled, unavailable| denied',
+    '  approval -.->|throw| normalized',
     '  denied --> post',
+    '  pre -.->|throw| normalized',
     '  toolBody --> fsGate',
     '  fsGate --> toolBody',
     '  toolBody --> owned',
     '  toolBody --> around',
     '  around --> post',
-    '  post --> final',
+    '  around -.->|wrapper throws| normalized',
+    '  post -.->|throw| normalized',
+    '  post --> finalize',
+    '  normalized --> finalize',
+    '  finalize --> final',
     '  final --> toolResult',
     '  toolResult --> presentResult',
     '  toolResult --> allResults',
     '  allResults --> context',
     '```',
     '',
-    'Filesystem read-before-edit checks stay below `tool-fs` on `fs/*` events. Generic pre/post waterfalls host hooks and approval policy; `ctx.approval` resolves asks before monotonic guards, and owner policy that must not be reordered remains a registered guard. Around-dispatch concerns such as timeouts wrap `tools/execute`, while `tools/result` observes the immutable outcome after transforms, lossless-JSON validation, and outer error normalization. This lets hooks span tool families without coupling the tools to one policy service. Code Mode sends both the reserved `run_code` transport and its serialized sub-calls through the pipeline; sub-calls carry the parent token, log `tool/code-dispatch`, surface denials as binding rejections, and omit `additionalContexts` to preserve call/result adjacency.',
-    '',
-    ...maintenanceFooter(maintenance),
-  ].join('\n')
-}
-
-function renderSnapshotReplay(): string {
-  const maintenance = 'curated Mermaid sequence based on the snapshot test harness'
-  return [
-    ...generatedHeader('ACP Snapshot Replay'),
-    'This graph explains what a snapshot scenario proves: recorded real-model session logs are replayed keylessly, ACP stdout is normalized and diffed, and scenario workspaces preserve tool side effects that the UI stream alone cannot prove.',
-    '',
-    '```mermaid',
-    'sequenceDiagram',
-    '  participant Recorder as Real API recording',
-    '  participant Fixture as snapshot fixture',
-    '  participant Workspace',
-    '  participant Replay as llm-replay adapter',
-    '  participant ACP as acp-agent subprocess',
-    '  participant Expected as stdout expected output',
-    '  Recorder->>Fixture: session.jsonl + workspace inputs',
-    '  Fixture->>Workspace: seed files and hook configs',
-    '  Fixture->>Replay: recorded StreamChunk script',
-    `  Replay->>ACP: deterministic ${mermaidCode('llm/stream')} chunks`,
-    '  ACP->>Workspace: bash, fs, and hook side effects',
-    '  ACP->>Expected: normalized sessionUpdate stream',
-    '  Expected-->>ACP: diff must be empty',
-    '```',
-    '',
-    'The fs and hook snapshot matrix is valuable because it proves world state, hook decisions, and failed tool-card rendering, not just that replay returns text.',
+    'Filesystem read-before-edit checks stay below `tool-fs` on `fs/*` events. Generic pre/post waterfalls host hooks and approval policy; `ctx.approval` resolves asks before monotonic guards, and owner policy that must not be reordered remains a registered guard. Around-dispatch concerns such as timeouts wrap `tools/execute`. The registry losslessly snapshots the candidate result and normalizes a snapshot failure before the visible definition\'s snapshotted `finalizeContent` callback enforces its synchronous content-only invariant. `tools/result` then observes the immutable, lossless-JSON outcome. This lets hooks span tool families without coupling the tools to one policy service. Code Mode sends both the reserved `run_code` transport and its serialized sub-calls through the pipeline; sub-calls carry the parent token, log `tool/code-dispatch`, return denials as binding rejections, and omit `additionalContexts` to preserve call/result adjacency.',
     '',
     ...maintenanceFooter(maintenance),
   ].join('\n')
@@ -1011,13 +1374,13 @@ function renderSnapshotReplay(): string {
 
 function renderDocs(): GraphDoc[] {
   const pkgs = collectPackageGraph(root, GROUP_ORDER, 'gen-doc-graphs')
+  const { model } = projectCordisCatalog(root, CORDIS_CATALOG_POLICY)
   const docs: GraphDoc[] = [
-    { rel: 'docs/capability-seams.md', content: renderCapabilitySeams(pkgs) },
+    { rel: 'docs/capability-seams.md', content: renderCapabilitySeams(pkgs, model.services) },
     ...APP_EXAMPLES.map(example => ({ rel: example.rel, content: renderAppComposition(example) })),
-    { rel: 'docs/event-producer-consumer.md', content: renderEventRelations(pkgs) },
+    { rel: 'docs/event-producer-consumer.md', content: renderEventRelations(pkgs, model.events) },
     { rel: 'docs/agent-lifecycle.md', content: renderLifecycle() },
     { rel: 'docs/tool-execution-pipeline.md', content: renderToolPipeline() },
-    { rel: 'packages/ui/acp/snapshot-replay.md', content: renderSnapshotReplay() },
   ]
   docs.unshift({ rel: 'docs/graph-atlas.md', content: renderIndex(docs) })
   return docs
@@ -1026,29 +1389,23 @@ function renderDocs(): GraphDoc[] {
 function renderIndex(docs: GraphDoc[]): string {
   const labels: Record<string, string> = {
     'docs/capability-seams.md': 'capability seams and core services',
-    'examples/echo-agent/composition.md': 'echo-agent app composition',
-    'examples/repl-agent/composition.md': 'repl-agent app composition',
+    'apps/cli/composition.md': 'dsh shared base composition',
     'examples/headless-agent/composition.md': 'headless-agent app composition',
-    'examples/tui-agent/composition.md': 'tui-agent app composition',
     'examples/cordis-agent/composition.md': 'cordis-agent app composition',
     'examples/acp-agent/composition.md': 'acp-agent app composition',
     'docs/event-producer-consumer.md': 'event producer/consumer matrix',
     'docs/agent-lifecycle.md': 'agent turn and step lifecycle',
     'docs/tool-execution-pipeline.md': 'tool execution pipeline',
-    'packages/ui/acp/snapshot-replay.md': 'ACP snapshot replay',
   }
   const modes: Record<string, string> = {
     'docs/capability-seams.md': 'hybrid generated',
-    'examples/echo-agent/composition.md': 'hybrid generated',
-    'examples/repl-agent/composition.md': 'hybrid generated',
+    'apps/cli/composition.md': 'hybrid generated',
     'examples/headless-agent/composition.md': 'hybrid generated',
-    'examples/tui-agent/composition.md': 'hybrid generated',
     'examples/cordis-agent/composition.md': 'hybrid generated',
     'examples/acp-agent/composition.md': 'hybrid generated',
     'docs/event-producer-consumer.md': 'hybrid generated',
     'docs/agent-lifecycle.md': 'curated',
     'docs/tool-execution-pipeline.md': 'curated',
-    'packages/ui/acp/snapshot-replay.md': 'curated',
   }
   const rows = [
     '| [module dependency graph](module-graph.md) | `generated` |',
@@ -1061,9 +1418,9 @@ function renderIndex(docs: GraphDoc[]): string {
   const maintenance = 'mixed: each linked page declares generated, hybrid, or curated mode'
   return [
     ...generatedHeader('Documentation Graph Index'),
-    'These diagrams are the relationship layer above the generated catalogs. Use them to navigate package topology, capability seams, event flow, model-facing tools, app composition, and runtime lifecycle paths. Exact signatures and type shapes still live in the generated [events](cordis-catalog/events.md) / [services](cordis-catalog/services.md) catalogs, [tool-catalog.md](tool-catalog.md), and [core-data-structures/](core-data-structures/core.md).',
+    'These diagrams show relationships that the generated catalogs do not. Use them to find package relationships, capability seams, event flow, model-facing tools, app composition, and runtime lifecycle paths. Exact signatures and type definitions still live in the [subsystem pages](subsystems/core.md) (types + the generated Cordis API regions) and [tool-catalog.md](tool-catalog.md).',
     '',
-    'The process decision behind this index is recorded in [the documentation graph Agent Note](../.agents/notes/implemented/process/2026-07-03-documentation-graph-atlas.md).',
+    'The process decision behind this index is recorded in [the documentation graph Agent Note](../.agents/notes/archived/process/2026-07-03-documentation-graph-atlas.md).',
     '',
     '| Graph | Mode |',
     '| --- | --- |',

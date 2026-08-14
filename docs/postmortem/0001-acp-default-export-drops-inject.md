@@ -1,5 +1,7 @@
 # Post-mortem 0001: ACP server crashed on connect — `export default` dropped the plugin's `inject`
 
+English | [中文](0001-acp-default-export-drops-inject.zh.md)
+
 Status: resolved (fix in PR #41 `feat/acp-2-bridge`)
 
 ## Executive summary
@@ -16,7 +18,7 @@ The ACP server could not create or load a single session — the two RPCs an edi
 
 ## Timeline
 
-- The bridge (RFC 010) landed with a full unit suite (codec, in-memory transport, property-based protocol-shape, failure paths, HMR), a key-gated real-API e2e, and a no-key stdout-purity e2e. All green, 100% coverage.
+- The bridge (RFC 010) landed with a full unit suite for the codec, in-memory transport, generated protocol messages, failure paths, and HMR; a key-gated real-API e2e; and a no-key stdout-purity e2e. All green, 100% coverage.
 - A real Zed session immediately failed on `session/new` with `cannot get property "agents" without inject`.
 - Investigation initially pursued a Cordis "traceable/shadow" theory (plausible, and the mechanism is real — see Bug #2), then instrumented the actual fiber walk in vendored `reflect.ts` and ran the real subprocess. The trace showed the throw at `apply()` line 179 *at plugin load time*, on the ROOT fiber with no shadow — falsifying the shadow theory for `session/new`.
 - Root cause #1 found: a stray `export default apply`. Removing it fixed `session/new`.
@@ -24,7 +26,7 @@ The ACP server could not create or load a single session — the two RPCs an edi
 
 ## Root cause #1 — `export default apply` drops the plugin's `inject` (broke `session/new`)
 
-`packages/ui/acp/src/index.ts` is a *namespace plugin*: it exports `name`, `inject`, `Config`, and `apply` as separate named exports — the same shape as every other plugin in the repo (`invariants`, `llm-deepseek`, `tool-bash`, `stdio-chat`, …). But it *also* ended with one extra line no other plugin had:
+`packages/acp/acp/src/index.ts` is a *namespace plugin*: it exports `name`, `inject`, `Config`, and `apply` as separate named exports, as every other plugin in the repo does (`invariants`, `llm-deepseek`, `tool-bash`, `tui`, …). But it *also* ended with one extra line no other plugin had:
 
 ```ts ignore-check
 export const name = 'acp'
@@ -97,7 +99,7 @@ Both bugs share one root process gap: **no test exercised the plugin through its
 
 ## Guardrails added
 
-- **Removed `export default apply`** (`packages/ui/acp/src/index.ts`) — the Bug #1 fix.
+- **Removed `export default apply`** (`packages/acp/acp/src/index.ts`) — the Bug #1 fix.
 - **`AgentLoop.resume` reads `this.ctx.get('sessionPersistence')`** (`packages/core/agent-loop/src/index.ts`) — the Bug #2 fix, with a comment explaining the shadow-walk trap.
 - **No-key `session/new` e2e over real stdio** (`examples/acp-agent/tests/acp.e2e.ts`): boots the example as a subprocess through the real Loader and asserts `session/new` resolves. This fails loudly on Bug #1 with no API key. Verified it fails when `export default apply` is restored.
 - **`TSX_TSCONFIG_PATH` in the e2e spawn**: the subprocess runs from a temp cwd, where tsx cannot find the repo-root tsconfig `paths` map by searching upward — so dsh-* imports silently fell back to built `lib/`. Pointing tsx at the repo tsconfig makes resolution cwd-independent and ensures the test runs *source*, not a possibly-stale build.

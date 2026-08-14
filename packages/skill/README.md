@@ -1,11 +1,16 @@
-# skill/ - skill capability family
+# skill/ — skill capability family
 
-The canonical three-package capability seam for reusable agent instructions: a provider registry, a local implementation, and the model-facing catalog/loader consumer. All are **product** packages.
+English | [中文](README.zh.md)
+
+This family discovers reusable agent instructions and exposes them to the model through a provider-neutral catalog and loader.
 
 | Package | Role | ctx key |
 |---|---|---|
-| `skill/` | Provider registry, precedence resolution, stable catalog snapshots, and full-definition lookup | `ctx.skills` |
-| `skill-local/` | Project/custom/user filesystem provider | (registers on `ctx.skills`) |
-| `tool-skill/` | Session-prefix catalog and model-facing `skill` loader | (registers on `ctx.tools`) |
+| [`skill/`](skill/README.md) | Defines skill provider registration and lookup | `ctx.skills` |
+| [`skill-badge/`](skill-badge/README.md) | Contributes the optional bundled dsh badge skill | registers on `ctx.skills` |
+| [`skill-filesystem/`](skill-filesystem/README.md) | Discovers skills from local filesystems | registers on `ctx.skills` |
+| [`tool-skill/`](tool-skill/README.md) | Publishes the skill catalog and model-facing loader | registers on `ctx.tools` |
 
-The interface lives at `skill/skill/`. Providers register synchronously and perform asynchronous discovery through `ctx.skills`; `tool-skill` consumes only that interface, so an embedded or remote provider can replace or complement `skill-local` without changing the model-facing contract. `agent-core` loads this family by default, but it remains a capability outside the core control spine, parallel to [`bash/`](../bash/README.md), [`fs/`](../fs/README.md), [`web/`](../web/README.md), and [`subagent/`](../subagent/README.md).
+This capability remains outside the core control spine and can use local, embedded, or remote providers without changing the model-facing contract.
+
+The subsystem reference — discovery priority, catalog snapshots, the `skill` loader — is [docs/subsystems/skills.md](../../docs/subsystems/skills.md).

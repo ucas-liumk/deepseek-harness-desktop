@@ -41,7 +41,10 @@ const chunkArb: fc.Arbitrary<StreamChunk> = indexArb.chain(index => fc.oneof(
   fc.constant<StreamChunk>({ type: 'usage', usage: { inputTokens: 1, outputTokens: 1 } }),
   fc.constant<StreamChunk>({ type: 'finish', reason: { kind: 'stop' } }),
   fc.constant<StreamChunk>({ type: 'finish', reason: { kind: 'tool-calls' } }),
-  fc.string().map((message): StreamChunk => ({ type: 'finish', reason: { kind: 'error', message } })),
+  fc.string({ minLength: 1 }).map((message): StreamChunk => ({
+    type: 'finish',
+    reason: { kind: 'error', failure: { message, code: 'UNKNOWN' } },
+  })),
 ))
 
 /** A stream is an arbitrary list of chunks (we do NOT force a terminal finish). */

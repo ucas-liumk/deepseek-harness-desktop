@@ -2,7 +2,7 @@
  * Unit tests for the result-time contextual-diff computation (`src/diff.ts`):
  * the pure before/after → {@link FileDiff}[] hunk builder and the defensive
  * `meta` narrowing. These pin the exact hunk reconstruction (context lines,
- * multi-hunk replaceAll, pure insertion/deletion, no-op) the ACP bridge renders.
+ * multi-hunk replaceAll, pure insertion/deletion, no-op) that UIs render.
  */
 
 import { describe, expect, it } from 'vitest'

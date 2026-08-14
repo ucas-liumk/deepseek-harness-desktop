@@ -21,6 +21,15 @@ export class TimeoutReason extends Error {
   }
 }
 
+/** Largest delay Node schedules without clamping it to one millisecond. */
+export const MAX_TIMER_DELAY_MS = 2_147_483_647
+
+function assertTimerDelay(timeoutMs: number, name: string): void {
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0 || timeoutMs > MAX_TIMER_DELAY_MS) {
+    throw new Error(`${name} must be a positive finite number no greater than ${MAX_TIMER_DELAY_MS}`)
+  }
+}
+
 /**
  * Validate a caller's optional timeout hint, use the backend default, then cap
  * it. Supplied values must be positive and finite; zero is not a public
@@ -53,6 +62,22 @@ export interface Deadline {
   [Symbol.dispose](): void
 }
 
+/** Rearmable timeout around one outstanding async-iterator demand. */
+export interface IdleWatchdog {
+  /** Stable signal aborted by upstream cancellation or this watchdog's timeout. */
+  readonly signal: AbortSignal
+  /**
+   * Await one iterator demand while the idle timer is armed.
+   * @param iterator - iterator whose next value represents provider progress.
+   * @returns the iterator's next result.
+   */
+  next<T>(iterator: AsyncIterator<T>): Promise<IteratorResult<T>>
+  /** Rearm an outstanding demand after transport activity that yields no iterator value; otherwise a no-op. */
+  pulse(): void
+  /** Clear an armed timer; safe to call once at the owning stream's exit. */
+  [Symbol.dispose](): void
+}
+
 /**
  * Fuse upstream cancellation with an identifiable timeout. `timeoutMs <= 0` is
  * the internal no-timer sentinel; the returned disposer clears an armed timer.
@@ -74,6 +99,8 @@ export function deadline(
     return { signal: upstream ?? new AbortController().signal, [Symbol.dispose]() {} }
   }
 
+  assertTimerDelay(timeoutMs, 'deadline timeoutMs')
+
   const timer = new AbortController()
   const id = setTimeout(() => { timer.abort(new TimeoutReason(code, timeoutMs)) }, timeoutMs)
   return {
@@ -82,6 +109,66 @@ export function deadline(
     // when the timeout won, and upstream-wins leaves an ordinary abort reason.
     signal: upstream !== undefined ? AbortSignal.any([upstream, timer.signal]) : timer.signal,
     [Symbol.dispose]() { clearTimeout(id) },
+  }
+}
+
+/**
+ * Create a rearmable idle watchdog for an async iterator. The timer exists only
+ * while {@link IdleWatchdog.next} is outstanding, so consumer think time does
+ * not count as provider idle time. The returned signal is stable for the whole
+ * call and only notifies; the iterator must observe it to terminate its work.
+ *
+ * @param upstream - caller cancellation fused into the stable signal.
+ * @param timeoutMs - positive finite idle interval in milliseconds.
+ * @param code - capability-owned code carried by the timeout reason.
+ * @returns a stable signal, guarded next operation, and timer disposer.
+ */
+export function idleWatchdog(
+  upstream: AbortSignal | undefined,
+  timeoutMs: number,
+  code: string,
+): IdleWatchdog {
+  assertTimerDelay(timeoutMs, 'idleWatchdog timeoutMs')
+  const timeout = new AbortController()
+  const signal = upstream === undefined
+    ? timeout.signal
+    : AbortSignal.any([upstream, timeout.signal])
+  let timer: ReturnType<typeof setTimeout> | undefined
+  let outstanding = false
+  let disposed = false
+
+  const arm = (): void => {
+    if (timer !== undefined) clearTimeout(timer)
+    timer = setTimeout(() => {
+      timeout.abort(new TimeoutReason(code, timeoutMs))
+    }, timeoutMs)
+  }
+
+  return {
+    signal,
+    async next<T>(iterator: AsyncIterator<T>): Promise<IteratorResult<T>> {
+      if (disposed) throw new Error('idleWatchdog is disposed')
+      if (outstanding) throw new Error('idleWatchdog next is already outstanding')
+      outstanding = true
+      arm()
+      try {
+        return await iterator.next()
+      } finally {
+        clearTimeout(timer)
+        timer = undefined
+        outstanding = false
+      }
+    },
+    pulse(): void {
+      if (disposed || !outstanding) return
+      arm()
+    },
+    [Symbol.dispose](): void {
+      if (disposed) return
+      disposed = true
+      if (timer !== undefined) clearTimeout(timer)
+      timer = undefined
+    },
   }
 }
 

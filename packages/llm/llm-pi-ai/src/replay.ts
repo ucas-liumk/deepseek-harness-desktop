@@ -9,7 +9,7 @@
  */
 
 import { LlmError } from '@deepseek-ai/dsh-llm'
-import type { Message } from '@deepseek-ai/dsh-llm'
+import type { Message, ModelMessageSource } from '@deepseek-ai/dsh-llm'
 import type { Api, AssistantMessage, Usage as PiUsage } from '@earendil-works/pi-ai'
 
 type PiAiReplayBlock =
@@ -123,6 +123,7 @@ function readReplayState(value: unknown): PiAiReplayState {
 
 /** Convert provider-neutral blocks without trusting them as same-model replay. */
 function foreignAssistant(message: Message): AssistantMessage {
+  const source = message.source.kind === 'model' ? message.source : undefined
   const content: AssistantMessage['content'] = []
   for (const block of message.content) {
     switch (block.type) {
@@ -134,6 +135,8 @@ function foreignAssistant(message: Message): AssistantMessage {
         name: block.name,
         arguments: parseArguments(block.arguments),
       }); break
+      case 'image':
+        throw new LlmError('pi-ai chat history cannot represent structured assistant image output', 'UNSUPPORTED_CONTENT')
       default:
         // plugin-added block types are not representable in pi-ai.
         break
@@ -143,10 +146,10 @@ function foreignAssistant(message: Message): AssistantMessage {
     role: 'assistant',
     content,
     // Deliberately never equals a catalog API: absent replay state is foreign
-    // even if provenance names the same provider/model as this request.
+    // even if source names the same provider/model as this request.
     api: 'dsh-foreign',
-    provider: message.provenance?.provider ?? 'dsh-foreign',
-    model: message.provenance?.model ?? 'dsh-foreign',
+    provider: source?.provider ?? 'dsh-foreign',
+    model: source?.model ?? 'dsh-foreign',
     usage: emptyPiUsage(),
     stopReason: content.some(piece => piece.type === 'toolCall') ? 'toolUse' : 'stop',
     timestamp: 0,
@@ -154,11 +157,10 @@ function foreignAssistant(message: Message): AssistantMessage {
 }
 
 /** Recombine durable Harness content with validated pi-ai replay metadata. */
-function replayedAssistant(message: Message, rawState: unknown): AssistantMessage {
+function replayedAssistant(message: Message, source: ModelMessageSource, rawState: unknown): AssistantMessage {
   const state = readReplayState(rawState)
-  const provenance = message.provenance
-  if (state.provider !== provenance?.provider) return invalidReplay('provider does not match assistant provenance')
-  if (state.model !== provenance.model) return invalidReplay('model does not match assistant provenance')
+  if (state.provider !== source.provider) return invalidReplay('provider does not match assistant source')
+  if (state.model !== source.model) return invalidReplay('model does not match assistant source')
   if (state.blocks.length !== message.content.length) return invalidReplay('block count does not match assistant content')
   const content: AssistantMessage['content'] = message.content.map((block, index) => {
     const replay = state.blocks[index]
@@ -202,10 +204,12 @@ function replayedAssistant(message: Message, rawState: unknown): AssistantMessag
 
 /**
  * Convert one durable Harness assistant message into pi-ai history.
- * @param message - assistant content with optional adapter-owned replay metadata.
+ * @param message - assistant content with required source and optional adapter-owned replay metadata.
  * @returns a native pi-ai assistant message reconstructed from durable content.
  */
 export function toPiAssistant(message: Message): AssistantMessage {
-  const replayState = message.provenance?.replayState
-  return replayState === undefined ? foreignAssistant(message) : replayedAssistant(message, replayState)
+  const source = message.source
+  return source.kind !== 'model' || source.replayState === undefined
+    ? foreignAssistant(message)
+    : replayedAssistant(message, source, source.replayState)
 }

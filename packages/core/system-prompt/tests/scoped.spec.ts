@@ -1,8 +1,8 @@
-import { describe, expect, it } from 'vitest'
-import { Context } from 'cordis'
+import { describe, expect, it, vi } from 'vitest'
+import { Context } from '@deepseek-ai/cordis'
 import { createScope, scopeOf } from '@deepseek-ai/dsh-scope'
 import type { Scope, ScopeKey } from '@deepseek-ai/dsh-scope'
-import SystemPrompt, { TOOL_ORDER_REST, renderPrompt } from '@deepseek-ai/dsh-system-prompt'
+import SystemPrompt, { TOOL_ORDER_REST, renderContextSnapshot, renderPrompt } from '@deepseek-ai/dsh-system-prompt'
 import type { Config, PromptAssembly } from '@deepseek-ai/dsh-system-prompt'
 
 async function mount(config: Config = {}): Promise<Context> {
@@ -63,6 +63,21 @@ describe('scoped sections', () => {
     expect(() => scope.ctx.systemPrompt.section({ name: 'y', order: 1, text: 'b' })).toThrow(/already registered in this scope/)
   })
 
+  it('shadows a global section before evaluating either text provider', async () => {
+    const ctx = await mount()
+    const scope = await mintScope(ctx, 'child')
+    const globalText = vi.fn(() => 'global text')
+    const scopedText = vi.fn(() => 'scoped text')
+    ctx.systemPrompt.section({ name: 'shared', order: 1, text: globalText })
+    scope.ctx.systemPrompt.section({ name: 'shared', order: 1, text: scopedText })
+
+    const assembly = await ctx.systemPrompt.assemble({ scope: scopeKeyOf(scope) })
+
+    expect(assembly.sections.find(section => section.name === 'shared')?.text).toBe('scoped text')
+    expect(globalText).not.toHaveBeenCalled()
+    expect(scopedText).toHaveBeenCalledOnce()
+  })
+
 })
 
 describe('scoped variables', () => {
@@ -85,6 +100,64 @@ describe('scoped variables', () => {
     // Re-minting a scope with the SAME key starts clean.
     const again = await mintScope(ctx, 'child2')
     again.ctx.systemPrompt.variable('v', () => '3')
+  })
+
+  it('defers a scoped variable that replaces the last provider in its generation', async () => {
+    const ctx = await mount({ persona: 'Mode: {{mode}}.' })
+    const scope = await mintScope(ctx, 'child')
+    const key = scopeKeyOf(scope)
+    const calls: string[] = []
+    scope.ctx.systemPrompt.section({ name: 'scope:sibling', order: 1, text: 'Scoped.' })
+    const dispose = scope.ctx.systemPrompt.variable('mode', () => {
+      calls.push('first')
+      dispose()
+      scope.ctx.systemPrompt.variable('mode', () => {
+        calls.push('replacement')
+        return 'replacement'
+      })
+      return 'first'
+    })
+
+    expect(renderPrompt(await ctx.systemPrompt.assemble({ scope: key }))).toContain('Mode: first.')
+    expect(calls).toEqual(['first'])
+    expect(renderPrompt(await ctx.systemPrompt.assemble({ scope: key }))).toContain('Mode: replacement.')
+    expect(calls).toEqual(['first', 'replacement'])
+  })
+})
+
+describe('scoped cache-safe context', () => {
+  it('shadows a global context for one scope and cleans up with that scope', async () => {
+    const ctx = await mount()
+    const scope = await mintScope(ctx, 'child-context')
+    ctx.systemPrompt.context({ name: 'policy', order: 1, text: 'global policy' })
+    scope.ctx.systemPrompt.context({ name: 'policy', order: 1, text: 'scoped policy' })
+    expect(() => scope.ctx.systemPrompt.context({ name: 'policy', order: 2, text: 'duplicate' }))
+      .toThrow('prompt context "policy" is already registered in this scope')
+
+    expect(renderContextSnapshot(await ctx.systemPrompt.assemble({ scope: scopeKeyOf(scope) })))
+      .toContain('scoped policy')
+    expect(renderContextSnapshot(await ctx.systemPrompt.assemble())).toContain('global policy')
+
+    await scope.dispose()
+    expect(renderContextSnapshot(await ctx.systemPrompt.assemble({ scope: scopeKeyOf(scope) })))
+      .toContain('global policy')
+  })
+
+  it('suppresses all context for one scope and restores it when disposed', async () => {
+    const ctx = await mount()
+    const scope = await mintScope(ctx, 'suppressed-context')
+    const key = scopeKeyOf(scope)
+    ctx.systemPrompt.context({ name: 'policy', order: 1, text: 'global policy' })
+    const dispose = scope.ctx.systemPrompt.suppressRuntimeContext()
+
+    const suppressed = await ctx.systemPrompt.assemble({ scope: key })
+    expect(suppressed.contexts).toEqual([])
+    const global = await ctx.systemPrompt.assemble()
+    expect(renderContextSnapshot(global)).toContain('global policy')
+
+    dispose()
+    expect(renderContextSnapshot(await ctx.systemPrompt.assemble({ scope: key })))
+      .toContain('global policy')
   })
 })
 

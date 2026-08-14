@@ -73,9 +73,7 @@ def run_smoke(repo_root: Path, keep_sessions: bool) -> None:
                 "Please reply with a short confirmation and do not call tools.",
                 session_id="sdk-smoke-main",
             )
-        print(f"turn_status={result.status}")
         print(f"final_response={result.final_response}")
-        assert result.status == "ok", result
         assert "configured HTTP model endpoint" in result.final_response
         assert len(MockCompletionHandler.requests) == 1
         request = MockCompletionHandler.requests[0]

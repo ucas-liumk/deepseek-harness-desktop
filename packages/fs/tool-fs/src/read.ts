@@ -4,16 +4,13 @@
  * @module @deepseek-ai/dsh-tool-fs/src/read
  */
 
-import type { Context } from 'cordis'
+import type { Context } from '@deepseek-ai/cordis'
 import { defineTool } from '@deepseek-ai/dsh-tools'
-import type { GenericCallView } from '@deepseek-ai/dsh-tools'
-import type { ContentBlock } from '@deepseek-ai/dsh-llm'
-import { FsError } from '@deepseek-ai/dsh-fs'
+import type { GenericCallView, ReadResultView, ToolResult } from '@deepseek-ai/dsh-tools'
 import type {} from '@deepseek-ai/dsh-fs'
 import type {} from '@deepseek-ai/dsh-system-prompt'
-import { buildWindow, formatReadOutput } from './read-render.ts'
-import type { FileReadOutcome } from './read-render.ts'
-import { sessionResolveOptions } from './session-cwd.ts'
+import { buildWindow, formatReadOutput, langFromPath, readMetaFromMeta } from './read-render.ts'
+import { resolveRegularReadTarget } from './read-target.ts'
 
 /** Default and maximum number of lines returned by one `read` call (the `readLimit` config). */
 export const READ_LIMIT = 2000
@@ -84,17 +81,63 @@ export function applyReadTool(ctx: Context, caps: ReadToolCaps): void {
       offset: { type: 'number', description: '1-based first line to return. Defaults to 1.' },
       limit: { type: 'number', description: `Maximum number of lines to return. Defaults to ${caps.limit}.` },
     },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          path: { type: 'string', required: true },
+          offset: { type: 'integer', required: true },
+          lines: {
+            type: 'array',
+            required: true,
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                number: { type: 'integer', required: true },
+                text: { type: 'string', required: true },
+              },
+            },
+          },
+          totalLines: { type: 'integer', required: true },
+        },
+      },
+      render: (args, value) => {
+        const input = parseReadArgs(args, caps.limit)
+        const endLine = value.lines.at(-1)?.number ?? Math.max(0, value.offset - 1)
+        const truncatedByBytes = value.lines.length < input.limit && endLine < value.totalLines
+        return [{
+          type: 'text',
+          text: formatReadOutput(value.path, {
+            offset: value.offset,
+            lines: value.lines,
+            totalLines: value.totalLines,
+            ...truncatedByBytes ? { truncatedByBytes: true } : {},
+          }),
+        }]
+      },
+      // Project the structured window into persisted `meta` so a UI's read card
+      // survives replay: the raw canonical output object is not on the wire, only
+      // the model-facing text, from which the line/lang data cannot be recovered.
+      presentationMeta: (_args, value) => {
+        const lang = langFromPath(value.path)
+        return {
+          path: value.path,
+          offset: value.offset,
+          lines: value.lines.map(({ number, text }) => ({ number, text })),
+          totalLines: value.totalLines,
+          ...lang === undefined ? {} : { lang },
+        }
+      },
+    },
     // Observation races fail closed because guarded mutations re-check the version in-lock.
     isConcurrencySafe: () => true,
-    async execute(args, exec): Promise<ContentBlock[]> {
+    async execute(args, exec) {
       const input = parseReadArgs(args, caps.limit)
-      const target = await ctx.fs.resolve(input.filePath, sessionResolveOptions(exec))
-
-      // One stat: type check + size routing + the version recorded as observed.
+      // One stat: absence observation OR type check + size routing + present version.
       // A concurrent write can only make a later guarded mutation fail stale and require reread.
-      const info = await ctx.fs.stat(target, exec.signal)
-      if (!info) throw new FsError(`cannot read "${target.displayPath}": not found`, 'FS_NOT_FOUND')
-      if (info.type !== 'file') throw new FsError(`cannot read "${target.displayPath}": not a regular file`, 'FS_NOT_REGULAR_FILE')
+      const { target, info } = await resolveRegularReadTarget(ctx, exec, input.filePath)
 
       // Stream when the file is large OR size is unknown, so a size-less backend
       // never buffers an arbitrarily large file.
@@ -107,17 +150,44 @@ export function applyReadTool(ctx: Context, caps: ReadToolCaps): void {
         target.displayPath,
       )
 
-      const outcome: FileReadOutcome = {
+      const outcome = {
+        path: target.displayPath,
         offset: input.offset,
         lines: window.lines,
         totalLines: window.totalLines,
-        ...window.truncatedByBytes ? { truncatedByBytes: true } : {},
       }
-      // Record the observed version (a no-op when no policy plugin listens). The
+      // Record the present observation (a no-op when no policy plugin listens). The
       // read already succeeded; an fs/observed listener is contractually a
       // synchronous, side-effect-only recorder.
-      ctx.emit('fs/observed', target, info.version, exec)
-      return [{ type: 'text', text: formatReadOutput(target.displayPath, outcome) }]
+      ctx.emit('fs/observed', target, { kind: 'present', version: info.version }, exec)
+      return outcome
+    },
+    // Result-time display: a `read` card carrying the structured line window a
+    // capable UI renders as a line-numbered, syntax-highlighted view. The
+    // structured data is narrowed from the persisted `meta` (replay-safe); the
+    // envelope-stripped model-facing text rides along as `content` so a UI without
+    // the read capability still shows the file text. A malformed or absent meta,
+    // or a result whose text is not the read envelope, declines to `undefined`
+    // (the generic fallback), never throwing on replay of obsolete logged output.
+    presentResult(_args, result: ToolResult): ReadResultView | undefined {
+      if (result.isError) return undefined
+      const meta = readMetaFromMeta(result.meta)
+      if (meta === undefined) return undefined
+      const only = result.content.length === 1 ? result.content[0] : undefined
+      const text = only?.type === 'text' ? only.text : undefined
+      if (text === undefined) return undefined
+      // Group 1 always captures (possibly empty) when the envelope matches.
+      const body = /^<path>[^\n]*<\/path>\n<type>file<\/type>\n<content>\n([\s\S]*)\n<\/content>$/u.exec(text)?.[1]
+      if (body === undefined) return undefined
+      return {
+        card: 'read',
+        path: meta.path,
+        offset: meta.offset,
+        lines: meta.lines,
+        totalLines: meta.totalLines,
+        ...meta.lang === undefined ? {} : { lang: meta.lang },
+        content: [{ type: 'text', text: body }],
+      }
     },
     // Pure display: a generic card titled by the file with the read window appended (`Read
     // foo.txt (5 - 8)`), `read` kind (icon), and a follow-along location whose line is the

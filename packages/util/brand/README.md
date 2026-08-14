@@ -1,5 +1,7 @@
 # dsh-brand
 
+English | [中文](README.zh.md)
+
 The `Branded<B>` nominal-typing primitive — a tiny, **type-only** package (no runtime code, no harness-package dependency) shared by every package that owns a cross-boundary id.
 
 ## What `Branded` is
@@ -21,6 +23,6 @@ Construction goes through the per-id factory in the owning package. Comparison, 
 
 ## Policy: brand ids that cross package boundaries
 
-A package brands the ids it owns — `CallId` in `dsh-llm`, the shared agent/session `SessionId` in `dsh-session`, and `TaskId` in `dsh-tasks`. Brand cross-package ids that could plausibly be confused; not every string needs one.
+A package brands the ids it owns — `CallId` in `dsh-llm`, the shared agent/session `SessionId` in `dsh-session`, and `JobId` in `dsh-jobs`. Brand cross-package ids that could plausibly be confused; not every string needs one.
 
-This package owns only the primitive. Keeping it dependency-free lets `dsh-tasks`, for example, brand `TaskId` without importing an unrelated capability package merely to reach `Branded`.
+This package owns only the primitive. Keeping it dependency-free lets `dsh-jobs`, for example, brand `JobId` without importing an unrelated capability package merely to reach `Branded`.

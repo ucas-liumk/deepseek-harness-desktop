@@ -18,10 +18,16 @@
       "path": "../../../vendor/schemastery"
     },
     {
+      "path": "../../../native/landlock-run/packages/entry"
+    },
+    {
       "path": "../../llm/llm"
     },
     {
       "path": "../../core/session"
+    },
+    {
+      "path": "../../session/session-title"
     },
     {
       "path": "../../core/system-prompt"
@@ -33,7 +39,7 @@
       "path": "../../skill/skill"
     },
     {
-      "path": "../../skill/skill-local"
+      "path": "../../skill/skill-filesystem"
     },
     {
       "path": "../../skill/tool-skill"
@@ -42,25 +48,43 @@
       "path": "../../core/agent"
     },
     {
-      "path": "../../context/workspace-context"
+      "path": "../../goal/goal"
+    },
+    {
+      "path": "../../goal/tool-goal"
+    },
+    {
+      "path": "../../goal/goal-round-driver"
+    },
+    {
+      "path": "../../context/agent-instructions"
     },
     {
       "path": "../../core/agent-loop"
     },
     {
-      "path": "../../support/invariants"
+      "path": "../../llm/llm-retry"
     },
     {
-      "path": "../../util/home"
+      "path": "../../runtime-diagnostics/invariants"
     },
     {
-      "path": "../../bash/tool-bash"
+      "path": "../../util/home-paths"
     },
     {
-      "path": "../../tasks/tasks"
+      "path": "../../shell/shell-env"
     },
     {
-      "path": "../../tasks/tool-tasks"
+      "path": "../../shell/tool-bash"
+    },
+    {
+      "path": "../../jobs/jobs"
+    },
+    {
+      "path": "../../jobs/jobs-local"
+    },
+    {
+      "path": "../../jobs/tool-jobs"
     }
   ]
 }
