@@ -150,6 +150,7 @@ jobs:
             libssl-dev \
             libwebkit2gtk-4.1-dev \
             libxdo-dev \
+            openbox \
             patchelf \
             xdotool \
             xvfb
@@ -699,16 +700,40 @@ jobs:
           smoke_root="$4"
           ready="$smoke_root/ready"
           log="$smoke_root/app.log"
+          openbox_log="$smoke_root/openbox.log"
           export DSH_DESKTOP_SMOKE_READY_FILE="$ready"
           export XDG_DATA_HOME="$smoke_root/data"
           app_pid=''
-          cleanup_smoke() {
-            if [ -n "$app_pid" ] && kill -0 "$app_pid" 2>/dev/null; then
-              kill -TERM "$app_pid" 2>/dev/null || true
-              wait "$app_pid" 2>/dev/null || true
+          openbox_pid=''
+          terminate_and_reap() {
+            local pid="$1"
+            [ -n "$pid" ] || return 0
+            if kill -0 "$pid" 2>/dev/null; then
+              kill -TERM "$pid" 2>/dev/null || true
             fi
+            wait "$pid" 2>/dev/null || true
+          }
+          cleanup_smoke() {
+            terminate_and_reap "$app_pid"
+            terminate_and_reap "$openbox_pid"
           }
           trap cleanup_smoke EXIT
+          openbox >"$openbox_log" 2>&1 &
+          openbox_pid=$!
+          openbox_ready=0
+          for _ in $(seq 1 80); do
+            kill -0 "$openbox_pid" 2>/dev/null || break
+            if xdotool search --name '^Openbox$' 2>/dev/null | head -n 1 | grep -q .; then
+              openbox_ready=1
+              break
+            fi
+            sleep 0.25
+          done
+          if [ "$openbox_ready" != 1 ]; then
+            echo '::error::Openbox did not become ready'
+            sed -n '1,200p' "$openbox_log" || true
+            exit 1
+          fi
           "$main" >"$log" 2>&1 &
           app_pid=$!
           for _ in $(seq 1 240); do
@@ -758,7 +783,6 @@ jobs:
             done
             [ "$clean" = 1 ] || { echo "::error::$binary remained running after app exit"; exit 1; }
           done
-          trap - EXIT
           SMOKE
           }
 
