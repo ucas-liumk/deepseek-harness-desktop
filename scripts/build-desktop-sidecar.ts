@@ -982,7 +982,10 @@ export async function verifyHostNativeStaging(rootDirectory: string, target: Hos
   if (ripgrepMetadata === undefined || !ripgrepMetadata.isFile() || ripgrepMetadata.size <= 0) {
     throw new Error(`target ripgrep executable is missing: ${ripgrepBinary}`)
   }
-  if (target.platform !== 'win32' && (ripgrepMetadata.mode & 0o111) === 0) {
+  // Windows does not expose portable Unix execute bits. Release builds always
+  // validate a native target on its matching host, while cross-target unit
+  // fixtures may validate Darwin/Linux layouts from a Windows runner.
+  if (target.platform !== 'win32' && process.platform !== 'win32' && (ripgrepMetadata.mode & 0o111) === 0) {
     throw new Error(`target ripgrep executable is not executable: ${ripgrepBinary}`)
   }
   const ripgrepBinEntries = await readdir(join(ripgrepDirectory, 'bin'), { withFileTypes: true })

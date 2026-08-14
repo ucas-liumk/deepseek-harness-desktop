@@ -282,10 +282,19 @@ describe('desktop third-party license bundle', () => {
   })
 
   it('does not derive the embedded runtime from a different pkg-fetch patch version', async () => {
-    await expect(cachedNodeVersion('aarch64-apple-darwin', '24.18.0')).rejects.toThrow(
-      'expected one verified Node 24.18.0 SEA archive',
-    )
-    await expect(cachedNodeVersion('aarch64-apple-darwin', '24.19.0')).resolves.toBe('v24.19.0')
+    const cache = await mkdtemp(join(tmpdir(), 'desktop-node-cache-'))
+    try {
+      const archive = join(cache, 'node-v24.19.0-darwin-arm64.tar.gz')
+      await writeFile(archive, 'fixture')
+      await writeFile(`${archive}.ok`, '')
+      await expect(cachedNodeVersion('aarch64-apple-darwin', '24.18.0', cache)).rejects.toThrow(
+        'expected one verified Node 24.18.0 SEA archive',
+      )
+      await expect(cachedNodeVersion('aarch64-apple-darwin', '24.19.0', cache)).resolves.toBe('v24.19.0')
+    }
+    finally {
+      await rm(cache, { recursive: true, force: true })
+    }
   })
 
   it('records the exact npm package roots and resolved Rust closure with verifiable hashes', async () => {

@@ -45,6 +45,24 @@ jobs:
         with:
           node-version: ${{ env.PRIMARY_NODE_VERSION }}
 
+      # The pinned cargo-audit binary requires glibc 2.39. Keep this audit on
+      # the Ubuntu 24.04 planning runner so the Linux package itself can remain
+      # compatible with the Ubuntu 22.04 / older-glibc release baseline.
+      - name: Audit Rust lockfile
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/cargo-audit-x86_64-unknown-linux-gnu-v0.22.2.tgz"
+          curl --fail --location --proto '=https' --tlsv1.2 \
+            --retry 5 --retry-all-errors --output "$archive" \
+            'https://github.com/rustsec/rustsec/releases/download/cargo-audit%2Fv0.22.2/cargo-audit-x86_64-unknown-linux-gnu-v0.22.2.tgz'
+          printf '%s  %s\n' \
+            ab28a1bdb54db4d5d8ad5981cf1f959410370b3d28250dbd35f6a44248620e39 \
+            "$archive" | sha256sum --check --strict
+          tar -xzf "$archive" -C "$RUNNER_TEMP"
+          "$RUNNER_TEMP/cargo-audit-x86_64-unknown-linux-gnu-v0.22.2/cargo-audit" \
+            audit --file src-tauri/Cargo.lock
+
       - name: Match tag and desktop versions
         id: release
         shell: bash
@@ -146,22 +164,6 @@ jobs:
           const actual = cp.execFileSync('rustc', ['--version'], { encoding: 'utf8' }).trim();
           if (!actual.startsWith('rustc ' + process.env.RUST_TOOLCHAIN_VERSION + ' '))
           throw new Error('Rust version mismatch: ' + actual);"
-
-      - name: Audit Rust lockfile
-        if: runner.os == 'Linux'
-        shell: bash
-        run: |
-          set -euo pipefail
-          archive="$RUNNER_TEMP/cargo-audit-x86_64-unknown-linux-gnu-v0.22.2.tgz"
-          curl --fail --location --proto '=https' --tlsv1.2 \
-            --retry 5 --retry-all-errors --output "$archive" \
-            'https://github.com/rustsec/rustsec/releases/download/cargo-audit%2Fv0.22.2/cargo-audit-x86_64-unknown-linux-gnu-v0.22.2.tgz'
-          printf '%s  %s\n' \
-            ab28a1bdb54db4d5d8ad5981cf1f959410370b3d28250dbd35f6a44248620e39 \
-            "$archive" | sha256sum --check --strict
-          tar -xzf "$archive" -C "$RUNNER_TEMP"
-          "$RUNNER_TEMP/cargo-audit-x86_64-unknown-linux-gnu-v0.22.2/cargo-audit" \
-            audit --file src-tauri/Cargo.lock
 
       - name: Install (immutable)
         run: pnpm install --frozen-lockfile

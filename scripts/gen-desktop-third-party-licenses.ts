@@ -2061,15 +2061,22 @@ async function localNodeLicense(nodeVersion: string, rustTarget: string): Promis
 }
 
 /** Resolve the one concrete, verified Node archive matching an exact SEA target version. */
-export async function cachedNodeVersion(rustTarget: string, expectedVersion = '24.19.0'): Promise<string> {
+export async function cachedNodeVersion(
+  rustTarget: string,
+  expectedVersion = '24.19.0',
+  cache = resolve(homedir(), '.pkg-cache/sea'),
+): Promise<string> {
   const platformArch = rustTarget.includes('apple-darwin')
     ? `darwin-${rustTarget.startsWith('aarch64') ? 'arm64' : 'x64'}`
     : rustTarget.includes('windows')
       ? `win-${rustTarget.startsWith('aarch64') ? 'arm64' : 'x64'}`
       : `linux-${rustTarget.startsWith('aarch64') ? 'arm64' : 'x64'}`
-  const cache = resolve(homedir(), '.pkg-cache/sea')
   const pattern = new RegExp(`^node-(v${expectedVersion.replaceAll('.', '\\.').replaceAll('-', '\\-')})-${platformArch.replaceAll('-', '\\-')}\\.(?:tar\\.gz|zip)$`)
-  const versions = (await readdir(cache))
+  const cacheEntries = await readdir(cache).catch((error: unknown) => {
+    if (isRecord(error) && error.code === 'ENOENT') return []
+    throw error
+  })
+  const versions = cacheEntries
     .flatMap((name) => {
       const match = pattern.exec(name)
       return match?.[1] !== undefined && existsSync(join(cache, `${name}.ok`)) ? [match[1]] : []
