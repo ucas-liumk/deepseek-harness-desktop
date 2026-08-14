@@ -18,6 +18,7 @@ import { homedir } from 'node:os'
 import { basename, dirname, join, relative, resolve, sep } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { parseArgs } from 'node:util'
+import { parse as parseToml, type TomlTableWithoutBigInt, type TomlValueWithoutBigInt } from 'smol-toml'
 import parseSpdx from 'spdx-expression-parse'
 
 const repositoryRoot = resolve(import.meta.dirname, '..')
@@ -101,6 +102,145 @@ const WEBVIEW2_COM_MACROS_REPOSITORY = 'https://github.com/wravery/webview2-rs'
 const WEBVIEW2_COM_MACROS_COMMIT = 'dffa41a8a46d3f5565eefbff2de57d38d399f158'
 const WEBVIEW2_COM_MACROS_LICENSE_SHA256 = '0dcf41516e608bbcb6cdc5229feb7b86fe4a643b85e7df251133c93408fdac73'
 const WEBVIEW2_COM_MACROS_LICENSE_NAME = 'webview2-com-macros-0.8.1-LICENSE'
+const CARGO_REGISTRY_SOURCE = 'registry+https://github.com/rust-lang/crates.io-index'
+const DLOPEN2_REPOSITORY = 'https://github.com/OpenByteDev/dlopen2'
+const DLOPEN2_COMMIT = 'cc80e4a0a90d499b677fdf7743699b4b3a43a989'
+const DLOPEN2_LICENSE_SHA256 = '39fa265207450e77c62e90c5594a06c085b655d8374c7ced4bf7894b6bd95dd2'
+const DLOPEN2_LICENSE_NAME = `dlopen2-${DLOPEN2_COMMIT}-LICENSE`
+const DLOPEN2_COPYRIGHT_LINES = [
+  'Copyright (c) 2017 Szymon Wieloch',
+  'Copyright (C) 2019 Ahmed Masud <ahmed.masud@saf.ai>',
+  'Copyright (C) 2022 OpenByte <development.openbyte@gmail.com>',
+] as const
+const LIBAPPINDICATOR_REPOSITORY = 'https://github.com/tauri-apps/libappindicator-rs'
+const LIBAPPINDICATOR_COMMIT = 'eafd1e3682a1247f595410266091e9684021cb6f'
+
+interface ReviewedCargoIdentity {
+  readonly name: string
+  readonly version: string
+  readonly checksum: string
+  readonly vcsCommit: string
+  readonly pathInVcs: string
+}
+
+interface ReviewedCargoUpstreamLicense extends ReviewedCargoIdentity {
+  readonly repository: string
+  readonly licenseExpression: string
+  readonly licenseName: string
+  readonly licenseUrl: string
+  readonly licenseSha256: string
+  readonly copyrightLines: readonly string[]
+}
+
+interface ReviewedCargoVcsSiblingDonor {
+  readonly source: ReviewedCargoIdentity
+  readonly donor: ReviewedCargoIdentity
+  readonly repository: string
+  readonly licenseExpression: string
+  readonly files: readonly {
+    readonly name: string
+    readonly sha256: string
+  }[]
+  readonly copyrightLines: readonly string[]
+}
+
+// These published crates omit their repository-root LICENSE. Each fallback is
+// tied to the exact registry archive and VCS revision that Cargo recorded.
+const REVIEWED_CARGO_UPSTREAM_LICENSES: readonly ReviewedCargoUpstreamLicense[] = [
+  {
+    name: 'webview2-com-macros',
+    version: WEBVIEW2_COM_MACROS_VERSION,
+    repository: WEBVIEW2_COM_MACROS_REPOSITORY,
+    licenseExpression: 'MIT',
+    checksum: '67a921c1b6914c367b2b823cd4cde6f96beec77d30a939c8199bb377cf9b9b54',
+    vcsCommit: WEBVIEW2_COM_MACROS_COMMIT,
+    pathInVcs: 'crates/callback-macros',
+    licenseName: WEBVIEW2_COM_MACROS_LICENSE_NAME,
+    licenseUrl: `https://raw.githubusercontent.com/wravery/webview2-rs/${WEBVIEW2_COM_MACROS_COMMIT}/LICENSE`,
+    licenseSha256: WEBVIEW2_COM_MACROS_LICENSE_SHA256,
+    copyrightLines: ['Copyright (c) 2021 Bill Avery'],
+  },
+  {
+    name: 'dlopen2',
+    version: '0.8.2',
+    repository: DLOPEN2_REPOSITORY,
+    licenseExpression: 'MIT',
+    checksum: '5e2c5bd4158e66d1e215c49b837e11d62f3267b30c92f1d171c4d3105e3dc4d4',
+    vcsCommit: DLOPEN2_COMMIT,
+    pathInVcs: 'dlopen2',
+    licenseName: DLOPEN2_LICENSE_NAME,
+    licenseUrl: `https://raw.githubusercontent.com/OpenByteDev/dlopen2/${DLOPEN2_COMMIT}/LICENSE`,
+    licenseSha256: DLOPEN2_LICENSE_SHA256,
+    copyrightLines: DLOPEN2_COPYRIGHT_LINES,
+  },
+  {
+    name: 'dlopen2_derive',
+    version: '0.4.3',
+    repository: DLOPEN2_REPOSITORY,
+    licenseExpression: 'MIT',
+    checksum: '0fbbb781877580993a8707ec48672673ec7b81eeba04cfd2310bd28c08e47c8f',
+    vcsCommit: DLOPEN2_COMMIT,
+    pathInVcs: 'dlopen2-derive',
+    licenseName: DLOPEN2_LICENSE_NAME,
+    licenseUrl: `https://raw.githubusercontent.com/OpenByteDev/dlopen2/${DLOPEN2_COMMIT}/LICENSE`,
+    licenseSha256: DLOPEN2_LICENSE_SHA256,
+    copyrightLines: DLOPEN2_COPYRIGHT_LINES,
+  },
+]
+const REVIEWED_CARGO_UPSTREAM_BY_NAME = new Map(
+  REVIEWED_CARGO_UPSTREAM_LICENSES.map(spec => [spec.name, spec] as const),
+)
+const REVIEWED_CARGO_VCS_SIBLING_DONORS: readonly ReviewedCargoVcsSiblingDonor[] = [
+  {
+    source: {
+      name: 'libappindicator-sys',
+      version: '0.9.0',
+      checksum: '6e9ec52138abedcc58dc17a7c6c0c00a2bdb4f3427c7f63fa97fd0d859155caf',
+      vcsCommit: LIBAPPINDICATOR_COMMIT,
+      pathInVcs: 'sys',
+    },
+    donor: {
+      name: 'libappindicator',
+      version: '0.9.0',
+      checksum: '03589b9607c868cc7ae54c0b2a22c8dc03dd41692d48f2d7df73615c6a95dc0a',
+      vcsCommit: LIBAPPINDICATOR_COMMIT,
+      pathInVcs: '',
+    },
+    repository: LIBAPPINDICATOR_REPOSITORY,
+    licenseExpression: 'Apache-2.0 OR MIT',
+    files: [
+      { name: 'LICENSE-APACHE', sha256: 'a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2' },
+      { name: 'LICENSE-MIT', sha256: 'eb227437252b2a7a9c1fc342c93ade1f3d7ce38cc6dd754f613db07d53ceff0b' },
+    ],
+    copyrightLines: [
+      'Copyright (c) 2017-2021 qDot',
+      'Copyright (c) 2021 Tauri Apps Contributors',
+    ],
+  },
+]
+const REVIEWED_CARGO_VCS_SIBLING_BY_SOURCE = new Map(
+  REVIEWED_CARGO_VCS_SIBLING_DONORS.map(spec => [spec.source.name, spec] as const),
+)
+const REQUIRED_REVIEWED_CARGO_IDS_BY_TARGET = new Map<string, readonly string[]>([
+  ['aarch64-apple-darwin', []],
+  ['x86_64-pc-windows-msvc', [
+    'cargo:webview2-com-macros@0.8.1',
+  ]],
+  ['x86_64-unknown-linux-gnu', [
+    'cargo:dlopen2@0.8.2',
+    'cargo:dlopen2_derive@0.4.3',
+    'cargo:libappindicator@0.9.0',
+    'cargo:libappindicator-sys@0.9.0',
+  ]],
+])
+
+function requiredReviewedCargoIds(rustTarget: string): readonly string[] {
+  const required = REQUIRED_REVIEWED_CARGO_IDS_BY_TARGET.get(rustTarget)
+  if (required === undefined) {
+    throw new Error(`desktop licenses: unsupported reviewed Cargo target ${rustTarget}.`)
+  }
+  return required
+}
 
 const RIPGREP_COMMON_CRATES = [
   'aho-corasick@1.1.3', 'anyhow@1.0.100', 'bstr@1.12.0', 'cc@1.2.41', 'cfg-if@1.0.4',
@@ -239,6 +379,24 @@ interface RawPackage {
   readonly repository?: string
   readonly packageDirectory: string
   readonly originalTextFiles: string[]
+  readonly reviewedCargoProvenance?: ReviewedCargoProvenance
+  readonly reviewedTextSources?: TextSource[]
+}
+
+interface ReviewedCargoProvenance {
+  readonly source: string
+  readonly checksum: string
+  readonly vcsCommit: string
+  readonly pathInVcs: string
+  readonly siblingDonor?: {
+    readonly name: string
+    readonly version: string
+    readonly repository: string
+    readonly source: string
+    readonly checksum: string
+    readonly vcsCommit: string
+    readonly pathInVcs: string
+  }
 }
 
 interface TextSource {
@@ -266,6 +424,7 @@ export interface LicenseManifestEntry {
   readonly repository?: string
   readonly copyrightLines: string[]
   readonly files: OutputFile[]
+  readonly reviewedCargoProvenance?: ReviewedCargoProvenance
 }
 
 interface GenerateOptions {
@@ -1015,41 +1174,194 @@ async function collectNpm(npmRoot: string, rustTarget: string): Promise<RawPacka
   return packages
 }
 
+function isTomlTable(value: TomlValueWithoutBigInt | undefined): value is TomlTableWithoutBigInt {
+  return value !== undefined && typeof value === 'object' && !Array.isArray(value)
+}
+
+function cargoLockPackages(text: string): TomlTableWithoutBigInt[] {
+  let document: TomlTableWithoutBigInt
+  try {
+    document = parseToml(text, { integersAsBigInt: false })
+  } catch (error) {
+    throw new Error(`desktop licenses: could not parse Cargo.lock: ${failureSummary(error)}`)
+  }
+  if (document.package === undefined) return []
+  if (!Array.isArray(document.package) || !document.package.every(isTomlTable)) {
+    throw new Error('desktop licenses: Cargo.lock package records are malformed.')
+  }
+  return document.package
+}
+
+function reviewedCargoLockProvenance(
+  packages: readonly TomlTableWithoutBigInt[],
+  spec: ReviewedCargoIdentity,
+): Pick<ReviewedCargoProvenance, 'source' | 'checksum'> {
+  const id = `cargo:${spec.name}@${spec.version}`
+  const matches = packages.filter(row => row.name === spec.name && row.version === spec.version)
+  if (matches.length !== 1) {
+    throw new Error(`desktop licenses: ${id} must have one unique Cargo.lock package record; found ${String(matches.length)}.`)
+  }
+  const [row] = matches
+  if (row?.source !== CARGO_REGISTRY_SOURCE || row.checksum !== spec.checksum) {
+    throw new Error(`desktop licenses: ${id} does not match its reviewed registry checksum.`)
+  }
+  return { source: CARGO_REGISTRY_SOURCE, checksum: spec.checksum }
+}
+
+async function reviewedCargoVcsProvenance(
+  packageDirectory: string,
+  spec: ReviewedCargoIdentity,
+): Promise<Pick<ReviewedCargoProvenance, 'vcsCommit' | 'pathInVcs'>> {
+  const id = `cargo:${spec.name}@${spec.version}`
+  let document: unknown
+  try {
+    document = JSON.parse(await readFile(join(packageDirectory, '.cargo_vcs_info.json'), 'utf8'))
+  } catch (error) {
+    throw new Error(`desktop licenses: ${id} lacks valid reviewed VCS provenance: ${failureSummary(error)}`)
+  }
+  if (document === null || typeof document !== 'object' || Array.isArray(document)) {
+    throw new Error(`desktop licenses: ${id} lacks valid reviewed VCS provenance.`)
+  }
+  const row = document as Record<string, unknown>
+  const git = row.git
+  if (git === null || typeof git !== 'object' || Array.isArray(git)
+    || (git as Record<string, unknown>).sha1 !== spec.vcsCommit
+    || row.path_in_vcs !== spec.pathInVcs) {
+    throw new Error(`desktop licenses: ${id} does not match its reviewed VCS commit and path.`)
+  }
+  return { vcsCommit: spec.vcsCommit, pathInVcs: spec.pathInVcs }
+}
+
+interface AuditedCargoUpstream {
+  readonly files: string[]
+  readonly provenance: ReviewedCargoProvenance
+}
+
+interface AuditedCargoVcsSibling {
+  readonly textSources: TextSource[]
+  readonly provenance: ReviewedCargoProvenance
+}
+
+function reviewedResolvedCargoPackage(
+  metadata: CargoMetadata,
+  resolved: ReadonlySet<string>,
+  identity: ReviewedCargoIdentity,
+): CargoPackage {
+  const id = `cargo:${identity.name}@${identity.version}`
+  const matches = metadata.packages.filter(row => (
+    resolved.has(row.id) && row.name === identity.name && row.version === identity.version
+  ))
+  if (matches.length !== 1 || matches[0] === undefined) {
+    throw new Error(`desktop licenses: reviewed VCS sibling ${id} must resolve exactly once; found ${String(matches.length)}.`)
+  }
+  return matches[0]
+}
+
+function validateVcsSiblingManifest(
+  manifest: CargoPackage,
+  identity: ReviewedCargoIdentity,
+  spec: ReviewedCargoVcsSiblingDonor,
+): void {
+  const id = `cargo:${identity.name}@${identity.version}`
+  if (manifest.name !== identity.name
+    || manifest.version !== identity.version
+    || normalizeExpression(manifest.license ?? '') !== spec.licenseExpression
+    || manifest.repository !== null
+    || manifest.homepage !== null
+    || manifest.source !== CARGO_REGISTRY_SOURCE) {
+    throw new Error(`desktop licenses: ${id} does not match its reviewed registry/SPDX VCS sibling provenance.`)
+  }
+}
+
+async function auditedCargoVcsSibling(
+  manifest: CargoPackage,
+  metadata: CargoMetadata,
+  resolved: ReadonlySet<string>,
+  cargoLock: readonly TomlTableWithoutBigInt[],
+): Promise<AuditedCargoVcsSibling | undefined> {
+  const spec = REVIEWED_CARGO_VCS_SIBLING_BY_SOURCE.get(manifest.name)
+  if (spec === undefined) return undefined
+  const id = `cargo:${manifest.name}@${manifest.version}`
+  if (manifest.version !== spec.source.version) {
+    throw new Error(`desktop licenses: ${id} needs a reviewed VCS sibling license donor.`)
+  }
+  validateVcsSiblingManifest(manifest, spec.source, spec)
+  const donor = reviewedResolvedCargoPackage(metadata, resolved, spec.donor)
+  validateVcsSiblingManifest(donor, spec.donor, spec)
+  const sourceLocked = reviewedCargoLockProvenance(cargoLock, spec.source)
+  const donorLocked = reviewedCargoLockProvenance(cargoLock, spec.donor)
+  const sourceVcs = await reviewedCargoVcsProvenance(dirname(manifest.manifest_path), spec.source)
+  const donorVcs = await reviewedCargoVcsProvenance(dirname(donor.manifest_path), spec.donor)
+  const donorFiles = await directTextFiles(dirname(donor.manifest_path), donor.license_file)
+  const donorFilesByName = new Map(donorFiles.map(path => [basename(path), path] as const))
+  if (donorFiles.length !== spec.files.length
+    || spec.files.some(file => !donorFilesByName.has(file.name))) {
+    throw new Error(`desktop licenses: ${id} reviewed VCS sibling donor has an unexpected license-text closure.`)
+  }
+  for (const file of spec.files) {
+    const path = donorFilesByName.get(file.name)
+    if (path === undefined || sha256(await readFile(path)) !== file.sha256) {
+      throw new Error(`desktop licenses: ${id} reviewed VCS sibling donor ${file.name} changed or is corrupted.`)
+    }
+  }
+  return {
+    textSources: spec.files.map(file => ({
+      sourcePath: donorFilesByName.get(file.name) as string,
+      origin: 'repository-sibling',
+      sourcePackage: `cargo:${spec.donor.name}@${spec.donor.version}`,
+    })),
+    provenance: {
+      ...sourceLocked,
+      ...sourceVcs,
+      siblingDonor: {
+        name: spec.donor.name,
+        version: spec.donor.version,
+        repository: spec.repository,
+        ...donorLocked,
+        ...donorVcs,
+      },
+    },
+  }
+}
+
 async function auditedCargoUpstreamFiles(
   manifest: CargoPackage,
+  cargoLock: readonly TomlTableWithoutBigInt[],
   pinnedTextCache: string,
   pinnedTextFetch?: FetchRetryDependencies['fetch'],
-): Promise<string[] | undefined> {
-  if (manifest.name !== 'webview2-com-macros') return undefined
+): Promise<AuditedCargoUpstream | undefined> {
+  const spec = REVIEWED_CARGO_UPSTREAM_BY_NAME.get(manifest.name)
+  if (spec === undefined) return undefined
   const id = `cargo:${manifest.name}@${manifest.version}`
-  if (manifest.version !== WEBVIEW2_COM_MACROS_VERSION) {
+  if (manifest.version !== spec.version) {
     throw new Error(`desktop licenses: ${id} needs a reviewed upstream license-text pin.`)
   }
   const repository = manifest.repository ?? manifest.homepage
-  if (normalizeExpression(manifest.license ?? '') !== 'MIT'
-    || repository !== WEBVIEW2_COM_MACROS_REPOSITORY
-    || !manifest.source?.startsWith('registry+')) {
-    throw new Error(`desktop licenses: ${id} does not match its reviewed MIT registry provenance.`)
+  if (normalizeExpression(manifest.license ?? '') !== spec.licenseExpression
+    || repository !== spec.repository
+    || manifest.source !== CARGO_REGISTRY_SOURCE) {
+    throw new Error(`desktop licenses: ${id} does not match its reviewed ${spec.licenseExpression} registry provenance.`)
   }
-  // Cargo.lock fixes the published crate to SHA-256
-  // 67a921c1b6914c367b2b823cd4cde6f96beec77d30a939c8199bb377cf9b9b54.
-  // Its .cargo_vcs_info.json identifies this commit; the crate omits the
-  // workspace-root LICENSE, so package that exact, independently hashed file.
-  return [await pinnedUpstreamText(
-    WEBVIEW2_COM_MACROS_LICENSE_NAME,
-    `https://raw.githubusercontent.com/wravery/webview2-rs/${WEBVIEW2_COM_MACROS_COMMIT}/LICENSE`,
-    WEBVIEW2_COM_MACROS_LICENSE_SHA256,
+  const locked = reviewedCargoLockProvenance(cargoLock, spec)
+  const vcs = await reviewedCargoVcsProvenance(dirname(manifest.manifest_path), spec)
+  const license = await pinnedUpstreamText(
+    spec.licenseName,
+    spec.licenseUrl,
+    spec.licenseSha256,
     pinnedTextCache,
     pinnedTextFetch,
-  )]
+  )
+  return { files: [license], provenance: { ...locked, ...vcs } }
 }
 
 async function collectCargo(
   metadata: CargoMetadata,
+  cargoLockText: string,
   pinnedTextCache = PINNED_SOURCE_DIRECTORY,
   pinnedTextFetch?: FetchRetryDependencies['fetch'],
 ): Promise<RawPackage[]> {
   if (metadata.resolve === null) throw new Error('desktop licenses: Cargo metadata has no resolved dependency graph.')
+  const cargoLock = cargoLockPackages(cargoLockText)
   const resolved = new Set(metadata.resolve.nodes.map(node => node.id))
   const workspace = new Set(metadata.workspace_members)
   const packages: RawPackage[] = []
@@ -1061,7 +1373,11 @@ async function collectCargo(
     licenseIdentifiers(manifest.license)
     const packageDirectory = dirname(manifest.manifest_path)
     const repository = manifest.repository ?? manifest.homepage ?? undefined
-    const auditedUpstreamFiles = await auditedCargoUpstreamFiles(manifest, pinnedTextCache, pinnedTextFetch)
+    const auditedSibling = await auditedCargoVcsSibling(manifest, metadata, resolved, cargoLock)
+    const auditedUpstream = auditedSibling === undefined
+      ? await auditedCargoUpstreamFiles(manifest, cargoLock, pinnedTextCache, pinnedTextFetch)
+      : undefined
+    const reviewedCargoProvenance = auditedSibling?.provenance ?? auditedUpstream?.provenance
     packages.push({
       ecosystem: 'cargo',
       name: manifest.name,
@@ -1070,8 +1386,11 @@ async function collectCargo(
       authors: [...manifest.authors].sort(),
       ...repository === undefined ? {} : { repository },
       packageDirectory,
-      originalTextFiles: auditedUpstreamFiles
-        ?? await directTextFiles(packageDirectory, manifest.license_file),
+      originalTextFiles: auditedSibling === undefined
+        ? auditedUpstream?.files ?? await directTextFiles(packageDirectory, manifest.license_file)
+        : [],
+      ...(auditedSibling === undefined ? {} : { reviewedTextSources: auditedSibling.textSources }),
+      ...(reviewedCargoProvenance === undefined ? {} : { reviewedCargoProvenance }),
     })
   }
   return packages.sort(comparePackage)
@@ -1098,6 +1417,7 @@ function textSourcesForPackage(
   projectLicense: string,
   pinnedTextCache = PINNED_SOURCE_DIRECTORY,
 ): TextSource[] {
+  if (row.reviewedTextSources !== undefined) return row.reviewedTextSources
   if (row.originalTextFiles.length > 0) {
     const pinnedDirectories = new Set([resolve(PINNED_SOURCE_DIRECTORY), resolve(pinnedTextCache)])
     return row.originalTextFiles.map(sourcePath => ({
@@ -1221,6 +1541,7 @@ async function writePackage(
     ...(row.repository === undefined ? {} : { repository: row.repository }),
     copyrightLines: copyrightLines(texts, row.authors),
     files,
+    ...(row.reviewedCargoProvenance === undefined ? {} : { reviewedCargoProvenance: row.reviewedCargoProvenance }),
   }
   await writeFile(join(packageDirectory, 'METADATA.json'), `${JSON.stringify(entry, null, 2)}\n`)
   return entry
@@ -2030,8 +2351,9 @@ export async function generateDesktopLicenseBundle(options: GenerateOptions): Pr
     throw new Error(`desktop licenses: refusing to clear unsafe output ${output}`)
   }
   const pinnedTextCache = resolve(options.pinnedTextCache ?? PINNED_SOURCE_DIRECTORY)
+  const cargoLock = await readFile(options.cargoLock)
   const npm = await collectNpm(resolve(options.npmRoot), options.rustTarget)
-  const cargo = await collectCargo(options.cargoMetadata, pinnedTextCache, options.pinnedTextFetch)
+  const cargo = await collectCargo(options.cargoMetadata, cargoLock.toString('utf8'), pinnedTextCache, options.pinnedTextFetch)
   const packages = [...npm, ...cargo, ...(options.supplementalPackages ?? [])].sort(comparePackage)
   const seen = new Map<string, RawPackage>()
   for (const row of packages) {
@@ -2065,7 +2387,7 @@ export async function generateDesktopLicenseBundle(options: GenerateOptions): Pr
   const manifest = {
     schemaVersion: 2,
     rustTarget: options.rustTarget,
-    cargoLockSha256: sha256(await readFile(options.cargoLock)),
+    cargoLockSha256: sha256(cargoLock),
     packageCount: entries.length,
     npmPackageCount: entries.filter(row => row.ecosystem === 'npm').length,
     cargoPackageCount: entries.filter(row => row.ecosystem === 'cargo').length,
@@ -2266,6 +2588,7 @@ export async function verifyDesktopLicenseBundle(directory: string): Promise<voi
     || typeof manifest.rustTarget !== 'string' || manifest.rustTarget === '') {
     throw new Error('desktop licenses: invalid or empty manifest.')
   }
+  const requiredReviewedIds = requiredReviewedCargoIds(manifest.rustTarget)
   const packageIds = new Set<string>()
   const metadataPaths = new Set(actualPaths.filter(path => path.endsWith('/METADATA.json')))
   for (const row of manifest.packages) {
@@ -2276,19 +2599,87 @@ export async function verifyDesktopLicenseBundle(directory: string): Promise<voi
     if (!Array.isArray(row.files) || row.files.length === 0) {
       throw new Error(`desktop licenses: ${id} has no license text.`)
     }
-    if (row.ecosystem === 'cargo' && row.name === 'webview2-com-macros') {
+    const reviewedSibling = row.ecosystem === 'cargo'
+      ? REVIEWED_CARGO_VCS_SIBLING_BY_SOURCE.get(row.name)
+      : undefined
+    if (reviewedSibling !== undefined) {
+      const donorId = `cargo:${reviewedSibling.donor.name}@${reviewedSibling.donor.version}`
+      const donor = manifest.packages.find(candidate => (
+        candidate.ecosystem === 'cargo'
+        && candidate.name === reviewedSibling.donor.name
+        && candidate.version === reviewedSibling.donor.version
+      ))
+      const sourceFilesMatch = row.files.length === reviewedSibling.files.length
+        && reviewedSibling.files.every((expected) => {
+          const matches = row.files.filter(file => file.sourceName === expected.name)
+          const [file] = matches
+          return matches.length === 1
+            && file?.origin === 'repository-sibling'
+            && file.sourcePackage === donorId
+            && file.licenseId === undefined
+            && file.sha256 === expected.sha256
+        })
+      const donorFilesMatch = donor?.files.length === reviewedSibling.files.length
+        && reviewedSibling.files.every((expected) => {
+          const matches = donor.files.filter(file => file.sourceName === expected.name)
+          const [file] = matches
+          return matches.length === 1
+            && file?.origin === 'package'
+            && file.sourcePackage === donorId
+            && file.licenseId === undefined
+            && file.sha256 === expected.sha256
+        })
+      const expectedProvenance: ReviewedCargoProvenance = {
+        source: CARGO_REGISTRY_SOURCE,
+        checksum: reviewedSibling.source.checksum,
+        vcsCommit: reviewedSibling.source.vcsCommit,
+        pathInVcs: reviewedSibling.source.pathInVcs,
+        siblingDonor: {
+          name: reviewedSibling.donor.name,
+          version: reviewedSibling.donor.version,
+          repository: reviewedSibling.repository,
+          source: CARGO_REGISTRY_SOURCE,
+          checksum: reviewedSibling.donor.checksum,
+          vcsCommit: reviewedSibling.donor.vcsCommit,
+          pathInVcs: reviewedSibling.donor.pathInVcs,
+        },
+      }
+      if (row.version !== reviewedSibling.source.version
+        || row.licenseExpression !== reviewedSibling.licenseExpression
+        || row.repository !== undefined
+        || !sourceFilesMatch
+        || JSON.stringify(row.reviewedCargoProvenance) !== JSON.stringify(expectedProvenance)
+        || !reviewedSibling.copyrightLines.every(line => row.copyrightLines.includes(line))
+        || donor === undefined
+        || donor.licenseExpression !== reviewedSibling.licenseExpression
+        || donor.repository !== undefined
+        || !donorFilesMatch
+        || !reviewedSibling.copyrightLines.every(line => donor.copyrightLines.includes(line))) {
+        throw new Error(`desktop licenses: ${id} does not contain its fixed reviewed VCS sibling licenses.`)
+      }
+    }
+    const reviewedCargo = row.ecosystem === 'cargo'
+      ? REVIEWED_CARGO_UPSTREAM_BY_NAME.get(row.name)
+      : undefined
+    if (reviewedCargo !== undefined) {
       const [licenseFile] = row.files
-      if (row.version !== WEBVIEW2_COM_MACROS_VERSION
-        || row.licenseExpression !== 'MIT'
-        || row.repository !== WEBVIEW2_COM_MACROS_REPOSITORY
+      if (row.version !== reviewedCargo.version
+        || row.licenseExpression !== reviewedCargo.licenseExpression
+        || row.repository !== reviewedCargo.repository
         || row.files.length !== 1
         || licenseFile?.origin !== 'pinned-upstream'
-        || licenseFile.sourceName !== WEBVIEW2_COM_MACROS_LICENSE_NAME
-        || licenseFile.sourcePackage !== `cargo:webview2-com-macros@${WEBVIEW2_COM_MACROS_VERSION}`
+        || licenseFile.sourceName !== reviewedCargo.licenseName
+        || licenseFile.sourcePackage !== `cargo:${reviewedCargo.name}@${reviewedCargo.version}`
         || licenseFile.licenseId !== undefined
-        || licenseFile.sha256 !== WEBVIEW2_COM_MACROS_LICENSE_SHA256
+        || licenseFile.sha256 !== reviewedCargo.licenseSha256
+        || JSON.stringify(row.reviewedCargoProvenance) !== JSON.stringify({
+          source: CARGO_REGISTRY_SOURCE,
+          checksum: reviewedCargo.checksum,
+          vcsCommit: reviewedCargo.vcsCommit,
+          pathInVcs: reviewedCargo.pathInVcs,
+        })
         || !Array.isArray(row.copyrightLines)
-        || !row.copyrightLines.includes('Copyright (c) 2021 Bill Avery')) {
+        || !reviewedCargo.copyrightLines.every(line => row.copyrightLines.includes(line))) {
         throw new Error(`desktop licenses: ${id} does not contain its fixed reviewed upstream LICENSE.`)
       }
     }
@@ -2307,6 +2698,13 @@ export async function verifyDesktopLicenseBundle(directory: string): Promise<voi
         throw new Error(`desktop licenses: manifest hash mismatch for ${file.path}`)
       }
     }
+  }
+  const missingRequiredReviewedCargoIds = requiredReviewedIds.filter(id => !packageIds.has(id))
+  if (missingRequiredReviewedCargoIds.length > 0) {
+    throw new Error(
+      `desktop licenses: ${manifest.rustTarget} is missing required reviewed Cargo packages: `
+      + missingRequiredReviewedCargoIds.join(', '),
+    )
   }
   if (metadataPaths.size > 0) {
     throw new Error(`desktop licenses: unreferenced package metadata: ${[...metadataPaths].sort().join(', ')}`)

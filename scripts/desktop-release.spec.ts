@@ -161,6 +161,20 @@ describe('desktop release workflow', () => {
 
   it('silently installs, starts, closes, checks, and uninstalls the final NSIS package', () => {
     const source = stringField(step(job(jobs, 'build'), 'Package and verify unsigned Windows x64 installer'), 'run')
+    expect(source).toContain('function Assert-NsisInstallerPe([string]$Path)')
+    expect(source).toContain('has no DOS MZ signature')
+    expect(source).toContain('has no PE signature')
+    expect(source.match(/\$machine = Get-PeMachine \$Path/g)).toHaveLength(2)
+    expect(source).toContain('if ($machine -ne 0x014c)')
+    expect(source).toContain('expected the pinned NSIS 32-bit bootstrap (0x014c)')
+    expect(source.match(/^\s*Assert-NsisInstallerPe \$installer$/gm)).toHaveLength(1)
+    expect(source).not.toContain('Assert-X64Pe $installer')
+    expect(source.match(/^\s*Assert-X64Pe \$\w+$/gm)?.map(line => line.trim())).toEqual([
+      'Assert-X64Pe $main',
+      'Assert-X64Pe $backend',
+      'Assert-X64Pe $installedMain',
+      'Assert-X64Pe $installedBackend',
+    ])
     expect(source.match(/\$sevenZip = Get-Command 7z/g)).toHaveLength(1)
     expect(source).toContain("-ArgumentList @('/S', \"/D=$installRoot\") -Wait -PassThru")
     expect(source).toContain('$env:DSH_DESKTOP_SMOKE_READY_FILE = $ready')

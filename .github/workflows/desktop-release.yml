@@ -493,14 +493,27 @@ jobs:
           VERSION: ${{ needs.plan.outputs.version }}
         run: |
           $ErrorActionPreference = 'Stop'
-          function Assert-X64Pe([string]$Path) {
+          function Get-PeMachine([string]$Path) {
             if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { throw "$Path is missing" }
             $bytes = [IO.File]::ReadAllBytes($Path)
             if ($bytes.Length -lt 64) { throw "$Path is not a PE executable" }
-            $header = [BitConverter]::ToInt32($bytes, 0x3c)
-            if ($header -lt 0 -or $header + 6 -gt $bytes.Length) { throw "$Path has an invalid PE header" }
+            if ($bytes[0] -ne 0x4d -or $bytes[1] -ne 0x5a) { throw "$Path has no DOS MZ signature" }
+            $header = [BitConverter]::ToUInt32($bytes, 0x3c)
+            if ([uint64]$header + 24 -gt $bytes.Length) { throw "$Path has an invalid PE header" }
             if ([Text.Encoding]::ASCII.GetString($bytes, $header, 4) -ne "PE`0`0") { throw "$Path has no PE signature" }
-            if ([BitConverter]::ToUInt16($bytes, $header + 4) -ne 0x8664) { throw "$Path is not Windows x64" }
+            return [BitConverter]::ToUInt16($bytes, $header + 4)
+          }
+          function Assert-X64Pe([string]$Path) {
+            $machine = Get-PeMachine $Path
+            if ($machine -ne 0x8664) {
+              throw "$Path has PE Machine 0x$($machine.ToString('x4')); expected Windows x64 (0x8664)"
+            }
+          }
+          function Assert-NsisInstallerPe([string]$Path) {
+            $machine = Get-PeMachine $Path
+            if ($machine -ne 0x014c) {
+              throw "$Path has PE Machine 0x$($machine.ToString('x4')); expected the pinned NSIS 32-bit bootstrap (0x014c)"
+            }
           }
           function Wait-ReadyFile([string]$Path, [Diagnostics.Process]$Process, [int]$TimeoutSeconds = 60) {
             $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
@@ -532,7 +545,7 @@ jobs:
           $installers = @(Get-ChildItem 'src-tauri/target/release/bundle/nsis' -File -Filter '*.exe')
           if ($installers.Count -ne 1) { throw "expected one NSIS installer, found $($installers.Count)" }
           $installer = $installers[0].FullName
-          Assert-X64Pe $installer
+          Assert-NsisInstallerPe $installer
           $sevenZip = Get-Command 7z -ErrorAction SilentlyContinue
           if ($null -eq $sevenZip) { throw '7z is required to inspect the NSIS installer payload' }
           $extractRoot = Join-Path $env:RUNNER_TEMP 'nsis-package'
