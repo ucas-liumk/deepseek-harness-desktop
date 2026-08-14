@@ -23,6 +23,28 @@ Copyright (c) Fixture Author
 
 Permission is hereby granted, free of charge, to any person obtaining a copy.
 `
+const WEBVIEW2_COM_MACROS_LICENSE = `MIT License
+
+Copyright (c) 2021 Bill Avery
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+`
 
 interface Fixture {
   readonly root: string
@@ -96,7 +118,16 @@ function cargoMetadata(cargoDirectory: string, license = 'MIT'): Parameters<type
   }
 }
 
-async function generate(row: Fixture, metadata = cargoMetadata(row.cargo)): Promise<LicenseManifestEntry[]> {
+type GenerateOverrides = Pick<
+  Parameters<typeof generateDesktopLicenseBundle>[0],
+  'pinnedTextCache' | 'pinnedTextFetch'
+>
+
+async function generate(
+  row: Fixture,
+  metadata = cargoMetadata(row.cargo),
+  overrides: GenerateOverrides = {},
+): Promise<LicenseManifestEntry[]> {
   return await generateDesktopLicenseBundle({
     npmRoot: row.npm,
     cargoMetadata: metadata,
@@ -104,6 +135,7 @@ async function generate(row: Fixture, metadata = cargoMetadata(row.cargo)): Prom
     projectLicense: row.projectLicense,
     output: row.output,
     rustTarget: 'fixture-target',
+    ...overrides,
   })
 }
 
@@ -374,6 +406,165 @@ describe('desktop third-party license bundle', () => {
       await writeFile(join(row.cargo, 'Cargo.toml'), '[package]\nname = "dependency"\nversion = "2.0.0"\n')
       await writeFile(join(row.cargo, 'LICENSE'), MIT)
       await expect(generate(row)).rejects.toThrow('unreviewed or forbidden SPDX term GPL-3.0-only')
+    } finally {
+      await rm(row.root, { recursive: true, force: true })
+    }
+  })
+
+  it('packages original text for the reviewed Apache-2.0 WITH LLVM-exception pair', async () => {
+    const row = await fixture()
+    const licenseText = `Apache License
+Version 2.0, January 2004
+
+LLVM Exceptions to the Apache 2.0 License
+`
+    try {
+      await npmPackage(row.npm, 'llvm-exception-runtime', {
+        version: '1.0.0',
+        license: 'Apache-2.0 WITH LLVM-exception',
+      }, licenseText)
+      await writeFile(join(row.cargo, 'Cargo.toml'), '[package]\nname = "dependency"\nversion = "2.0.0"\n')
+      await writeFile(join(row.cargo, 'LICENSE'), MIT)
+
+      const entries = await generate(row)
+      const entry = entries.find(candidate => candidate.name === 'llvm-exception-runtime')
+      expect(entry?.licenseExpression).toBe('Apache-2.0 WITH LLVM-exception')
+      expect(entry?.files).toHaveLength(1)
+      expect(entry?.files[0]?.origin).toBe('package')
+      expect(await readFile(join(row.output, entry?.files[0]?.path ?? ''), 'utf8')).toBe(licenseText)
+      await expect(verifyDesktopLicenseBundle(row.output)).resolves.toBeUndefined()
+    } finally {
+      await rm(row.root, { recursive: true, force: true })
+    }
+  })
+
+  it('rejects unknown or mismatched SPDX exceptions and plus suffixes', async () => {
+    const cases = [
+      {
+        expression: 'Apache-2.0 WITH GCC-exception-3.1',
+        message: 'SPDX exception GCC-exception-3.1 for Apache-2.0',
+      },
+      {
+        expression: 'MIT WITH LLVM-exception',
+        message: 'SPDX exception LLVM-exception for MIT',
+      },
+      {
+        expression: 'MIT+',
+        message: 'SPDX term MIT+',
+      },
+    ]
+    for (const { expression, message } of cases) {
+      const row = await fixture()
+      try {
+        await npmPackage(row.npm, 'unreviewed-expression', {
+          version: '1.0.0',
+          license: expression,
+        }, 'Unreviewed license text.\n')
+        await writeFile(join(row.cargo, 'Cargo.toml'), '[package]\nname = "dependency"\nversion = "2.0.0"\n')
+        await writeFile(join(row.cargo, 'LICENSE'), MIT)
+        await expect(generate(row)).rejects.toThrow(message)
+      } finally {
+        await rm(row.root, { recursive: true, force: true })
+      }
+    }
+  })
+
+  it('packages only the fixed upstream LICENSE for webview2-com-macros 0.8.1', async () => {
+    const row = await fixture()
+    const macroDirectory = join(row.root, 'webview2-com-macros')
+    const pinnedTextCache = join(row.root, 'pinned-text')
+    const cachedLicense = join(pinnedTextCache, 'webview2-com-macros-0.8.1-LICENSE')
+    try {
+      await writeFile(join(row.cargo, 'Cargo.toml'), '[package]\nname = "dependency"\nversion = "2.0.0"\n')
+      await writeFile(join(row.cargo, 'LICENSE'), MIT)
+      await mkdir(macroDirectory, { recursive: true })
+      await writeFile(join(macroDirectory, 'Cargo.toml'), '[package]\nname = "webview2-com-macros"\nversion = "0.8.1"\n')
+      await mkdir(pinnedTextCache, { recursive: true })
+      await writeFile(cachedLicense, WEBVIEW2_COM_MACROS_LICENSE)
+      expect(createHash('sha256').update(WEBVIEW2_COM_MACROS_LICENSE).digest('hex')).toBe(
+        '0dcf41516e608bbcb6cdc5229feb7b86fe4a643b85e7df251133c93408fdac73',
+      )
+
+      const metadataForVersion = (
+        version: string,
+        license = 'MIT',
+        repository = 'https://github.com/wravery/webview2-rs',
+      ) => {
+        const metadata = cargoMetadata(row.cargo)
+        const id = `webview2-com-macros ${version} (registry+https://github.com/rust-lang/crates.io-index)`
+        return {
+          ...metadata,
+          resolve: {
+            nodes: [...(metadata.resolve?.nodes ?? []), { id }],
+          },
+          packages: [
+            ...metadata.packages,
+            {
+              id,
+              name: 'webview2-com-macros',
+              version,
+              license,
+              license_file: null,
+              authors: ['Bill Avery'],
+              repository,
+              homepage: null,
+              source: 'registry+https://github.com/rust-lang/crates.io-index',
+              manifest_path: join(macroDirectory, 'Cargo.toml'),
+            },
+          ],
+        }
+      }
+
+      let offlineFetchCalls = 0
+      const entries = await generate(row, metadataForVersion('0.8.1'), {
+        pinnedTextCache,
+        pinnedTextFetch: async () => {
+          offlineFetchCalls += 1
+          throw new Error('offline fixture must use its verified cache')
+        },
+      })
+      expect(offlineFetchCalls).toBe(0)
+      const entry = entries.find(candidate => candidate.name === 'webview2-com-macros')
+      expect(entry?.files).toHaveLength(1)
+      expect(entry?.files[0]).toMatchObject({
+        origin: 'pinned-upstream',
+        sourceName: 'webview2-com-macros-0.8.1-LICENSE',
+        sourcePackage: 'cargo:webview2-com-macros@0.8.1',
+        sha256: '0dcf41516e608bbcb6cdc5229feb7b86fe4a643b85e7df251133c93408fdac73',
+      })
+      expect(entry?.files[0]?.licenseId).toBeUndefined()
+      expect(entry?.copyrightLines).toContain('Copyright (c) 2021 Bill Avery')
+      const outputLicense = join(row.output, entry?.files[0]?.path ?? '')
+      expect(await readFile(outputLicense, 'utf8')).toBe(WEBVIEW2_COM_MACROS_LICENSE)
+      await expect(verifyDesktopLicenseBundle(row.output)).resolves.toBeUndefined()
+
+      await writeFile(outputLicense, `${WEBVIEW2_COM_MACROS_LICENSE}tampered\n`)
+      await expect(verifyDesktopLicenseBundle(row.output)).rejects.toThrow('checksum mismatch')
+
+      await expect(generate(row, metadataForVersion('0.8.2'), { pinnedTextCache })).rejects.toThrow(
+        'cargo:webview2-com-macros@0.8.2 needs a reviewed upstream license-text pin',
+      )
+      await expect(generate(row, metadataForVersion('0.8.1', 'Apache-2.0'), { pinnedTextCache })).rejects.toThrow(
+        'cargo:webview2-com-macros@0.8.1 does not match its reviewed MIT registry provenance',
+      )
+      await expect(generate(
+        row,
+        metadataForVersion('0.8.1', 'MIT', 'https://example.test/wrong-repository'),
+        { pinnedTextCache },
+      )).rejects.toThrow(
+        'cargo:webview2-com-macros@0.8.1 does not match its reviewed MIT registry provenance',
+      )
+
+      await writeFile(cachedLicense, 'changed upstream text\n')
+      let changedFetchCalls = 0
+      await expect(generate(row, metadataForVersion('0.8.1'), {
+        pinnedTextCache,
+        pinnedTextFetch: async () => {
+          changedFetchCalls += 1
+          return new Response('changed upstream text\n')
+        },
+      })).rejects.toThrow('pinned license source changed or was corrupted')
+      expect(changedFetchCalls).toBe(1)
     } finally {
       await rm(row.root, { recursive: true, force: true })
     }

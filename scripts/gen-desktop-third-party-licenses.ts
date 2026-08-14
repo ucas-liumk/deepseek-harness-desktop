@@ -96,6 +96,11 @@ const WINDOWS_SHARP_LIBVIPS_COMMIT = 'a2d035c4b72d8f33942c2dfa8e020e49fcacc0dc'
 const WINDOWS_SHARP_LIBVIPS_ARCHIVE_SHA256 = 'cab8a652dc49e02bd5df89ba1ce30075949f4f5943de9bd425d05535f63e07eb'
 const TAURI_BUNDLER_COMMIT = '8909f221d1515955fc843808032bdc5d62209c96'
 const TAURI_SOURCE_ARCHIVE_SHA256 = '1718a576b18e511979ac81f4d40813b74f2a129935260da6af7be1d3fed97d48'
+const WEBVIEW2_COM_MACROS_VERSION = '0.8.1'
+const WEBVIEW2_COM_MACROS_REPOSITORY = 'https://github.com/wravery/webview2-rs'
+const WEBVIEW2_COM_MACROS_COMMIT = 'dffa41a8a46d3f5565eefbff2de57d38d399f158'
+const WEBVIEW2_COM_MACROS_LICENSE_SHA256 = '0dcf41516e608bbcb6cdc5229feb7b86fe4a643b85e7df251133c93408fdac73'
+const WEBVIEW2_COM_MACROS_LICENSE_NAME = 'webview2-com-macros-0.8.1-LICENSE'
 
 const RIPGREP_COMMON_CRATES = [
   'aho-corasick@1.1.3', 'anyhow@1.0.100', 'bstr@1.12.0', 'cc@1.2.41', 'cfg-if@1.0.4',
@@ -177,6 +182,9 @@ const REVIEWED_LICENSES = new Set([
   'Unicode-3.0',
   'Unlicense',
   'Zlib',
+])
+const REVIEWED_LICENSE_EXCEPTION_PAIRS = new Set([
+  'Apache-2.0 WITH LLVM-exception',
 ])
 
 // crates.io omits workspace-root license files from these published crates.
@@ -270,6 +278,8 @@ interface GenerateOptions {
   readonly supplementalPackages?: RawPackage[]
   readonly sourceArtifacts?: SourceArtifactSpec[]
   readonly sourceArtifactCache?: string
+  readonly pinnedTextCache?: string
+  readonly pinnedTextFetch?: FetchRetryDependencies['fetch']
 }
 
 export interface SourceArtifactSpec {
@@ -533,10 +543,23 @@ function licenseIdentifiers(expression: string): string[] {
       visit(node.right)
       return
     }
-    if (node.exception !== undefined || node.plus === true || !REVIEWED_LICENSES.has(node.license)) {
+    if (!REVIEWED_LICENSES.has(node.license)) {
       throw new Error(
         `desktop licenses: ${JSON.stringify(expression)} contains unreviewed or forbidden SPDX term ${node.license}`,
       )
+    }
+    if (node.plus === true) {
+      throw new Error(
+        `desktop licenses: ${JSON.stringify(expression)} contains unreviewed or forbidden SPDX term ${node.license}+`,
+      )
+    }
+    if (node.exception !== undefined) {
+      const licenseWithException = `${node.license} WITH ${node.exception}`
+      if (!REVIEWED_LICENSE_EXCEPTION_PAIRS.has(licenseWithException)) {
+        throw new Error(
+          `desktop licenses: ${JSON.stringify(expression)} contains unreviewed or forbidden SPDX exception ${node.exception} for ${node.license}`,
+        )
+      }
     }
     identifiers.add(node.license)
   }
@@ -587,13 +610,23 @@ async function directTextFiles(directory: string, explicit?: string | null): Pro
   return [...files].sort()
 }
 
-async function pinnedUpstreamText(name: string, url: string, expectedSha256: string): Promise<string> {
-  await mkdir(PINNED_SOURCE_DIRECTORY, { recursive: true })
-  const destination = join(PINNED_SOURCE_DIRECTORY, outputSegment(name))
+async function pinnedUpstreamText(
+  name: string,
+  url: string,
+  expectedSha256: string,
+  cacheDirectory = PINNED_SOURCE_DIRECTORY,
+  fetchImplementation?: FetchRetryDependencies['fetch'],
+): Promise<string> {
+  await mkdir(cacheDirectory, { recursive: true })
+  const destination = join(cacheDirectory, outputSegment(name))
   if (existsSync(destination) && sha256(await readFile(destination)) === expectedSha256) return destination
   let bytes: Buffer
   try {
-    bytes = await fetchPinnedBytes(url, PINNED_TEXT_FETCH_POLICY)
+    bytes = await fetchPinnedBytes(
+      url,
+      PINNED_TEXT_FETCH_POLICY,
+      fetchImplementation === undefined ? {} : { fetch: fetchImplementation },
+    )
   } catch (error) {
     throw new Error(`desktop licenses: could not fetch pinned license source ${url}: ${failureSummary(error)}`)
   }
@@ -982,7 +1015,40 @@ async function collectNpm(npmRoot: string, rustTarget: string): Promise<RawPacka
   return packages
 }
 
-async function collectCargo(metadata: CargoMetadata): Promise<RawPackage[]> {
+async function auditedCargoUpstreamFiles(
+  manifest: CargoPackage,
+  pinnedTextCache: string,
+  pinnedTextFetch?: FetchRetryDependencies['fetch'],
+): Promise<string[] | undefined> {
+  if (manifest.name !== 'webview2-com-macros') return undefined
+  const id = `cargo:${manifest.name}@${manifest.version}`
+  if (manifest.version !== WEBVIEW2_COM_MACROS_VERSION) {
+    throw new Error(`desktop licenses: ${id} needs a reviewed upstream license-text pin.`)
+  }
+  const repository = manifest.repository ?? manifest.homepage
+  if (normalizeExpression(manifest.license ?? '') !== 'MIT'
+    || repository !== WEBVIEW2_COM_MACROS_REPOSITORY
+    || !manifest.source?.startsWith('registry+')) {
+    throw new Error(`desktop licenses: ${id} does not match its reviewed MIT registry provenance.`)
+  }
+  // Cargo.lock fixes the published crate to SHA-256
+  // 67a921c1b6914c367b2b823cd4cde6f96beec77d30a939c8199bb377cf9b9b54.
+  // Its .cargo_vcs_info.json identifies this commit; the crate omits the
+  // workspace-root LICENSE, so package that exact, independently hashed file.
+  return [await pinnedUpstreamText(
+    WEBVIEW2_COM_MACROS_LICENSE_NAME,
+    `https://raw.githubusercontent.com/wravery/webview2-rs/${WEBVIEW2_COM_MACROS_COMMIT}/LICENSE`,
+    WEBVIEW2_COM_MACROS_LICENSE_SHA256,
+    pinnedTextCache,
+    pinnedTextFetch,
+  )]
+}
+
+async function collectCargo(
+  metadata: CargoMetadata,
+  pinnedTextCache = PINNED_SOURCE_DIRECTORY,
+  pinnedTextFetch?: FetchRetryDependencies['fetch'],
+): Promise<RawPackage[]> {
   if (metadata.resolve === null) throw new Error('desktop licenses: Cargo metadata has no resolved dependency graph.')
   const resolved = new Set(metadata.resolve.nodes.map(node => node.id))
   const workspace = new Set(metadata.workspace_members)
@@ -995,6 +1061,7 @@ async function collectCargo(metadata: CargoMetadata): Promise<RawPackage[]> {
     licenseIdentifiers(manifest.license)
     const packageDirectory = dirname(manifest.manifest_path)
     const repository = manifest.repository ?? manifest.homepage ?? undefined
+    const auditedUpstreamFiles = await auditedCargoUpstreamFiles(manifest, pinnedTextCache, pinnedTextFetch)
     packages.push({
       ecosystem: 'cargo',
       name: manifest.name,
@@ -1003,7 +1070,8 @@ async function collectCargo(metadata: CargoMetadata): Promise<RawPackage[]> {
       authors: [...manifest.authors].sort(),
       ...repository === undefined ? {} : { repository },
       packageDirectory,
-      originalTextFiles: await directTextFiles(packageDirectory, manifest.license_file),
+      originalTextFiles: auditedUpstreamFiles
+        ?? await directTextFiles(packageDirectory, manifest.license_file),
     })
   }
   return packages.sort(comparePackage)
@@ -1028,11 +1096,15 @@ function textSourcesForPackage(
   packages: RawPackage[],
   canonicalDonors: ReadonlyMap<string, RawPackage>,
   projectLicense: string,
+  pinnedTextCache = PINNED_SOURCE_DIRECTORY,
 ): TextSource[] {
   if (row.originalTextFiles.length > 0) {
+    const pinnedDirectories = new Set([resolve(PINNED_SOURCE_DIRECTORY), resolve(pinnedTextCache)])
     return row.originalTextFiles.map(sourcePath => ({
       sourcePath,
-      origin: sourcePath.startsWith(PINNED_SOURCE_DIRECTORY + sep) ? 'pinned-upstream' : 'package',
+      origin: [...pinnedDirectories].some(directory => sourcePath.startsWith(directory + sep))
+        ? 'pinned-upstream'
+        : 'package',
       sourcePackage: packageId(row),
     }))
   }
@@ -1957,8 +2029,9 @@ export async function generateDesktopLicenseBundle(options: GenerateOptions): Pr
   if (output === repositoryRoot || repositoryRoot.startsWith(output + sep)) {
     throw new Error(`desktop licenses: refusing to clear unsafe output ${output}`)
   }
+  const pinnedTextCache = resolve(options.pinnedTextCache ?? PINNED_SOURCE_DIRECTORY)
   const npm = await collectNpm(resolve(options.npmRoot), options.rustTarget)
-  const cargo = await collectCargo(options.cargoMetadata)
+  const cargo = await collectCargo(options.cargoMetadata, pinnedTextCache, options.pinnedTextFetch)
   const packages = [...npm, ...cargo, ...(options.supplementalPackages ?? [])].sort(comparePackage)
   const seen = new Map<string, RawPackage>()
   for (const row of packages) {
@@ -1981,7 +2054,7 @@ export async function generateDesktopLicenseBundle(options: GenerateOptions): Pr
     entries.push(await writePackage(
       output,
       row,
-      textSourcesForPackage(row, unique, donors, resolve(options.projectLicense)),
+      textSourcesForPackage(row, unique, donors, resolve(options.projectLicense), pinnedTextCache),
     ))
   }
   const sourceArtifacts = await writeSourceArtifacts(
@@ -2202,6 +2275,22 @@ export async function verifyDesktopLicenseBundle(directory: string): Promise<voi
     licenseIdentifiers(row.licenseExpression)
     if (!Array.isArray(row.files) || row.files.length === 0) {
       throw new Error(`desktop licenses: ${id} has no license text.`)
+    }
+    if (row.ecosystem === 'cargo' && row.name === 'webview2-com-macros') {
+      const [licenseFile] = row.files
+      if (row.version !== WEBVIEW2_COM_MACROS_VERSION
+        || row.licenseExpression !== 'MIT'
+        || row.repository !== WEBVIEW2_COM_MACROS_REPOSITORY
+        || row.files.length !== 1
+        || licenseFile?.origin !== 'pinned-upstream'
+        || licenseFile.sourceName !== WEBVIEW2_COM_MACROS_LICENSE_NAME
+        || licenseFile.sourcePackage !== `cargo:webview2-com-macros@${WEBVIEW2_COM_MACROS_VERSION}`
+        || licenseFile.licenseId !== undefined
+        || licenseFile.sha256 !== WEBVIEW2_COM_MACROS_LICENSE_SHA256
+        || !Array.isArray(row.copyrightLines)
+        || !row.copyrightLines.includes('Copyright (c) 2021 Bill Avery')) {
+        throw new Error(`desktop licenses: ${id} does not contain its fixed reviewed upstream LICENSE.`)
+      }
     }
     const metadataPath = `packages/${row.ecosystem}/${outputSegment(row.name)}/${outputSegment(row.version)}/METADATA.json`
     if (!metadataPaths.delete(metadataPath)) throw new Error(`desktop licenses: ${id} has no unique METADATA.json.`)
