@@ -152,6 +152,7 @@ jobs:
             libxdo-dev \
             openbox \
             patchelf \
+            wmctrl \
             x11-utils \
             xdotool \
             xvfb
@@ -706,6 +707,17 @@ jobs:
           export XDG_DATA_HOME="$smoke_root/data"
           app_pid=''
           openbox_pid=''
+          process_state() {
+            ps -o stat= -p "$1" 2>/dev/null | awk 'NR == 1 { print $1 }' || true
+          }
+          process_is_live() {
+            local state
+            state="$(process_state "$1")"
+            case "$state" in
+              ''|Z*|X*) return 1 ;;
+              *) return 0 ;;
+            esac
+          }
           terminate_and_reap() {
             local pid="$1"
             [ -n "$pid" ] || return 0
@@ -741,7 +753,7 @@ jobs:
           app_pid=$!
           for _ in $(seq 1 240); do
             [ -f "$ready" ] && break
-            kill -0 "$app_pid" 2>/dev/null || break
+            process_is_live "$app_pid" || break
             sleep 0.25
           done
           if [ ! -f "$ready" ]; then
@@ -749,20 +761,53 @@ jobs:
             sed -n '1,200p' "$log" || true
             exit 1
           fi
-          window=''
+          windows=()
           for _ in $(seq 1 80); do
-            window="$(xdotool search --pid "$app_pid" --name '^Unofficial DeepSeek Harness Desktop$' 2>/dev/null | head -n 1 || true)"
-            [ -n "$window" ] && break
+            mapfile -t windows < <(
+              xdotool search --all --onlyvisible --maxdepth 2 \
+                --pid "$app_pid" \
+                --name '^Unofficial DeepSeek Harness Desktop$' 2>/dev/null || true
+            )
+            [ "${#windows[@]}" -gt 0 ] && break
+            process_is_live "$app_pid" || break
             sleep 0.25
           done
-          [ -n "$window" ] || { echo "::error::$main did not expose its expected desktop window"; exit 1; }
-          xdotool windowclose "$window"
+          if [ "${#windows[@]}" -ne 1 ]; then
+            echo "::error::$main exposed ${#windows[@]} matching top-level windows; expected exactly one"
+            wmctrl -lpx || true
+            xprop -root _NET_ACTIVE_WINDOW _NET_CLIENT_LIST || true
+            ps -o pid,ppid,pgid,sid,stat,etime,wchan:32,args -p "$app_pid" || true
+            sed -n '1,200p' "$log" || true
+            sed -n '1,200p' "$openbox_log" || true
+            exit 1
+          fi
+          window="${windows[0]}"
+          xprop -id "$window" WM_PROTOCOLS | grep -q 'WM_DELETE_WINDOW' || {
+            echo "::error::$main does not advertise the graceful WM_DELETE_WINDOW protocol"
+            xprop -id "$window" || true
+            exit 1
+          }
+          wmctrl -i -c "$window"
           exited=0
           for _ in $(seq 1 80); do
-            if ! kill -0 "$app_pid" 2>/dev/null; then exited=1; break; fi
+            if ! process_is_live "$app_pid"; then
+              exited=1
+              break
+            fi
             sleep 0.25
           done
-          [ "$exited" = 1 ] || { echo "::error::$main did not exit after its window closed"; exit 1; }
+          if [ "$exited" != 1 ]; then
+            app_state="$(process_state "$app_pid")"
+            echo "::error::$main did not exit after close; pid=$app_pid state=${app_state:-gone}"
+            ps -o pid,ppid,pgid,sid,stat,etime,wchan:32,args -p "$app_pid" || true
+            wmctrl -lpx || true
+            xprop -root _NET_ACTIVE_WINDOW _NET_CLIENT_LIST || true
+            xprop -id "$window" \
+              WM_STATE WM_PROTOCOLS _NET_WM_PID WM_CLASS _NET_WM_NAME WM_NAME || true
+            sed -n '1,200p' "$log" || true
+            sed -n '1,200p' "$openbox_log" || true
+            exit 1
+          fi
           set +e
           wait "$app_pid"
           app_status=$?
