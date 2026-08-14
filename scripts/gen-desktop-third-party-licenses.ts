@@ -323,7 +323,7 @@ const NATIVE_TARGET_PROVENANCE: Readonly<Record<string, NativeTargetProvenance>>
   'x86_64-unknown-linux-gnu': {
     ripgrepPackage: '@vscode/ripgrep-linux-x64',
     ripgrepBinary: 'bin/rg',
-    ripgrepSha256: 'f2ee496a39139b8d9ad9408081217a55f1382cef4950100565d147d247364856',
+    ripgrepSha256: '193906679498de4d939345b937fa24e0e69a03c244bd70c859f5e41232713f21',
     koffiPackage: '@koromix/koffi-linux-x64',
     koffiBinary: 'linux_x64/koffi.node',
     koffiSha256: 'df687b8c68598c3ee83d06dcbc1d72fca032475e62b6108c4badfb5e43a3e7ff',
@@ -336,7 +336,7 @@ const NATIVE_TARGET_PROVENANCE: Readonly<Record<string, NativeTargetProvenance>>
   'x86_64-pc-windows-msvc': {
     ripgrepPackage: '@vscode/ripgrep-win32-x64',
     ripgrepBinary: 'bin/rg.exe',
-    ripgrepSha256: '331303d50b7cb4abe04ee549e57b04f65550ce936da1eeba4d4b05909c96eb29',
+    ripgrepSha256: 'f9dde63498b3193f098355dbec97af99dc4f6b8fa0df5ed04114a03012c042cb',
     koffiPackage: '@koromix/koffi-win32-x64',
     koffiBinary: 'win32_x64/koffi.node',
     koffiSha256: 'eb0587c804bb76262968bf83028528da4dc2d4322f558845cce205c709e2ba20',
